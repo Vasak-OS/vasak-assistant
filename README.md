@@ -1,4 +1,4 @@
-# vasak-lynx
+# vasak-assistant
 
 El asistente de IA residente de VasakOS — **Lince**. Un servicio local que
 responde desde la máquina, con el modelo que elija cada persona —desde uno
