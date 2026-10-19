@@ -24,6 +24,9 @@ uuid = { version = "1", features = ["v4"] }
 # ruta relativa o vacía se ignora vive ahí y no en una copia acá.
 dirs = "6"
 parking_lot = "0.12"
+# `StreamExt::next` para la señal `NameOwnerChanged`. Ya estaba en el grafo
+# (por hyper-util); no suma ningún crate.
+futures-util = { version = "0.3", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

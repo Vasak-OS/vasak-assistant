@@ -33,8 +33,12 @@ pub const SERVICE_INTERFACE: &str = "ar.net.vasak.os.Assistant";
 /// El tamaño máximo, en bytes UTF-8, de un mensaje que se le manda a `Chat`.
 pub const MAX_MESSAGE_BYTES: usize = 32 * 1024;
 
-/// Cuántas conversaciones abiertas puede haber a la vez.
+/// Cuántas conversaciones abiertas puede haber a la vez, entre todos los
+/// clientes.
 pub const MAX_CONVERSATIONS: usize = 32;
+
+/// Cuántas conversaciones abiertas puede tener una misma conexión.
+pub const MAX_CONVERSATIONS_PER_OWNER: usize = 8;
 
 /// Cuántos mensajes guarda una conversación. Pasado eso se olvidan los más
 /// viejos; el último intercambio se conserva siempre.
@@ -127,7 +131,7 @@ pub struct ServiceStatus {
     pub reason: String,
     /// El modelo activo.
     pub model: ModelInfo,
-    /// Cuántas conversaciones hay abiertas.
+    /// Cuántas conversaciones tiene abiertas quien pregunta.
     pub conversations: u32,
 }
 
@@ -163,7 +167,7 @@ pub enum Error {
     InvalidArgs(String),
     /// No hay ninguna conversación con ese id.
     NotFound(String),
-    /// Se llegó a [`MAX_CONVERSATIONS`].
+    /// Se llegó a [`MAX_CONVERSATIONS`] o a [`MAX_CONVERSATIONS_PER_OWNER`].
     LimitExceeded(String),
     /// La conversación ya está esperando una respuesta.
     Busy(String),
@@ -175,6 +179,14 @@ pub enum Error {
 ///
 /// Lo usa quien esté en la misma versión de zbus que el servicio. Quien esté
 /// clavado en zbus 4 (el escritorio) replica estas firmas a mano.
+///
+/// # Las conversaciones son de la conexión que las abrió
+///
+/// `NewConversation` deja como dueña a la conexión que llama (su nombre único
+/// en el bus). Sólo ella la ve en `Conversations`, y sólo ella puede usar
+/// `History`, `Chat` y `DeleteConversation` con ese id; para cualquier otra, el
+/// id da `NotFound`, igual que uno que no existe. Cuando la conexión se cierra,
+/// sus conversaciones se olvidan. `Status` cuenta sólo las de quien pregunta.
 #[zbus::proxy(
     interface = "ar.net.vasak.os.Assistant",
     default_service = "ar.net.vasak.os.Assistant",
@@ -193,10 +205,10 @@ pub trait Assistant {
     /// Los modelos instalados en el backend. `Unavailable` si no responde.
     fn models(&self) -> Result<Vec<String>, Error>;
 
-    /// Abre una conversación nueva y devuelve su id.
+    /// Abre una conversación nueva, de quien llama, y devuelve su id.
     fn new_conversation(&self) -> Result<String, Error>;
 
-    /// Las conversaciones abiertas.
+    /// Las conversaciones abiertas de quien llama.
     fn conversations(&self) -> Result<Vec<String>, Error>;
 
     /// Los mensajes de una conversación, del más viejo al más nuevo.

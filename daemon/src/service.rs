@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use zbus::interface;
+use zbus::message::Header;
 
 use vasak_assistant_protocol::{
     Capability, Error, Message, ServiceStatus, DOMAINS, DOMAIN_REMOTE_BACKENDS,
@@ -29,8 +30,65 @@ pub struct AssistantService {
 #[interface(name = "ar.net.vasak.os.Assistant")]
 impl AssistantService {
     /// Cómo está el servicio: si hay modelo, cuál, y por qué no si no.
-    async fn status(&self) -> ServiceStatus {
-        let conversations = u32::try_from(self.conversations.lock().len()).unwrap_or(u32::MAX);
+    async fn status(&self, #[zbus(header)] header: Header<'_>) -> ServiceStatus {
+        self.status_for(owner(&header)).await
+    }
+
+    /// Las capacidades sobre cada dominio. Las de datos del usuario no están
+    /// en esta fase: se dicen no disponibles, nunca rotas.
+    fn capabilities(&self) -> Vec<Capability> {
+        capabilities(self.remote_allowed)
+    }
+
+    /// Los modelos instalados en el backend.
+    async fn models(&self) -> Result<Vec<String>, Error> {
+        self.backend.models().await.map_err(to_dbus)
+    }
+
+    /// Abre una conversación nueva, de quien llama, y devuelve su id.
+    fn new_conversation(&self, #[zbus(header)] header: Header<'_>) -> Result<String, Error> {
+        self.open(owner(&header))
+    }
+
+    /// Las conversaciones abiertas de quien llama.
+    fn conversations(&self, #[zbus(header)] header: Header<'_>) -> Vec<String> {
+        self.list(owner(&header))
+    }
+
+    /// Los mensajes de una conversación de quien llama.
+    fn history(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        conversation_id: &str,
+    ) -> Result<Vec<Message>, Error> {
+        self.history_of(owner(&header), conversation_id)
+    }
+
+    /// Manda un mensaje y devuelve la respuesta del modelo.
+    async fn chat(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        conversation_id: &str,
+        content: &str,
+    ) -> Result<String, Error> {
+        self.chat_as(owner(&header), conversation_id, content).await
+    }
+
+    /// Cierra una conversación de quien llama y olvida sus mensajes.
+    fn delete_conversation(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        conversation_id: &str,
+    ) -> Result<(), Error> {
+        self.delete_as(owner(&header), conversation_id)
+    }
+}
+
+/// Lo mismo que la interfaz, con el dueño ya resuelto: se puede llamar sin bus.
+impl AssistantService {
+    pub async fn status_for(&self, owner: &str) -> ServiceStatus {
+        let count = self.conversations.lock().count_for(owner);
+        let conversations = u32::try_from(count).unwrap_or(u32::MAX);
         match self.backend.active_model().await {
             Ok(model) => ServiceStatus {
                 backend_available: true,
@@ -47,38 +105,28 @@ impl AssistantService {
         }
     }
 
-    /// Las capacidades sobre cada dominio. Las de datos del usuario no están
-    /// en esta fase: se dicen no disponibles, nunca rotas.
-    fn capabilities(&self) -> Vec<Capability> {
-        capabilities(self.remote_allowed)
+    pub fn open(&self, owner: &str) -> Result<String, Error> {
+        self.conversations.lock().create(owner)
     }
 
-    /// Los modelos instalados en el backend.
-    async fn models(&self) -> Result<Vec<String>, Error> {
-        self.backend.models().await.map_err(to_dbus)
+    pub fn list(&self, owner: &str) -> Vec<String> {
+        self.conversations.lock().ids(owner)
     }
 
-    /// Abre una conversación nueva y devuelve su id.
-    fn new_conversation(&self) -> Result<String, Error> {
-        self.conversations.lock().create()
+    pub fn history_of(&self, owner: &str, conversation_id: &str) -> Result<Vec<Message>, Error> {
+        self.conversations.lock().history(owner, conversation_id)
     }
 
-    /// Las conversaciones abiertas.
-    fn conversations(&self) -> Vec<String> {
-        self.conversations.lock().ids()
-    }
-
-    /// Los mensajes de una conversación.
-    fn history(&self, conversation_id: &str) -> Result<Vec<Message>, Error> {
-        self.conversations.lock().history(conversation_id)
-    }
-
-    /// Manda un mensaje y devuelve la respuesta del modelo.
-    async fn chat(&self, conversation_id: &str, content: &str) -> Result<String, Error> {
+    pub async fn chat_as(
+        &self,
+        owner: &str,
+        conversation_id: &str,
+        content: &str,
+    ) -> Result<String, Error> {
         let context = self
             .conversations
             .lock()
-            .begin_turn(conversation_id, content)?;
+            .begin_turn(owner, conversation_id, content)?;
         let mut turn = Turn {
             conversations: &self.conversations,
             id: conversation_id,
@@ -90,10 +138,17 @@ impl AssistantService {
         Ok(reply)
     }
 
-    /// Cierra una conversación y olvida sus mensajes.
-    fn delete_conversation(&self, conversation_id: &str) -> Result<(), Error> {
-        self.conversations.lock().delete(conversation_id)
+    pub fn delete_as(&self, owner: &str, conversation_id: &str) -> Result<(), Error> {
+        self.conversations.lock().delete(owner, conversation_id)
     }
+}
+
+/// El dueño de un pedido: el nombre único de la conexión que lo manda. En el
+/// bus siempre viene (lo pone el demonio del bus, no el cliente); sólo una
+/// conexión punto a punto, sin bus y con un único par, llega sin remitente, y
+/// ahí ese par es el único dueño posible.
+fn owner<'a>(header: &'a Header<'_>) -> &'a str {
+    header.sender().map(|sender| sender.as_str()).unwrap_or("")
 }
 
 /// Cierra el turno pase lo que pase: con la respuesta si la hubo, y si no —un
@@ -161,9 +216,11 @@ mod tests {
     use crate::backend::RejectedBackend;
     use crate::test_support::{model_info, p2p_pair, FakeBackend};
     use vasak_assistant_protocol::{
-        AssistantProxy, Role, DOMAIN_MAIL, DOMAIN_MEMORY, MAX_CONVERSATIONS, SERVICE_PATH,
+        AssistantProxy, Role, DOMAIN_MAIL, DOMAIN_MEMORY, MAX_CONVERSATIONS_PER_OWNER, SERVICE_PATH,
     };
     use zbus::DBusError;
+
+    const OWNER: &str = ":1.1";
 
     fn service(backend: impl ModelBackend + 'static, remote_allowed: bool) -> AssistantService {
         AssistantService {
@@ -239,10 +296,10 @@ mod tests {
     #[tokio::test]
     async fn el_estado_con_modelo_listo_lo_informa_y_cuenta_las_conversaciones() {
         let service = service(FakeBackend::replying("hola"), false);
-        service.new_conversation().unwrap();
-        service.new_conversation().unwrap();
+        service.open(OWNER).unwrap();
+        service.open(OWNER).unwrap();
 
-        let status = service.status().await;
+        let status = service.status_for(OWNER).await;
 
         assert!(status.backend_available);
         assert!(status.reason.is_empty());
@@ -261,7 +318,7 @@ mod tests {
             };
             let mut backend = FakeBackend::replying("");
             backend.active_result = Err(error);
-            let status = service(backend, false).status().await;
+            let status = service(backend, false).status_for(OWNER).await;
 
             assert!(!status.backend_available);
             assert_eq!(status.reason, texto);
@@ -275,7 +332,7 @@ mod tests {
             info: model_info("gpt"),
             reason: "Es remoto y no está permitido.".into(),
         };
-        let status = service(rejected, false).status().await;
+        let status = service(rejected, false).status_for(OWNER).await;
         assert!(!status.backend_available);
         assert_eq!(status.reason, "Es remoto y no está permitido.");
         assert_eq!(status.model.name, "gpt");
@@ -302,12 +359,18 @@ mod tests {
             conversations: Arc::default(),
             remote_allowed: false,
         };
-        let id = service.new_conversation().unwrap();
+        let id = service.open(OWNER).unwrap();
 
-        assert_eq!(service.chat(&id, "uno").await.unwrap(), "respuesta");
-        assert_eq!(service.chat(&id, "dos").await.unwrap(), "respuesta");
+        assert_eq!(
+            service.chat_as(OWNER, &id, "uno").await.unwrap(),
+            "respuesta"
+        );
+        assert_eq!(
+            service.chat_as(OWNER, &id, "dos").await.unwrap(),
+            "respuesta"
+        );
 
-        let history = service.history(&id).unwrap();
+        let history = service.history_of(OWNER, &id).unwrap();
         let textos: Vec<_> = history
             .iter()
             .map(|m| (m.role, m.content.as_str()))
@@ -335,13 +398,16 @@ mod tests {
             conversations: Arc::default(),
             remote_allowed: false,
         };
-        let id = service.new_conversation().unwrap();
-        service.chat(&id, "primero").await.unwrap_err();
-        assert!(service.history(&id).unwrap().is_empty());
+        let id = service.open(OWNER).unwrap();
+        service.chat_as(OWNER, &id, "primero").await.unwrap_err();
+        assert!(service.history_of(OWNER, &id).unwrap().is_empty());
 
         *backend.chat_result.lock() = Ok("ahora sí".into());
-        assert_eq!(service.chat(&id, "segundo").await.unwrap(), "ahora sí");
-        assert_eq!(service.history(&id).unwrap().len(), 2);
+        assert_eq!(
+            service.chat_as(OWNER, &id, "segundo").await.unwrap(),
+            "ahora sí"
+        );
+        assert_eq!(service.history_of(OWNER, &id).unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -349,23 +415,24 @@ mod tests {
         let (backend, gate) = FakeBackend::gated("respuesta");
         let entered = backend.entered.clone();
         let service = Arc::new(service(backend, false));
-        let id = service.new_conversation().unwrap();
+        let id = service.open(OWNER).unwrap();
 
         let primero = tokio::spawn({
             let (service, id) = (service.clone(), id.clone());
-            async move { service.chat(&id, "uno").await }
+            async move { service.chat_as(OWNER, &id, "uno").await }
         });
         entered.notified().await;
 
         // Con un plazo: si la marca de ocupada fallara, el segundo chat
         // esperaría al modelo para siempre en vez de fallar la prueba.
-        let segundo = tokio::time::timeout(Duration::from_secs(5), service.chat(&id, "dos"))
-            .await
-            .expect("el segundo chat no debía quedar esperando al modelo");
+        let segundo =
+            tokio::time::timeout(Duration::from_secs(5), service.chat_as(OWNER, &id, "dos"))
+                .await
+                .expect("el segundo chat no debía quedar esperando al modelo");
         assert!(matches!(segundo, Err(Error::Busy(_))));
         gate.notify_one();
         assert_eq!(primero.await.unwrap().unwrap(), "respuesta");
-        assert_eq!(service.history(&id).unwrap().len(), 2);
+        assert_eq!(service.history_of(OWNER, &id).unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -373,18 +440,21 @@ mod tests {
         let (backend, gate) = FakeBackend::gated("respuesta");
         let entered = backend.entered.clone();
         let service = service(backend, false);
-        let id = service.new_conversation().unwrap();
+        let id = service.open(OWNER).unwrap();
 
         // El pedido queda esperando al modelo y se abandona (el cliente se fue).
         tokio::select! {
-            _ = service.chat(&id, "uno") => panic!("no debía terminar"),
+            _ = service.chat_as(OWNER, &id, "uno") => panic!("no debía terminar"),
             _ = entered.notified() => {}
         }
 
-        assert!(service.history(&id).unwrap().is_empty());
+        assert!(service.history_of(OWNER, &id).unwrap().is_empty());
         gate.notify_one();
-        assert_eq!(service.chat(&id, "dos").await.unwrap(), "respuesta");
-        assert_eq!(service.history(&id).unwrap()[0].content, "dos");
+        assert_eq!(
+            service.chat_as(OWNER, &id, "dos").await.unwrap(),
+            "respuesta"
+        );
+        assert_eq!(service.history_of(OWNER, &id).unwrap()[0].content, "dos");
     }
 
     #[tokio::test]
@@ -395,13 +465,13 @@ mod tests {
             conversations: Arc::default(),
             remote_allowed: false,
         };
-        let id = service.new_conversation().unwrap();
+        let id = service.open(OWNER).unwrap();
         assert!(matches!(
-            service.chat(&id, "  ").await,
+            service.chat_as(OWNER, &id, "  ").await,
             Err(Error::InvalidArgs(_))
         ));
         assert!(matches!(
-            service.chat("basura", "hola").await,
+            service.chat_as(OWNER, "basura", "hola").await,
             Err(Error::InvalidArgs(_))
         ));
         assert!(backend.seen.lock().is_empty());
@@ -410,18 +480,15 @@ mod tests {
     #[tokio::test]
     async fn abrir_listar_y_cerrar_conversaciones_respeta_el_tope() {
         let service = service(FakeBackend::replying("x"), false);
-        let ids: Vec<String> = (0..MAX_CONVERSATIONS)
-            .map(|_| service.new_conversation().unwrap())
+        let ids: Vec<String> = (0..MAX_CONVERSATIONS_PER_OWNER)
+            .map(|_| service.open(OWNER).unwrap())
             .collect();
-        assert_eq!(service.conversations().len(), MAX_CONVERSATIONS);
+        assert_eq!(service.list(OWNER).len(), MAX_CONVERSATIONS_PER_OWNER);
+        assert!(matches!(service.open(OWNER), Err(Error::LimitExceeded(_))));
+        service.delete_as(OWNER, &ids[0]).unwrap();
+        assert_eq!(service.list(OWNER).len(), MAX_CONVERSATIONS_PER_OWNER - 1);
         assert!(matches!(
-            service.new_conversation(),
-            Err(Error::LimitExceeded(_))
-        ));
-        service.delete_conversation(&ids[0]).unwrap();
-        assert_eq!(service.conversations().len(), MAX_CONVERSATIONS - 1);
-        assert!(matches!(
-            service.delete_conversation(&ids[0]),
+            service.delete_as(OWNER, &ids[0]),
             Err(Error::NotFound(_))
         ));
     }
@@ -542,7 +609,8 @@ mod tests {
             "listo"
         );
 
-        for _ in 1..MAX_CONVERSATIONS {
+        // Por el bus, el que se agota primero es el tope de la conexión.
+        for _ in 1..MAX_CONVERSATIONS_PER_OWNER {
             proxy.new_conversation().await.unwrap();
         }
         assert!(matches!(

@@ -7,6 +7,7 @@
 //! pasa por ningún proxy del entorno (`HTTP_PROXY` mandaría la conversación a
 //! otra máquina sin que nadie lo haya elegido).
 
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use reqwest::{redirect, Client, Response, Url};
@@ -25,7 +26,14 @@ pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
 /// El cliente que comparten todos los backends.
 pub fn client() -> reqwest::Result<Client> {
+    // `localhost` cuenta como local (`config::is_local`), así que no puede
+    // depender del resolvedor: va directo al loopback. El puerto lo pone la URL.
+    let loopback = [
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        SocketAddr::from((Ipv6Addr::LOCALHOST, 0)),
+    ];
     Client::builder()
+        .resolve_to_addrs("localhost", &loopback)
         .connect_timeout(CONNECT_TIMEOUT)
         .redirect(redirect::Policy::none())
         .no_proxy()

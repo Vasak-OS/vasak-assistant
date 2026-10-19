@@ -9,17 +9,24 @@
 //! Los límites del contrato (`MAX_*` de `vasak-assistant-protocol`) se aplican
 //! acá, en la frontera: un cliente del bus no puede hacer crecer la memoria del
 //! servicio sin techo.
+//!
+//! Cada conversación es de la conexión que la abrió (su nombre único en el bus,
+//! `:1.42`). Nadie más la ve: para cualquier otro, una conversación ajena da el
+//! mismo `NotFound` que una que no existe, así ni siquiera se confirma que el id
+//! esté en uso. Cuando la conexión se va, sus conversaciones se liberan
+//! ([`Conversations::release_owner`]).
 
 use std::collections::HashMap;
 
 use uuid::Uuid;
 use vasak_assistant_protocol::{
-    Error, Message, Role, MAX_CONVERSATIONS, MAX_HISTORY_BYTES, MAX_HISTORY_MESSAGES,
-    MAX_MESSAGE_BYTES,
+    Error, Message, Role, MAX_CONVERSATIONS, MAX_CONVERSATIONS_PER_OWNER, MAX_HISTORY_BYTES,
+    MAX_HISTORY_MESSAGES, MAX_MESSAGE_BYTES,
 };
 
-#[derive(Default)]
 struct Conversation {
+    /// El nombre único de la conexión que la abrió.
+    owner: String,
     messages: Vec<Message>,
     /// Hay un pedido al modelo en curso: un segundo `Chat` sobre la misma
     /// conversación se rechaza en vez de entreverar las respuestas.
@@ -32,46 +39,85 @@ pub struct Conversations {
 }
 
 impl Conversations {
+    /// Cuántas conversaciones hay abiertas en total, de todos los dueños.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.open.len()
     }
 
-    /// Abre una conversación y devuelve su id.
-    pub fn create(&mut self) -> Result<String, Error> {
+    /// Cuántas conversaciones tiene abiertas `owner`.
+    pub fn count_for(&self, owner: &str) -> usize {
+        self.open.values().filter(|c| c.owner == owner).count()
+    }
+
+    /// Abre una conversación para `owner` y devuelve su id. Hay un tope por
+    /// dueño, para que un solo cliente no se quede con todas, además del total.
+    pub fn create(&mut self, owner: &str) -> Result<String, Error> {
+        if self.count_for(owner) >= MAX_CONVERSATIONS_PER_OWNER {
+            return Err(Error::LimitExceeded(format!(
+                "ya tenés {MAX_CONVERSATIONS_PER_OWNER} conversaciones abiertas; cerrá alguna"
+            )));
+        }
         if self.open.len() >= MAX_CONVERSATIONS {
             return Err(Error::LimitExceeded(format!(
                 "ya hay {MAX_CONVERSATIONS} conversaciones abiertas; cerrá alguna"
             )));
         }
         let id = Uuid::new_v4().to_string();
-        self.open.insert(id.clone(), Conversation::default());
+        self.open.insert(
+            id.clone(),
+            Conversation {
+                owner: owner.to_owned(),
+                messages: Vec::new(),
+                busy: false,
+            },
+        );
         Ok(id)
     }
 
-    /// Los ids abiertos, ordenados para que la respuesta no cambie de una
+    /// Los ids de `owner`, ordenados para que la respuesta no cambie de una
     /// llamada a otra.
-    pub fn ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.open.keys().cloned().collect();
+    pub fn ids(&self, owner: &str) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .open
+            .iter()
+            .filter(|(_, c)| c.owner == owner)
+            .map(|(id, _)| id.clone())
+            .collect();
         ids.sort();
         ids
     }
 
-    pub fn history(&self, id: &str) -> Result<Vec<Message>, Error> {
-        Ok(self.get(id)?.messages.clone())
+    pub fn history(&self, owner: &str, id: &str) -> Result<Vec<Message>, Error> {
+        Ok(self.get(owner, id)?.messages.clone())
     }
 
-    pub fn delete(&mut self, id: &str) -> Result<(), Error> {
-        validate_id(id)?;
-        self.open.remove(id).map(drop).ok_or_else(not_found)
+    pub fn delete(&mut self, owner: &str, id: &str) -> Result<(), Error> {
+        self.get(owner, id)?;
+        self.open.remove(id);
+        Ok(())
+    }
+
+    /// Olvida todas las conversaciones de `owner`: la conexión se fue. Devuelve
+    /// cuántas eran.
+    pub fn release_owner(&mut self, owner: &str) -> usize {
+        let before = self.open.len();
+        self.open.retain(|_, c| c.owner != owner);
+        before - self.open.len()
     }
 
     /// Empieza un turno: valida el mensaje, marca la conversación ocupada y
     /// devuelve lo que hay que mandarle al modelo (el historial más el mensaje
     /// nuevo). El mensaje todavía no se guarda: si el modelo falla, la
     /// conversación queda como estaba.
-    pub fn begin_turn(&mut self, id: &str, content: &str) -> Result<Vec<Message>, Error> {
+    pub fn begin_turn(
+        &mut self,
+        owner: &str,
+        id: &str,
+        content: &str,
+    ) -> Result<Vec<Message>, Error> {
         validate_content(content)?;
-        let conversation = self.get_mut(id)?;
+        let conversation = self.get_mut(owner, id)?;
         if conversation.busy {
             return Err(Error::Busy(
                 "la conversación todavía está esperando la respuesta anterior".into(),
@@ -88,7 +134,9 @@ impl Conversations {
 
     /// Termina un turno. Con respuesta, guarda el mensaje y la respuesta y
     /// recorta el historial; sin respuesta, sólo libera la conversación. Si la
-    /// conversación se cerró mientras tanto, no hay nada que guardar.
+    /// conversación se cerró mientras tanto, no hay nada que guardar. Sin
+    /// dueño: sólo se llama después de un `begin_turn` que ya lo comprobó, y un
+    /// id (UUID v4) no vuelve a darse.
     pub fn finish_turn(&mut self, id: &str, content: &str, reply: Option<&str>) {
         let Some(conversation) = self.open.get_mut(id) else {
             return;
@@ -107,14 +155,20 @@ impl Conversations {
         }
     }
 
-    fn get(&self, id: &str) -> Result<&Conversation, Error> {
+    fn get(&self, owner: &str, id: &str) -> Result<&Conversation, Error> {
         validate_id(id)?;
-        self.open.get(id).ok_or_else(not_found)
+        self.open
+            .get(id)
+            .filter(|c| c.owner == owner)
+            .ok_or_else(not_found)
     }
 
-    fn get_mut(&mut self, id: &str) -> Result<&mut Conversation, Error> {
+    fn get_mut(&mut self, owner: &str, id: &str) -> Result<&mut Conversation, Error> {
         validate_id(id)?;
-        self.open.get_mut(id).ok_or_else(not_found)
+        self.open
+            .get_mut(id)
+            .filter(|c| c.owner == owner)
+            .ok_or_else(not_found)
     }
 }
 
@@ -164,6 +218,8 @@ fn not_found() -> Error {
 mod tests {
     use super::*;
 
+    const OWNER: &str = ":1.1";
+
     fn message(role: Role, content: &str) -> Message {
         Message {
             role,
@@ -174,10 +230,10 @@ mod tests {
     /// Una conversación con `n` intercambios de mensajes cortos y distintos.
     fn with_turns(n: usize) -> (Conversations, String) {
         let mut conversations = Conversations::default();
-        let id = conversations.create().unwrap();
+        let id = conversations.create(OWNER).unwrap();
         for i in 0..n {
             let content = format!("pregunta {i}");
-            conversations.begin_turn(&id, &content).unwrap();
+            conversations.begin_turn(OWNER, &id, &content).unwrap();
             conversations.finish_turn(&id, &content, Some(&format!("respuesta {i}")));
         }
         (conversations, id)
@@ -186,7 +242,7 @@ mod tests {
     #[test]
     fn un_id_valido_es_un_uuid_con_guiones() {
         let mut conversations = Conversations::default();
-        let id = conversations.create().unwrap();
+        let id = conversations.create(OWNER).unwrap();
         assert!(validate_id(&id).is_ok());
     }
 
@@ -245,28 +301,31 @@ mod tests {
 
     #[test]
     fn no_se_pasa_del_maximo_de_conversaciones_y_cerrar_una_deja_abrir_otra() {
+        // Repartidas entre varios dueños, para no toparse antes con el tope por
+        // dueño.
+        let owner = |i: usize| format!(":1.{}", i / MAX_CONVERSATIONS_PER_OWNER);
         let mut conversations = Conversations::default();
         let ids: Vec<String> = (0..MAX_CONVERSATIONS)
-            .map(|_| conversations.create().unwrap())
+            .map(|i| conversations.create(&owner(i)).unwrap())
             .collect();
         assert_eq!(conversations.len(), MAX_CONVERSATIONS);
         assert!(matches!(
-            conversations.create(),
+            conversations.create(":1.999"),
             Err(Error::LimitExceeded(_))
         ));
         assert_eq!(conversations.len(), MAX_CONVERSATIONS);
 
-        conversations.delete(&ids[0]).unwrap();
-        assert!(conversations.create().is_ok());
+        conversations.delete(&owner(0), &ids[0]).unwrap();
+        assert!(conversations.create(":1.999").is_ok());
     }
 
     #[test]
     fn los_ids_salen_ordenados_y_sin_repetirse() {
         let mut conversations = Conversations::default();
         for _ in 0..5 {
-            conversations.create().unwrap();
+            conversations.create(OWNER).unwrap();
         }
-        let ids = conversations.ids();
+        let ids = conversations.ids(OWNER);
         let mut sorted = ids.clone();
         sorted.sort();
         sorted.dedup();
@@ -277,8 +336,8 @@ mod tests {
     #[test]
     fn una_conversacion_nueva_no_tiene_mensajes() {
         let mut conversations = Conversations::default();
-        let id = conversations.create().unwrap();
-        assert!(conversations.history(&id).unwrap().is_empty());
+        let id = conversations.create(OWNER).unwrap();
+        assert!(conversations.history(OWNER, &id).unwrap().is_empty());
     }
 
     #[test]
@@ -286,11 +345,11 @@ mod tests {
         let (conversations, _) = with_turns(0);
         let otro = Uuid::new_v4().to_string();
         assert!(matches!(
-            conversations.history(&otro),
+            conversations.history(OWNER, &otro),
             Err(Error::NotFound(_))
         ));
         assert!(matches!(
-            conversations.history("basura"),
+            conversations.history(OWNER, "basura"),
             Err(Error::InvalidArgs(_))
         ));
     }
@@ -298,15 +357,18 @@ mod tests {
     #[test]
     fn cerrar_una_conversacion_olvida_sus_mensajes_y_no_se_puede_cerrar_dos_veces() {
         let (mut conversations, id) = with_turns(1);
-        conversations.delete(&id).unwrap();
+        conversations.delete(OWNER, &id).unwrap();
         assert_eq!(conversations.len(), 0);
         assert!(matches!(
-            conversations.history(&id),
+            conversations.history(OWNER, &id),
             Err(Error::NotFound(_))
         ));
-        assert!(matches!(conversations.delete(&id), Err(Error::NotFound(_))));
         assert!(matches!(
-            conversations.delete("basura"),
+            conversations.delete(OWNER, &id),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            conversations.delete(OWNER, "basura"),
             Err(Error::InvalidArgs(_))
         ));
     }
@@ -314,7 +376,9 @@ mod tests {
     #[test]
     fn el_turno_le_da_al_modelo_el_historial_mas_el_mensaje_nuevo_sin_guardarlo() {
         let (mut conversations, id) = with_turns(1);
-        let context = conversations.begin_turn(&id, "hola de nuevo").unwrap();
+        let context = conversations
+            .begin_turn(OWNER, &id, "hola de nuevo")
+            .unwrap();
         assert_eq!(
             context,
             vec![
@@ -323,14 +387,14 @@ mod tests {
                 message(Role::User, "hola de nuevo"),
             ]
         );
-        assert_eq!(conversations.history(&id).unwrap().len(), 2);
+        assert_eq!(conversations.history(OWNER, &id).unwrap().len(), 2);
     }
 
     #[test]
     fn un_turno_exitoso_guarda_el_mensaje_y_la_respuesta() {
         let (conversations, id) = with_turns(2);
         assert_eq!(
-            conversations.history(&id).unwrap(),
+            conversations.history(OWNER, &id).unwrap(),
             vec![
                 message(Role::User, "pregunta 0"),
                 message(Role::Assistant, "respuesta 0"),
@@ -343,9 +407,9 @@ mod tests {
     #[test]
     fn un_segundo_turno_sobre_la_misma_conversacion_da_busy() {
         let (mut conversations, id) = with_turns(0);
-        conversations.begin_turn(&id, "uno").unwrap();
+        conversations.begin_turn(OWNER, &id, "uno").unwrap();
         assert!(matches!(
-            conversations.begin_turn(&id, "dos"),
+            conversations.begin_turn(OWNER, &id, "dos"),
             Err(Error::Busy(_))
         ));
     }
@@ -353,30 +417,30 @@ mod tests {
     #[test]
     fn el_turno_de_una_conversacion_no_ocupa_a_las_otras() {
         let mut conversations = Conversations::default();
-        let a = conversations.create().unwrap();
-        let b = conversations.create().unwrap();
-        conversations.begin_turn(&a, "uno").unwrap();
-        assert!(conversations.begin_turn(&b, "dos").is_ok());
+        let a = conversations.create(OWNER).unwrap();
+        let b = conversations.create(OWNER).unwrap();
+        conversations.begin_turn(OWNER, &a, "uno").unwrap();
+        assert!(conversations.begin_turn(OWNER, &b, "dos").is_ok());
     }
 
     #[test]
     fn un_turno_fallido_deja_la_conversacion_como_estaba_y_libre() {
         let (mut conversations, id) = with_turns(1);
-        let antes = conversations.history(&id).unwrap();
-        conversations.begin_turn(&id, "esto falla").unwrap();
+        let antes = conversations.history(OWNER, &id).unwrap();
+        conversations.begin_turn(OWNER, &id, "esto falla").unwrap();
         conversations.finish_turn(&id, "esto falla", None);
-        assert_eq!(conversations.history(&id).unwrap(), antes);
-        assert!(conversations.begin_turn(&id, "de nuevo").is_ok());
+        assert_eq!(conversations.history(OWNER, &id).unwrap(), antes);
+        assert!(conversations.begin_turn(OWNER, &id, "de nuevo").is_ok());
     }
 
     #[test]
     fn un_mensaje_invalido_no_deja_la_conversacion_ocupada() {
         let (mut conversations, id) = with_turns(0);
         assert!(matches!(
-            conversations.begin_turn(&id, "  "),
+            conversations.begin_turn(OWNER, &id, "  "),
             Err(Error::InvalidArgs(_))
         ));
-        assert!(conversations.begin_turn(&id, "ahora sí").is_ok());
+        assert!(conversations.begin_turn(OWNER, &id, "ahora sí").is_ok());
     }
 
     #[test]
@@ -384,11 +448,11 @@ mod tests {
         let (mut conversations, _) = with_turns(0);
         let otro = Uuid::new_v4().to_string();
         assert!(matches!(
-            conversations.begin_turn(&otro, "hola"),
+            conversations.begin_turn(OWNER, &otro, "hola"),
             Err(Error::NotFound(_))
         ));
         assert!(matches!(
-            conversations.begin_turn("basura", "hola"),
+            conversations.begin_turn(OWNER, "basura", "hola"),
             Err(Error::InvalidArgs(_))
         ));
     }
@@ -396,8 +460,8 @@ mod tests {
     #[test]
     fn terminar_el_turno_de_una_conversacion_cerrada_no_la_resucita() {
         let (mut conversations, id) = with_turns(0);
-        conversations.begin_turn(&id, "hola").unwrap();
-        conversations.delete(&id).unwrap();
+        conversations.begin_turn(OWNER, &id, "hola").unwrap();
+        conversations.delete(OWNER, &id).unwrap();
         conversations.finish_turn(&id, "hola", Some("respuesta"));
         assert_eq!(conversations.len(), 0);
     }
@@ -406,7 +470,7 @@ mod tests {
     fn el_historial_se_recorta_al_maximo_de_mensajes_y_se_van_los_mas_viejos() {
         let turnos = MAX_HISTORY_MESSAGES; // el doble de mensajes que el tope
         let (conversations, id) = with_turns(turnos);
-        let history = conversations.history(&id).unwrap();
+        let history = conversations.history(OWNER, &id).unwrap();
         assert_eq!(history.len(), MAX_HISTORY_MESSAGES);
         assert_eq!(
             history[0],

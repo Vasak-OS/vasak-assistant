@@ -133,14 +133,14 @@ struct TagsModel {
 pub fn parse_chat(body: &[u8]) -> Result<String, BackendError> {
     serde_json::from_slice::<ChatResponse>(body)
         .map(|response| response.message.content)
-        .map_err(|error| BackendError::Failed(format!("respuesta de Ollama ilegible: {error}")))
+        .map_err(|_| BackendError::Failed("respuesta de Ollama ilegible".into()))
 }
 
 /// La respuesta de `/api/tags`: los nombres de los modelos instalados.
 pub fn parse_tags(body: &[u8]) -> Result<Vec<String>, BackendError> {
     serde_json::from_slice::<TagsResponse>(body)
         .map(|tags| tags.models.into_iter().map(|model| model.name).collect())
-        .map_err(|error| BackendError::Failed(format!("lista de modelos ilegible: {error}")))
+        .map_err(|_| BackendError::Failed("lista de modelos ilegible".into()))
 }
 
 /// Con qué modelo responder. Si hay uno configurado tiene que estar instalado;

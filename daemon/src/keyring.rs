@@ -118,6 +118,16 @@ impl SecretService {
             .await?
             .body()
             .deserialize()?;
+        // Más de un ítem con los mismos atributos: cualquiera de la sesión puede
+        // crear uno, así que otro proceso pudo haber plantado su clave al lado de
+        // la verdadera. No se adivina cuál es cuál: no se usa ninguna.
+        if unlocked.len() > 1 {
+            tracing::warn!(
+                "hay {} claves en el llavero para la misma dirección; no se usa ninguna hasta que quede una sola",
+                unlocked.len()
+            );
+            return Ok(None);
+        }
         let Some(item) = unlocked.into_iter().next() else {
             if !locked.is_empty() {
                 // Desbloquearlo pediría un diálogo; eso es de quien usa el

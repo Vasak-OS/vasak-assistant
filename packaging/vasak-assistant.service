@@ -47,6 +47,18 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 
+# Un volcado de memoria tendría conversaciones y, con un proveedor remoto, la
+# clave: no se escribe ninguno.
+LimitCORE=0
+# Techos de recursos. La memoria propia está acotada por los topes del
+# contrato (32 conversaciones de hasta 512 KiB, respuestas de hasta 256 KiB,
+# cuatro pedidos al modelo a la vez): unas decenas de MiB. 256M deja margen de
+# sobra y frena a cualquier cosa que se descontrole. Los hilos son los de
+# Tokio (uno por núcleo más los de E/S bloqueante); 256 alcanza aun en una
+# máquina con muchos núcleos.
+MemoryMax=256M
+TasksMax=256
+
 # `strict`: no escribe nada en ningún lado, así que todo el sistema de archivos
 # queda de sólo lectura. `read-only` en la carpeta personal: sólo lee
 # `vasak.conf` (la memoria, fase 4, vivirá en el almacén cifrado).

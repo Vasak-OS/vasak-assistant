@@ -188,7 +188,7 @@ struct ModelEntry {
 /// La respuesta de `/chat/completions`: el texto de la primera opción.
 pub fn parse_chat(body: &[u8]) -> Result<String, BackendError> {
     let response = serde_json::from_slice::<ChatResponse>(body)
-        .map_err(|error| BackendError::Failed(format!("respuesta del modelo ilegible: {error}")))?;
+        .map_err(|_| BackendError::Failed("respuesta del modelo ilegible".into()))?;
     response
         .choices
         .into_iter()
@@ -201,7 +201,7 @@ pub fn parse_chat(body: &[u8]) -> Result<String, BackendError> {
 pub fn parse_models(body: &[u8]) -> Result<Vec<String>, BackendError> {
     serde_json::from_slice::<ModelsResponse>(body)
         .map(|models| models.data.into_iter().map(|model| model.id).collect())
-        .map_err(|error| BackendError::Failed(format!("lista de modelos ilegible: {error}")))
+        .map_err(|_| BackendError::Failed("lista de modelos ilegible".into()))
 }
 
 #[cfg(test)]

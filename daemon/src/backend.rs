@@ -8,6 +8,10 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use vasak_assistant_protocol::{Message, ModelInfo};
 
@@ -73,6 +77,78 @@ impl ModelBackend for RejectedBackend {
 
     fn chat<'a>(&'a self, _: &'a [Message]) -> BoxFuture<'a, Result<String, BackendError>> {
         Box::pin(async move { Err(self.unavailable()) })
+    }
+}
+
+/// Cuántos pedidos al backend puede haber en vuelo a la vez. Los demás
+/// esperan su turno: varios clientes no pueden poner al modelo (ni a la
+/// máquina) a atender decenas de pedidos juntos.
+pub const MAX_IN_FLIGHT: usize = 4;
+
+/// Cuánto vale la respuesta de `active_model` antes de volver a preguntar.
+/// `Status` se puede consultar seguido (un panel abierto); el backend no
+/// necesita enterarse de cada vez.
+pub const ACTIVE_MODEL_TTL: Duration = Duration::from_secs(5);
+
+/// Envuelve un backend con un tope de pedidos simultáneos y una caché corta del
+/// modelo activo.
+pub struct Limited {
+    inner: Arc<dyn ModelBackend>,
+    permits: Semaphore,
+    active: parking_lot::Mutex<Option<(Instant, Result<ModelInfo, BackendError>)>>,
+}
+
+impl Limited {
+    pub fn new(inner: Arc<dyn ModelBackend>) -> Self {
+        Self {
+            inner,
+            permits: Semaphore::new(MAX_IN_FLIGHT),
+            active: parking_lot::Mutex::new(None),
+        }
+    }
+
+    async fn permit(&self) -> Result<SemaphorePermit<'_>, BackendError> {
+        // El semáforo sólo se cierra a mano, y acá nadie lo cierra.
+        self.permits
+            .acquire()
+            .await
+            .map_err(|_| BackendError::Failed("el servicio se está cerrando".into()))
+    }
+}
+
+impl ModelBackend for Limited {
+    fn info(&self) -> ModelInfo {
+        self.inner.info()
+    }
+
+    fn models(&self) -> BoxFuture<'_, Result<Vec<String>, BackendError>> {
+        Box::pin(async move {
+            let _permit = self.permit().await?;
+            self.inner.models().await
+        })
+    }
+
+    fn active_model(&self) -> BoxFuture<'_, Result<ModelInfo, BackendError>> {
+        Box::pin(async move {
+            if let Some((at, cached)) = &*self.active.lock() {
+                if at.elapsed() < ACTIVE_MODEL_TTL {
+                    return cached.clone();
+                }
+            }
+            let result = {
+                let _permit = self.permit().await?;
+                self.inner.active_model().await
+            };
+            *self.active.lock() = Some((Instant::now(), result.clone()));
+            result
+        })
+    }
+
+    fn chat<'a>(&'a self, messages: &'a [Message]) -> BoxFuture<'a, Result<String, BackendError>> {
+        Box::pin(async move {
+            let _permit = self.permit().await?;
+            self.inner.chat(messages).await
+        })
     }
 }
 

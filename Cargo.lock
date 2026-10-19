@@ -1642,6 +1642,7 @@ name = "vasak-assistant-daemon"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "futures-util",
  "parking_lot",
  "reqwest",
  "serde",
