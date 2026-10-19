@@ -75,3 +75,34 @@ impl ModelBackend for RejectedBackend {
         Box::pin(async move { Err(self.unavailable()) })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::model_info;
+
+    fn rejected() -> RejectedBackend {
+        RejectedBackend {
+            info: model_info("gpt"),
+            reason: "No se puede usar esta configuración.".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn el_backend_rechazado_contesta_no_disponible_con_el_motivo_a_todo() {
+        let backend = rejected();
+        let esperado = BackendError::Unavailable("No se puede usar esta configuración.".into());
+        assert_eq!(backend.models().await.unwrap_err(), esperado);
+        assert_eq!(backend.active_model().await.unwrap_err(), esperado);
+        let mensaje = Message {
+            role: vasak_assistant_protocol::Role::User,
+            content: "hola".into(),
+        };
+        assert_eq!(backend.chat(&[mensaje]).await.unwrap_err(), esperado);
+    }
+
+    #[test]
+    fn el_backend_rechazado_igual_dice_que_modelo_y_host_eran() {
+        assert_eq!(rejected().info(), model_info("gpt"));
+    }
+}

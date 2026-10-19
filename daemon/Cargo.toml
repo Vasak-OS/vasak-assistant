@@ -26,3 +26,7 @@ dirs = "6"
 parking_lot = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# Para las pruebas del servicio: una conexión D-Bus punto a punto, sin bus.
+zbus = { workspace = true, features = ["p2p"] }

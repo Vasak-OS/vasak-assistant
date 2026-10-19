@@ -18,6 +18,8 @@ mod keyring;
 mod ollama;
 mod openai;
 mod service;
+#[cfg(test)]
+mod test_support;
 
 use std::sync::Arc;
 

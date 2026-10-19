@@ -152,3 +152,402 @@ pub fn to_dbus(error: BackendError) -> Error {
         BackendError::Failed(text) => Error::Backend(text),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::backend::RejectedBackend;
+    use crate::test_support::{model_info, p2p_pair, FakeBackend};
+    use vasak_assistant_protocol::{
+        AssistantProxy, Role, DOMAIN_MAIL, DOMAIN_MEMORY, MAX_CONVERSATIONS, SERVICE_PATH,
+    };
+    use zbus::DBusError;
+
+    fn service(backend: impl ModelBackend + 'static, remote_allowed: bool) -> AssistantService {
+        AssistantService {
+            backend: Arc::new(backend),
+            conversations: Arc::new(Mutex::new(Conversations::default())),
+            remote_allowed,
+        }
+    }
+
+    /// El servicio servido por una conexión punto a punto y su proxy de cliente.
+    async fn connected(service: AssistantService) -> (AssistantProxy<'static>, zbus::Connection) {
+        let (server, client) = p2p_pair(|builder| builder.serve_at(SERVICE_PATH, service))
+            .await
+            .unwrap();
+        let proxy = AssistantProxy::builder(&client)
+            .path(SERVICE_PATH)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        (proxy, server)
+    }
+
+    fn capability<'a>(all: &'a [Capability], domain: &str) -> &'a Capability {
+        all.iter().find(|c| c.domain == domain).unwrap()
+    }
+
+    #[test]
+    fn las_capacidades_cubren_todos_los_dominios_en_orden_y_ninguna_de_datos_esta_disponible() {
+        let all = capabilities(false);
+        assert_eq!(
+            all.iter().map(|c| c.domain.as_str()).collect::<Vec<_>>(),
+            DOMAINS
+        );
+        for capability in &all {
+            assert!(!capability.available, "{}", capability.domain);
+            assert!(!capability.reason.is_empty(), "{}", capability.domain);
+        }
+    }
+
+    #[test]
+    fn remote_backends_esta_disponible_solo_si_la_configuracion_lo_permite() {
+        let permitido = capabilities(true);
+        let remoto = capability(&permitido, DOMAIN_REMOTE_BACKENDS);
+        assert!(remoto.available);
+        assert!(remoto.reason.is_empty());
+
+        let prohibido = capabilities(false);
+        let remoto = capability(&prohibido, DOMAIN_REMOTE_BACKENDS);
+        assert!(!remoto.available);
+        assert!(remoto.reason.contains("allow_remote"));
+    }
+
+    #[test]
+    fn permitir_lo_remoto_no_habilita_las_capacidades_sobre_datos_del_usuario() {
+        let all = capabilities(true);
+        assert!(!capability(&all, DOMAIN_MAIL).available);
+        assert!(!capability(&all, DOMAIN_MEMORY).available);
+    }
+
+    #[test]
+    fn cada_error_del_backend_se_traduce_al_error_del_bus_que_toca() {
+        assert!(matches!(
+            to_dbus(BackendError::Unavailable("a".into())),
+            Error::Unavailable(text) if text == "a"
+        ));
+        assert!(matches!(
+            to_dbus(BackendError::Failed("b".into())),
+            Error::Backend(text) if text == "b"
+        ));
+    }
+
+    #[tokio::test]
+    async fn el_estado_con_modelo_listo_lo_informa_y_cuenta_las_conversaciones() {
+        let service = service(FakeBackend::replying("hola"), false);
+        service.new_conversation().unwrap();
+        service.new_conversation().unwrap();
+
+        let status = service.status().await;
+
+        assert!(status.backend_available);
+        assert!(status.reason.is_empty());
+        assert_eq!(status.model, model_info("modelo-de-prueba"));
+        assert_eq!(status.conversations, 2);
+    }
+
+    #[tokio::test]
+    async fn el_estado_sin_modelo_dice_por_que_y_muestra_lo_que_se_sabe_del_backend() {
+        for error in [
+            BackendError::Unavailable("no hay modelo".into()),
+            BackendError::Failed("respuesta rota".into()),
+        ] {
+            let texto = match &error {
+                BackendError::Unavailable(t) | BackendError::Failed(t) => t.clone(),
+            };
+            let mut backend = FakeBackend::replying("");
+            backend.active_result = Err(error);
+            let status = service(backend, false).status().await;
+
+            assert!(!status.backend_available);
+            assert_eq!(status.reason, texto);
+            assert_eq!(status.model, model_info(""));
+        }
+    }
+
+    #[tokio::test]
+    async fn con_la_configuracion_rechazada_el_estado_explica_el_motivo() {
+        let rejected = RejectedBackend {
+            info: model_info("gpt"),
+            reason: "Es remoto y no está permitido.".into(),
+        };
+        let status = service(rejected, false).status().await;
+        assert!(!status.backend_available);
+        assert_eq!(status.reason, "Es remoto y no está permitido.");
+        assert_eq!(status.model.name, "gpt");
+    }
+
+    #[tokio::test]
+    async fn models_devuelve_la_lista_del_backend_o_su_error() {
+        let ok = service(FakeBackend::replying(""), false);
+        assert_eq!(ok.models().await.unwrap(), ["modelo-de-prueba"]);
+
+        let mut roto = FakeBackend::replying("");
+        roto.models_result = Err(BackendError::Unavailable("apagado".into()));
+        assert!(matches!(
+            service(roto, false).models().await,
+            Err(Error::Unavailable(text)) if text == "apagado"
+        ));
+    }
+
+    #[tokio::test]
+    async fn el_chat_guarda_el_intercambio_y_el_modelo_ve_el_historial_completo() {
+        let backend = Arc::new(FakeBackend::replying("respuesta"));
+        let service = AssistantService {
+            backend: backend.clone(),
+            conversations: Arc::default(),
+            remote_allowed: false,
+        };
+        let id = service.new_conversation().unwrap();
+
+        assert_eq!(service.chat(&id, "uno").await.unwrap(), "respuesta");
+        assert_eq!(service.chat(&id, "dos").await.unwrap(), "respuesta");
+
+        let history = service.history(&id).unwrap();
+        let textos: Vec<_> = history
+            .iter()
+            .map(|m| (m.role, m.content.as_str()))
+            .collect();
+        assert_eq!(
+            textos,
+            [
+                (Role::User, "uno"),
+                (Role::Assistant, "respuesta"),
+                (Role::User, "dos"),
+                (Role::Assistant, "respuesta"),
+            ]
+        );
+        let visto = backend.seen.lock();
+        assert_eq!(visto[0].len(), 1);
+        assert_eq!(visto[1].len(), 3);
+        assert_eq!(visto[1][2].content, "dos");
+    }
+
+    #[tokio::test]
+    async fn un_chat_fallido_deja_la_conversacion_como_estaba_y_libre() {
+        let backend = Arc::new(FakeBackend::failing(BackendError::Failed("se cayó".into())));
+        let service = AssistantService {
+            backend: backend.clone(),
+            conversations: Arc::default(),
+            remote_allowed: false,
+        };
+        let id = service.new_conversation().unwrap();
+        service.chat(&id, "primero").await.unwrap_err();
+        assert!(service.history(&id).unwrap().is_empty());
+
+        *backend.chat_result.lock() = Ok("ahora sí".into());
+        assert_eq!(service.chat(&id, "segundo").await.unwrap(), "ahora sí");
+        assert_eq!(service.history(&id).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn un_chat_con_la_conversacion_ocupada_da_busy_y_el_primero_termina_bien() {
+        let (backend, gate) = FakeBackend::gated("respuesta");
+        let entered = backend.entered.clone();
+        let service = Arc::new(service(backend, false));
+        let id = service.new_conversation().unwrap();
+
+        let primero = tokio::spawn({
+            let (service, id) = (service.clone(), id.clone());
+            async move { service.chat(&id, "uno").await }
+        });
+        entered.notified().await;
+
+        // Con un plazo: si la marca de ocupada fallara, el segundo chat
+        // esperaría al modelo para siempre en vez de fallar la prueba.
+        let segundo = tokio::time::timeout(Duration::from_secs(5), service.chat(&id, "dos"))
+            .await
+            .expect("el segundo chat no debía quedar esperando al modelo");
+        assert!(matches!(segundo, Err(Error::Busy(_))));
+        gate.notify_one();
+        assert_eq!(primero.await.unwrap().unwrap(), "respuesta");
+        assert_eq!(service.history(&id).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn un_chat_abandonado_a_mitad_libera_la_conversacion_y_no_guarda_nada() {
+        let (backend, gate) = FakeBackend::gated("respuesta");
+        let entered = backend.entered.clone();
+        let service = service(backend, false);
+        let id = service.new_conversation().unwrap();
+
+        // El pedido queda esperando al modelo y se abandona (el cliente se fue).
+        tokio::select! {
+            _ = service.chat(&id, "uno") => panic!("no debía terminar"),
+            _ = entered.notified() => {}
+        }
+
+        assert!(service.history(&id).unwrap().is_empty());
+        gate.notify_one();
+        assert_eq!(service.chat(&id, "dos").await.unwrap(), "respuesta");
+        assert_eq!(service.history(&id).unwrap()[0].content, "dos");
+    }
+
+    #[tokio::test]
+    async fn un_chat_con_mensaje_invalido_no_llega_al_modelo() {
+        let backend = Arc::new(FakeBackend::replying("x"));
+        let service = AssistantService {
+            backend: backend.clone(),
+            conversations: Arc::default(),
+            remote_allowed: false,
+        };
+        let id = service.new_conversation().unwrap();
+        assert!(matches!(
+            service.chat(&id, "  ").await,
+            Err(Error::InvalidArgs(_))
+        ));
+        assert!(matches!(
+            service.chat("basura", "hola").await,
+            Err(Error::InvalidArgs(_))
+        ));
+        assert!(backend.seen.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn abrir_listar_y_cerrar_conversaciones_respeta_el_tope() {
+        let service = service(FakeBackend::replying("x"), false);
+        let ids: Vec<String> = (0..MAX_CONVERSATIONS)
+            .map(|_| service.new_conversation().unwrap())
+            .collect();
+        assert_eq!(service.conversations().len(), MAX_CONVERSATIONS);
+        assert!(matches!(
+            service.new_conversation(),
+            Err(Error::LimitExceeded(_))
+        ));
+        service.delete_conversation(&ids[0]).unwrap();
+        assert_eq!(service.conversations().len(), MAX_CONVERSATIONS - 1);
+        assert!(matches!(
+            service.delete_conversation(&ids[0]),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    // ── De punta a punta, por D-Bus ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn por_el_bus_status_capabilities_models_y_conversaciones_responden() {
+        let (proxy, _server) = connected(service(FakeBackend::replying("hola"), true)).await;
+
+        let status = proxy.status().await.unwrap();
+        assert!(status.backend_available);
+        assert_eq!(status.model.name, "modelo-de-prueba");
+        assert_eq!(status.conversations, 0);
+
+        let all = proxy.capabilities().await.unwrap();
+        assert_eq!(all.len(), DOMAINS.len());
+        assert!(capability(&all, DOMAIN_REMOTE_BACKENDS).available);
+
+        assert_eq!(proxy.models().await.unwrap(), ["modelo-de-prueba"]);
+
+        let id = proxy.new_conversation().await.unwrap();
+        assert_eq!(
+            proxy.conversations().await.unwrap(),
+            std::slice::from_ref(&id)
+        );
+        proxy.delete_conversation(&id).await.unwrap();
+        assert!(proxy.conversations().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn por_el_bus_remote_backends_sigue_a_allow_remote() {
+        let (proxy, _server) = connected(service(FakeBackend::replying("x"), false)).await;
+        let all = proxy.capabilities().await.unwrap();
+        assert!(!capability(&all, DOMAIN_REMOTE_BACKENDS).available);
+    }
+
+    #[tokio::test]
+    async fn por_el_bus_el_chat_y_el_historial_van_de_punta_a_punta() {
+        let (proxy, _server) =
+            connected(service(FakeBackend::replying("Hola, soy Lince."), false)).await;
+        let id = proxy.new_conversation().await.unwrap();
+
+        assert_eq!(proxy.chat(&id, "hola").await.unwrap(), "Hola, soy Lince.");
+
+        let history = proxy.history(&id).await.unwrap();
+        assert_eq!(
+            history,
+            [
+                Message {
+                    role: Role::User,
+                    content: "hola".into()
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: "Hola, soy Lince.".into()
+                },
+            ]
+        );
+        assert_eq!(proxy.status().await.unwrap().conversations, 1);
+    }
+
+    #[tokio::test]
+    async fn por_el_bus_cada_error_llega_con_su_nombre() {
+        let mut backend = FakeBackend::failing(BackendError::Unavailable("sin modelo".into()));
+        backend.models_result = Err(BackendError::Failed("roto".into()));
+        let (proxy, _server) = connected(service(backend, false)).await;
+        let id = proxy.new_conversation().await.unwrap();
+
+        assert!(matches!(
+            proxy.chat(&id, "hola").await,
+            Err(Error::Unavailable(text)) if text == "sin modelo"
+        ));
+        assert!(matches!(proxy.models().await, Err(Error::Backend(text)) if text == "roto"));
+        assert!(matches!(
+            proxy.chat(&id, " ").await,
+            Err(Error::InvalidArgs(_))
+        ));
+        let otro = uuid::Uuid::new_v4().to_string();
+        assert!(matches!(
+            proxy.history(&otro).await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            proxy.history("basura").await,
+            Err(Error::InvalidArgs(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn por_el_bus_el_limite_y_la_conversacion_ocupada_llegan_como_errores_propios() {
+        let (backend, gate) = FakeBackend::gated("listo");
+        let entered = backend.entered.clone();
+        let (proxy, _server) = connected(service(backend, false)).await;
+        let id = proxy.new_conversation().await.unwrap();
+
+        let ocupada = tokio::spawn({
+            let (proxy, id) = (proxy.clone(), id.clone());
+            async move { proxy.chat(&id, "uno").await }
+        });
+        entered.notified().await;
+        let error = tokio::time::timeout(Duration::from_secs(5), proxy.chat(&id, "dos"))
+            .await
+            .expect("el segundo chat no debía quedar esperando al modelo")
+            .unwrap_err();
+        assert!(matches!(error, Error::Busy(_)), "{error:?}");
+        assert_eq!(
+            error.name().as_str(),
+            "ar.net.vasak.os.Assistant.Error.Busy"
+        );
+        gate.notify_one();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), ocupada)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            "listo"
+        );
+
+        for _ in 1..MAX_CONVERSATIONS {
+            proxy.new_conversation().await.unwrap();
+        }
+        assert!(matches!(
+            proxy.new_conversation().await,
+            Err(Error::LimitExceeded(_))
+        ));
+    }
+}

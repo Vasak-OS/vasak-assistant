@@ -209,3 +209,134 @@ pub trait Assistant {
     /// Cierra una conversación y olvida sus mensajes.
     fn delete_conversation(&self, conversation_id: &str) -> Result<(), Error>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zbus::zvariant::{serialized::Context, to_bytes, LE};
+    use zbus::DBusError;
+
+    fn signature<T: Type>() -> String {
+        T::SIGNATURE.to_string()
+    }
+
+    /// Ida y vuelta por la codificación de D-Bus, que es la del cable.
+    fn round_trip<T>(value: &T) -> T
+    where
+        T: Serialize + for<'de> Deserialize<'de> + Type,
+    {
+        let context = Context::new_dbus(LE, 0);
+        let bytes = to_bytes(context, value).unwrap();
+        bytes.deserialize().unwrap().0
+    }
+
+    #[test]
+    fn la_firma_de_cada_tipo_es_la_del_contrato() {
+        // Quien replica estas firmas a mano (el escritorio, en zbus 4) depende
+        // de que no cambien sin avisar.
+        assert_eq!(signature::<Role>(), "s");
+        assert_eq!(signature::<Message>(), "(ss)");
+        assert_eq!(signature::<ModelInfo>(), "(ssbs)");
+        assert_eq!(signature::<ServiceStatus>(), "(bs(ssbs)u)");
+        assert_eq!(signature::<Capability>(), "(sbs)");
+    }
+
+    #[test]
+    fn los_roles_viajan_como_texto_en_minuscula() {
+        for (role, name) in [
+            (Role::System, "system"),
+            (Role::User, "user"),
+            (Role::Assistant, "assistant"),
+        ] {
+            let bytes = to_bytes(Context::new_dbus(LE, 0), &role).unwrap();
+            // Un string D-Bus: largo (u32), texto y NUL final.
+            let mut expected = (name.len() as u32).to_le_bytes().to_vec();
+            expected.extend_from_slice(name.as_bytes());
+            expected.push(0);
+            assert_eq!(&*bytes, expected.as_slice(), "{role:?}");
+            assert_eq!(round_trip(&role), role);
+        }
+    }
+
+    #[test]
+    fn los_tipos_sobreviven_a_la_codificacion_de_dbus() {
+        let message = Message {
+            role: Role::Assistant,
+            content: "Hola, ¿qué tal? 👋".into(),
+        };
+        assert_eq!(round_trip(&message), message);
+
+        let status = ServiceStatus {
+            backend_available: true,
+            reason: String::new(),
+            model: ModelInfo {
+                provider: PROVIDER_OLLAMA.into(),
+                name: "llama3.2:latest".into(),
+                local: true,
+                host: "127.0.0.1".into(),
+            },
+            conversations: 3,
+        };
+        assert_eq!(round_trip(&status), status);
+
+        let capabilities: Vec<Capability> = DOMAINS
+            .iter()
+            .map(|domain| Capability {
+                domain: (*domain).into(),
+                available: false,
+                reason: "todavía no".into(),
+            })
+            .collect();
+        assert_eq!(round_trip(&capabilities), capabilities);
+    }
+
+    #[test]
+    fn cada_error_tiene_su_nombre_propio_en_el_bus() {
+        let prefix = "ar.net.vasak.os.Assistant.Error";
+        let casos = [
+            (Error::Unavailable(String::new()), "Unavailable"),
+            (Error::Backend(String::new()), "Backend"),
+            (Error::InvalidArgs(String::new()), "InvalidArgs"),
+            (Error::NotFound(String::new()), "NotFound"),
+            (Error::LimitExceeded(String::new()), "LimitExceeded"),
+            (Error::Busy(String::new()), "Busy"),
+        ];
+        for (error, name) in casos {
+            assert_eq!(error.name().as_str(), format!("{prefix}.{name}"));
+        }
+    }
+
+    #[test]
+    fn el_texto_del_error_viaja_como_descripcion() {
+        assert_eq!(
+            Error::Busy("esperando".into()).description(),
+            Some("esperando")
+        );
+    }
+
+    #[test]
+    fn las_direcciones_del_servicio_son_coherentes_entre_si() {
+        assert_eq!(SERVICE_INTERFACE, SERVICE_NAME);
+        assert_eq!(SERVICE_PATH, format!("/{}", SERVICE_NAME.replace('.', "/")));
+    }
+
+    #[test]
+    fn los_dominios_son_siete_sin_repetirse_y_terminan_en_remote_backends() {
+        assert_eq!(DOMAINS.len(), 7);
+        let mut sorted = DOMAINS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), DOMAINS.len());
+        assert_eq!(DOMAINS.last(), Some(&DOMAIN_REMOTE_BACKENDS));
+        assert!(DOMAINS.contains(&DOMAIN_MAIL));
+    }
+
+    #[test]
+    fn los_limites_son_coherentes_para_que_un_mensaje_siempre_quepa_en_el_historial() {
+        const {
+            assert!(MAX_MESSAGE_BYTES * 2 <= MAX_HISTORY_BYTES);
+            assert!(MAX_HISTORY_MESSAGES >= 2);
+            assert!(MAX_CONVERSATIONS > 0);
+        }
+    }
+}
