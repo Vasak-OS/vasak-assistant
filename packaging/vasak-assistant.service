@@ -9,27 +9,25 @@ Type=exec
 ExecStart=/usr/bin/vasak-assistant
 Restart=on-failure
 RestartSec=3
-# La dirección de Ollama y el modelo se cambian con
-# `systemctl --user edit vasak-assistant`:
-#   Environment=VASAK_ASSISTANT_OLLAMA_URL=http://127.0.0.1:11434
-#   Environment=VASAK_ASSISTANT_MODEL=llama3.2
+# El backend se elige en la sección `assistant` de ~/.config/vasak/vasak.conf
+# (ver el README); la clave de un proveedor, en el llavero. Ninguna de las dos
+# cosas va acá.
 
 # En esta fase el servicio sólo conversa: guarda las conversaciones en memoria,
-# no escribe nada en disco, no lee datos del usuario y habla con un único
-# servidor, Ollama, en la propia máquina. Se le saca todo lo demás.
+# no escribe nada en disco, lee `vasak.conf` y la clave del llavero, y habla
+# con un único servidor de modelo. Se le saca todo lo demás.
 NoNewPrivileges=yes
 CapabilityBoundingSet=
-# AF_UNIX para el bus de sesión. AF_INET y AF_INET6 sólo porque Ollama escucha
-# por TCP (127.0.0.1:11434): no hay otra forma de hablarle.
+# AF_UNIX para el bus de sesión. AF_INET y AF_INET6 porque los backends hablan
+# HTTP por TCP: Ollama o llama.cpp en 127.0.0.1 por omisión, y un proveedor
+# remoto sólo si la persona lo permitió (`allow_remote`) y sólo por https.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-# Sin `IPAddressAllow=localhost` + `IPAddressDeny=any` ni
-# `RestrictNetworkInterfaces=lo`, a propósito: son filtros BPF y el gestor de
-# usuario de systemd no los puede aplicar («unit configures an IP firewall, but
-# not running as root»); quedarían escritos sin hacer nada. `PrivateNetwork=`
-# tampoco sirve: el loopback propio no llega al Ollama de la máquina. Que la
-# conversación no salga de la caja lo asegura el servicio: sólo acepta una
-# dirección de loopback por http, no sigue redirecciones y no usa el proxy del
-# entorno (`daemon/src/config.rs`, `daemon/src/ollama.rs`).
+# Sin `IPAddressAllow=`/`IPAddressDeny=` ni `RestrictNetworkInterfaces=`: son
+# filtros BPF y el gestor de usuario de systemd no los aplica («unit configures
+# an IP firewall, but not running as root»); quedarían escritos sin hacer nada.
+# Que la conversación no salga de la caja sin permiso lo decide el servicio
+# (`daemon/src/config.rs`), que además no sigue redirecciones ni usa el proxy
+# del entorno (`daemon/src/http.rs`).
 PrivateDevices=yes
 PrivateTmp=yes
 ProtectClock=yes
@@ -50,8 +48,8 @@ SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 
 # `strict`: no escribe nada en ningún lado, así que todo el sistema de archivos
-# queda de sólo lectura. `read-only` en la carpeta personal: no la necesita en
-# esta fase (la memoria, fase 4, vivirá en el almacén cifrado).
+# queda de sólo lectura. `read-only` en la carpeta personal: sólo lee
+# `vasak.conf` (la memoria, fase 4, vivirá en el almacén cifrado).
 ProtectSystem=strict
 ProtectHome=read-only
 

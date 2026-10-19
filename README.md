@@ -9,7 +9,7 @@ archivos, la web— es un permiso que se concede, igual que los tokens de
 
 El diseño completo, las fases y el porqué viven en el issue ancla **#1**.
 
-## Lo que hay hoy (fase 1)
+## Lo que hay hoy (fase 1, y parte de la 2)
 
 El servicio y el contrato:
 
@@ -17,13 +17,63 @@ El servicio y el contrato:
   (`ar.net.vasak.os.Assistant` en `/ar/net/vasak/os/Assistant`), los tipos que
   viajan, los límites y el proxy de zbus 5.
 - **`daemon/`** (`vasak-assistant-daemon`, binario `vasak-assistant`): conversa
-  con un modelo **local** por [Ollama](https://ollama.com). Las conversaciones
-  viven en memoria y se pierden al cerrar el servicio.
+  con un modelo por uno de dos backends intercambiables:
+  - **`ollama`** (por omisión): [Ollama](https://ollama.com) en
+    `http://127.0.0.1:11434`.
+  - **`openai`**: cualquier servidor compatible con la API de OpenAI —el propio
+    OpenAI y la mayoría de los proveedores, o llama.cpp server y LM Studio en la
+    máquina—.
+
+  Las conversaciones viven en memoria y se pierden al cerrar el servicio.
 
 Todavía no tiene ninguna capacidad sobre datos del usuario: `Capabilities` las
-informa todas como **no disponibles**. Si Ollama no corre o no tiene el modelo,
-`Status` lo dice con un motivo legible y `Chat` devuelve el error
+informa como **no disponibles**. Si el backend no responde, no tiene el modelo,
+pide una clave que no está o la configuración no se puede usar, `Status` lo dice
+con un motivo legible y `Chat` devuelve el error
 `ar.net.vasak.os.Assistant.Error.Unavailable`; el servicio sigue en pie.
+
+## Configuración
+
+En la sección `assistant` de `~/.config/vasak/vasak.conf` (o la ruta de
+`VASAK_CONFIG_PATH`). Todo es opcional; sin la sección, Ollama local. Se lee al
+arrancar: después de cambiarla, `systemctl --user restart vasak-assistant`.
+
+```json
+{
+  "assistant": {
+    "backend": "openai",
+    "url": "https://api.openai.com/v1",
+    "model": "gpt-4o-mini",
+    "allow_remote": true
+  }
+}
+```
+
+| Clave | Por omisión |
+|---|---|
+| `backend` | `ollama`; también `openai` |
+| `url` | `http://127.0.0.1:11434` con `ollama`, `http://127.0.0.1:8080/v1` (llama.cpp server) con `openai` |
+| `model` | el primero que ofrezca el backend; con un remoto es obligatorio |
+| `allow_remote` | `false` |
+
+**Local o remoto.** Lo decide la dirección, no una declaración: un host
+`localhost` o una IP de loopback es **local**; cualquier otro es **remoto**. Un
+remoto sólo se usa con `allow_remote: true`, sólo por `https` y con el modelo
+elegido; si no, queda no disponible con el motivo. `Status` informa en
+`model.local` y `model.host` si la conversación sale de la máquina y hacia
+dónde.
+
+**La clave del proveedor nunca va en la configuración.** Se lee de
+`vasak-keyring` (el Secret Service de la sesión), del ítem con los atributos
+`service=ar.net.vasak.os.Assistant` y `url=` la dirección base terminada en
+`/`. Hasta que esté el panel de Configuración:
+
+```bash
+secret-tool store --label='Lince' service ar.net.vasak.os.Assistant url https://api.openai.com/v1/
+```
+
+La clave queda atada a esa dirección: si la configuración cambia de servidor, la
+clave de antes no viaja al nuevo.
 
 ## Correrlo
 
@@ -40,13 +90,6 @@ busctl --user call $d $p $d Status
 id=$(busctl --user call $d $p $d NewConversation | cut -d'"' -f2)
 busctl --user call $d $p $d Chat ss "$id" "Hola, ¿quién sos?"
 ```
-
-Dos variables de entorno, opcionales:
-
-| Variable | Por omisión |
-|---|---|
-| `VASAK_ASSISTANT_OLLAMA_URL` | `http://127.0.0.1:11434` (sólo se acepta una dirección de la propia máquina) |
-| `VASAK_ASSISTANT_MODEL` | el primer modelo que tenga Ollama |
 
 Instalado, lo arranca systemd como servicio de usuario
 (`packaging/vasak-assistant.service`, parte de `graphical-session.target`) o

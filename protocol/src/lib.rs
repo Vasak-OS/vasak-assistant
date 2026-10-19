@@ -7,10 +7,12 @@
 //!
 //! # Lo que hay en esta fase
 //!
-//! Conversación con un modelo local y nada más. Ninguna capacidad sobre datos
-//! del usuario: [`Assistant::capabilities`] las lista todas como **no
-//! disponibles**, nunca como un error ni como un método que falla (decisión de
-//! producto, vasak-accounts#24). Lo que falta se ve que falta.
+//! Conversación con un modelo, local por omisión (Ollama en la máquina) o, si la
+//! persona lo permitió explícitamente, un proveedor remoto compatible con la API
+//! de OpenAI. Ninguna capacidad sobre datos del usuario:
+//! [`Assistant::capabilities`] las lista como **no disponibles**, nunca como un
+//! error ni como un método que falla (decisión de producto,
+//! vasak-accounts#24). Lo que falta se ve que falta.
 
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::Type;
@@ -41,6 +43,15 @@ pub const MAX_HISTORY_MESSAGES: usize = 100;
 /// Cuántos bytes de texto guarda una conversación entre todos sus mensajes.
 /// Pasado eso se olvidan los más viejos, igual que con [`MAX_HISTORY_MESSAGES`].
 pub const MAX_HISTORY_BYTES: usize = 512 * 1024;
+
+// ── Proveedores ───────────────────────────────────────────────────────────────
+
+/// Ollama, con su API propia (`/api/chat`, `/api/tags`).
+pub const PROVIDER_OLLAMA: &str = "ollama";
+/// Cualquier servidor compatible con la API de OpenAI (`/chat/completions`,
+/// `/models`): el de OpenAI y la mayoría de los proveedores, pero también
+/// llama.cpp server o LM Studio en la máquina.
+pub const PROVIDER_OPENAI: &str = "openai";
 
 // ── Dominios ──────────────────────────────────────────────────────────────────
 
@@ -91,13 +102,19 @@ pub struct Message {
 /// El modelo con el que responde el asistente.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct ModelInfo {
-    /// El proveedor: `ollama` en esta fase.
+    /// El proveedor: uno de los `PROVIDER_*`.
     pub provider: String,
     /// El nombre del modelo, tal como lo conoce el proveedor
     /// (`llama3.2:latest`). Vacío si todavía no hay ninguno.
     pub name: String,
-    /// Si corre en la máquina: nada de la conversación sale de la caja.
+    /// Si corre en la máquina: nada de la conversación sale de la caja. Sale de
+    /// la dirección efectiva del backend (el host es de loopback), no de nada
+    /// que alguien haya declarado. Es el dato para el indicador de «esto sale de
+    /// la caja»: `false` quiere decir que cada mensaje viaja a [`Self::host`].
     pub local: bool,
+    /// El host al que se le habla (`127.0.0.1`, `api.openai.com`). Vacío si la
+    /// dirección configurada no se pudo leer.
+    pub host: String,
 }
 
 /// Cómo está el servicio.
@@ -136,8 +153,9 @@ pub struct Capability {
 pub enum Error {
     #[zbus(error)]
     ZBus(zbus::Error),
-    /// No hay un modelo que pueda responder: Ollama no corre, o no tiene el
-    /// modelo. El texto lo explica para la persona.
+    /// No hay un modelo que pueda responder: el backend no corre, no tiene el
+    /// modelo, pide una clave que no está en el llavero, o la configuración
+    /// eligió un remoto sin permitirlo. El texto lo explica para la persona.
     Unavailable(String),
     /// El modelo respondió algo que no se pudo usar, o tardó demasiado.
     Backend(String),
@@ -167,8 +185,9 @@ pub trait Assistant {
     /// Cómo está el servicio: si hay modelo, cuál, y por qué no si no.
     fn status(&self) -> Result<ServiceStatus, Error>;
 
-    /// Las capacidades sobre cada dominio de [`DOMAINS`]. En esta fase todas
-    /// vienen como no disponibles.
+    /// Las capacidades sobre cada dominio de [`DOMAINS`]. En esta fase las de
+    /// datos del usuario vienen como no disponibles; `remote_backends` dice si
+    /// la configuración permite un proveedor remoto.
     fn capabilities(&self) -> Result<Vec<Capability>, Error>;
 
     /// Los modelos instalados en el backend. `Unavailable` si no responde.

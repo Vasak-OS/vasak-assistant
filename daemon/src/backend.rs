@@ -1,8 +1,10 @@
 //! La interfaz común de los backends de modelo.
 //!
-//! El motor de conversación y la interfaz D-Bus sólo conocen este rasgo: hoy lo
-//! implementa Ollama ([`crate::ollama`]); un proveedor remoto (fase 2) será otra
-//! implementación, y las pruebas pueden poner una de mentira.
+//! El motor de conversación y la interfaz D-Bus sólo conocen este rasgo. Lo
+//! implementan Ollama ([`crate::ollama`]), cualquier servidor compatible con la
+//! API de OpenAI ([`crate::openai`]) y [`RejectedBackend`], que es lo que queda
+//! cuando la configuración no se puede usar. Las pruebas pueden poner uno de
+//! mentira.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -16,8 +18,9 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Por qué el backend no respondió.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendError {
-    /// No hay con quién hablar: el proveedor no corre o no tiene el modelo. El
-    /// texto es para la persona.
+    /// No hay con quién hablar: el proveedor no corre, no tiene el modelo, pide
+    /// una clave que no hay, o la configuración no se puede usar. El texto es
+    /// para la persona.
     Unavailable(String),
     /// Respondió, pero algo que no sirve: un estado HTTP de error, un cuerpo
     /// ilegible o demasiado grande, o tardó más de la cuenta.
@@ -25,9 +28,9 @@ pub enum BackendError {
 }
 
 pub trait ModelBackend: Send + Sync {
-    /// El proveedor y si es local, sin preguntarle nada a nadie.
-    fn provider(&self) -> &str;
-    fn is_local(&self) -> bool;
+    /// Lo que se sabe sin preguntarle nada a nadie: proveedor, host, si es
+    /// local, y el modelo configurado (vacío si se elige solo).
+    fn info(&self) -> ModelInfo;
 
     /// Los modelos que el proveedor tiene. Sirve también para saber si está.
     fn models(&self) -> BoxFuture<'_, Result<Vec<String>, BackendError>>;
@@ -39,4 +42,36 @@ pub trait ModelBackend: Send + Sync {
     /// La respuesta del modelo a la conversación, que termina con el mensaje de
     /// la persona.
     fn chat<'a>(&'a self, messages: &'a [Message]) -> BoxFuture<'a, Result<String, BackendError>>;
+}
+
+/// El backend que queda cuando la configuración no se puede usar (un remoto sin
+/// permiso, una dirección inválida…): responde siempre «no disponible» con el
+/// motivo, así el servicio sigue en pie y el estado lo explica.
+pub struct RejectedBackend {
+    pub info: ModelInfo,
+    pub reason: String,
+}
+
+impl RejectedBackend {
+    fn unavailable(&self) -> BackendError {
+        BackendError::Unavailable(self.reason.clone())
+    }
+}
+
+impl ModelBackend for RejectedBackend {
+    fn info(&self) -> ModelInfo {
+        self.info.clone()
+    }
+
+    fn models(&self) -> BoxFuture<'_, Result<Vec<String>, BackendError>> {
+        Box::pin(async move { Err(self.unavailable()) })
+    }
+
+    fn active_model(&self) -> BoxFuture<'_, Result<ModelInfo, BackendError>> {
+        Box::pin(async move { Err(self.unavailable()) })
+    }
+
+    fn chat<'a>(&'a self, _: &'a [Message]) -> BoxFuture<'a, Result<String, BackendError>> {
+        Box::pin(async move { Err(self.unavailable()) })
+    }
 }

@@ -12,7 +12,9 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use zbus::interface;
 
-use vasak_assistant_protocol::{Capability, Error, Message, ModelInfo, ServiceStatus, DOMAINS};
+use vasak_assistant_protocol::{
+    Capability, Error, Message, ServiceStatus, DOMAINS, DOMAIN_REMOTE_BACKENDS,
+};
 
 use crate::backend::{BackendError, ModelBackend};
 use crate::conversations::Conversations;
@@ -20,6 +22,8 @@ use crate::conversations::Conversations;
 pub struct AssistantService {
     pub backend: Arc<dyn ModelBackend>,
     pub conversations: Arc<Mutex<Conversations>>,
+    /// Si la configuración permite un backend remoto (`allow_remote`).
+    pub remote_allowed: bool,
 }
 
 #[interface(name = "ar.net.vasak.os.Assistant")]
@@ -37,20 +41,16 @@ impl AssistantService {
             Err(error) => ServiceStatus {
                 backend_available: false,
                 reason: reason(&error).to_owned(),
-                model: ModelInfo {
-                    provider: self.backend.provider().to_owned(),
-                    name: String::new(),
-                    local: self.backend.is_local(),
-                },
+                model: self.backend.info(),
                 conversations,
             },
         }
     }
 
-    /// Las capacidades sobre cada dominio. En esta fase ninguna está: se dicen
-    /// no disponibles, nunca rotas.
+    /// Las capacidades sobre cada dominio. Las de datos del usuario no están
+    /// en esta fase: se dicen no disponibles, nunca rotas.
     fn capabilities(&self) -> Vec<Capability> {
-        unavailable_capabilities()
+        capabilities(self.remote_allowed)
     }
 
     /// Los modelos instalados en el backend.
@@ -114,14 +114,28 @@ impl Drop for Turn<'_> {
     }
 }
 
-/// Todas las capacidades de [`DOMAINS`], no disponibles.
-pub fn unavailable_capabilities() -> Vec<Capability> {
+/// Las capacidades de [`DOMAINS`]. `remote_backends` está si la configuración
+/// permite un proveedor remoto; las demás, todavía no.
+pub fn capabilities(remote_allowed: bool) -> Vec<Capability> {
     DOMAINS
         .iter()
-        .map(|domain| Capability {
-            domain: (*domain).to_owned(),
-            available: false,
-            reason: "Todavía no está disponible en esta versión del asistente.".into(),
+        .map(|&domain| {
+            let (available, reason) = match domain {
+                DOMAIN_REMOTE_BACKENDS if remote_allowed => (true, ""),
+                DOMAIN_REMOTE_BACKENDS => (
+                    false,
+                    "Desactivado: la configuración no permite proveedores remotos («allow_remote»).",
+                ),
+                _ => (
+                    false,
+                    "Todavía no está disponible en esta versión del asistente.",
+                ),
+            };
+            Capability {
+                domain: domain.to_owned(),
+                available,
+                reason: reason.to_owned(),
+            }
         })
         .collect()
 }

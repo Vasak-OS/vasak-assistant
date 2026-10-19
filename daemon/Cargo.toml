@@ -16,10 +16,13 @@ serde.workspace = true
 serde_json = "1"
 zbus.workspace = true
 tokio.workspace = true
-# Sólo HTTP contra Ollama en la máquina: sin TLS, así no entra ni OpenSSL ni
-# rustls. Un backend remoto (fase 2) decide su propio transporte.
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# rustls y no OpenSSL, como el resto del workspace: un proveedor remoto va por
+# https, y así no hace falta ninguna biblioteca de TLS del sistema.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 uuid = { version = "1", features = ["v4"] }
+# Los directorios base XDG, como en vasak-health-service: la regla de que una
+# ruta relativa o vacía se ignora vive ahí y no en una copia acá.
+dirs = "6"
 parking_lot = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,8 +1,10 @@
 //! El asistente de IA residente de VasakOS (Lince, por omisión).
 //!
 //! Fase 1: el servicio y el contrato. Expone D-Bus en el bus de sesión y
-//! conversa con un modelo local por Ollama, sin ninguna capacidad sobre los
-//! datos del usuario. Las conversaciones viven en memoria; nada se guarda.
+//! conversa con un modelo —local por omisión (Ollama), o un proveedor
+//! compatible con OpenAI si la configuración lo elige— sin ninguna capacidad
+//! sobre los datos del usuario. Las conversaciones viven en memoria; nada se
+//! guarda.
 //!
 //! No dibuja nada: el chat y el panel de Configuración son otras superficies
 //! que le hablan por D-Bus. Por eso es un demonio de Rust y no una aplicación
@@ -11,18 +13,25 @@
 mod backend;
 mod config;
 mod conversations;
+mod http;
+mod keyring;
 mod ollama;
+mod openai;
 mod service;
 
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::info;
-use zbus::connection;
+use tracing::{info, warn};
+use zbus::{connection, Connection};
 
+use backend::{ModelBackend, RejectedBackend};
+use config::BackendKind;
 use conversations::Conversations;
+use keyring::SecretService;
 use ollama::OllamaBackend;
+use openai::OpenAiBackend;
 use service::AssistantService;
 use vasak_assistant_protocol::{SERVICE_NAME, SERVICE_PATH};
 
@@ -37,15 +46,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let (url, model) = config::from_env();
-    info!(
-        "backend: Ollama en {url}, modelo {}",
-        model.as_deref().unwrap_or("(el primero instalado)")
-    );
+    let settings = config::read_settings();
+    let client = http::client()?;
+    let backend: Arc<dyn ModelBackend> = match config::select_backend(&settings) {
+        Ok(selection) => {
+            info!(
+                "backend: {} en {} ({}), modelo {}",
+                config::provider_name(selection.kind),
+                http::origin(&selection.url),
+                if selection.local { "local" } else { "remoto" },
+                selection
+                    .model
+                    .as_deref()
+                    .unwrap_or("(el primero que ofrezca)")
+            );
+            match selection.kind {
+                BackendKind::Ollama => Arc::new(OllamaBackend::new(client, selection)),
+                BackendKind::OpenAi => {
+                    let secrets = SecretService {
+                        connection: Connection::session().await?,
+                    };
+                    Arc::new(OpenAiBackend::new(client, selection, Arc::new(secrets)))
+                }
+            }
+        }
+        Err(rejection) => {
+            warn!("backend no disponible: {}", rejection.reason);
+            Arc::new(RejectedBackend {
+                info: rejection.info,
+                reason: rejection.reason,
+            })
+        }
+    };
 
     let service = AssistantService {
-        backend: Arc::new(OllamaBackend::new(url, model)?),
+        backend,
         conversations: Arc::new(Mutex::new(Conversations::default())),
+        remote_allowed: settings.allow_remote,
     };
 
     let _connection = connection::Builder::session()?

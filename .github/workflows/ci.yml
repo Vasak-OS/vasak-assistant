@@ -28,8 +28,11 @@ jobs:
       # Las pruebas de Rust corren en `revisar` y de esa misma corrida sale la
       # cobertura que se le pasa a Sonar.
       pruebas_rust: -p vasak-assistant-protocol -p vasak-assistant-daemon
-      # Sin `paquetes_rust`, a propósito: mirado con `cargo tree -i`, el grafo
-      # no tiene ni `cc` ni `pkg-config` ni ningún `-sys` que compile C
-      # (`linux-raw-sys` es Rust puro). reqwest va sin TLS, así que tampoco
-      # entra OpenSSL. El enlazador del runner alcanza, y vacío no corre ni un
-      # `apt-get update`.
+      # Lo que pide el grafo en Linux, mirado con `cargo tree -i`:
+      #
+      #   build-essential  el compilador de C de `ring` (vía `cc`), que trae
+      #                    rustls para el https de los proveedores remotos
+      #
+      # Nada más: no hay `pkg-config` ni otro `-sys`, y sin OpenSSL.
+      paquetes_rust: >-
+        build-essential
