@@ -1,0 +1,22 @@
+# El demonio y el protocolo van separados para que el escritorio, Configuración
+# y las aplicaciones —que viven en otros repositorios— puedan depender del
+# contrato sin arrastrar nada de lo que el servicio necesita para su trabajo
+# (el cliente HTTP, el runtime, los backends de modelo).
+[workspace]
+resolver = "2"
+members = ["protocol", "daemon"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Vasak Group", "Joaquin (Pato) Decima"]
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+vasak-assistant-protocol = { path = "protocol" }
+serde = { version = "1", features = ["derive"] }
+# El rasgo `tokio` hace que zbus corra los métodos de la interfaz sobre el
+# runtime de Tokio. Sin él se ejecutan sobre el ejecutor propio de zbus, donde
+# reqwest y `tokio::time` entran en pánico con «there is no reactor running».
+zbus = { version = "5", features = ["tokio"] }
+tokio = { version = "1", features = ["full"] }

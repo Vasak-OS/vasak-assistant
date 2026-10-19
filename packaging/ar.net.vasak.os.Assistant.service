@@ -1,0 +1,7 @@
+[D-BUS Service]
+# Normalmente ya corre como servicio de usuario; esto deja que el escritorio,
+# Configuración o la terminal lo arranquen si alguien le habla antes de que
+# graphical-session.target haya llegado tan lejos.
+Name=ar.net.vasak.os.Assistant
+Exec=/usr/bin/vasak-assistant
+SystemdService=vasak-assistant.service
