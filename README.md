@@ -66,11 +66,19 @@ dónde.
 **La clave del proveedor nunca va en la configuración.** Se lee de
 `vasak-keyring` (el Secret Service de la sesión), del ítem con los atributos
 `service=ar.net.vasak.os.Assistant` y `url=` la dirección base terminada en
-`/`. Hasta que esté el panel de Configuración:
+`/`. Se guarda desde **Configuración → Asistente**, o con `secret-tool`:
 
 ```bash
 secret-tool store --label='Lince' service ar.net.vasak.os.Assistant url https://api.openai.com/v1/
 ```
+
+Configuración no toca el llavero: le pasa la clave al servicio, que es quien
+crea el ítem.
+
+| Método | Qué hace |
+|---|---|
+| `SetProviderKey(s url, s key) → ()` | Guarda la clave de esa dirección en la colección por omisión del llavero, reemplazando la anterior. La dirección se normaliza como la de `vasak.conf` (con `/` final); un host remoto tiene que ser `https`. La clave se recorta y va de 1 a 4096 bytes sin caracteres de control. `InvalidArgs` si algo no vale; `Unavailable` si el llavero está bloqueado (no abre ningún diálogo) o no responde. La clave nunca vuelve en un error ni va al registro. |
+| `HasProviderKey(s url) → b` | Si hay una clave guardada para esa dirección (aunque el llavero esté bloqueado). Con más de una para la misma dirección da `false`, porque el servicio no usa ninguna. Nunca devuelve la clave. |
 
 La clave queda atada a esa dirección: si la configuración cambia de servidor, la
 clave de antes no viaja al nuevo.

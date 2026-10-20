@@ -2,6 +2,21 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-assistant 0.2.0
+
+La clave del proveedor se guarda por el servicio, para la pantalla «Asistente»
+de Configuración (fase 3 de #1).
+
+- **`protocol`** — dos métodos nuevos en el proxy: `SetProviderKey(url, key)` y
+  `HasProviderKey(url)`.
+- **`daemon`** — `SetProviderKey` valida la dirección (`normalize_url`, la misma
+  forma con la que después se busca la clave; un remoto sólo por https) y la
+  clave, y la guarda en el llavero con `CreateItem`, reemplazando la anterior.
+  Con el llavero bloqueado contesta `Unavailable` y no abre ningún diálogo.
+  `HasProviderKey` dice si hay una clave utilizable para esa dirección (con más
+  de una, `false`, igual que la lectura). La clave nunca va al registro ni a un
+  mensaje de error.
+
 ## vasak-assistant 0.1.0
 
 Primera versión: el servicio y el contrato (fase 1 de #1), con parte de la

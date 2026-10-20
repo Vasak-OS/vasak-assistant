@@ -220,6 +220,32 @@ pub trait Assistant {
 
     /// Cierra una conversación y olvida sus mensajes.
     fn delete_conversation(&self, conversation_id: &str) -> Result<(), Error>;
+
+    /// Guarda en el llavero de la sesión la clave del proveedor de `url`,
+    /// reemplazando la que hubiera. Es lo que usa el panel de Configuración:
+    /// así sólo el servicio escribe el ítem del llavero.
+    ///
+    /// `url` se normaliza igual que la de `vasak.conf` (`http` o `https`, sin
+    /// consulta ni fragmento, con `/` final), así que
+    /// `https://api.openai.com/v1` y `https://api.openai.com/v1/` son la misma
+    /// clave. La clave se recorta y tiene que tener de 1 a 4096 bytes sin
+    /// caracteres de control.
+    ///
+    /// - `InvalidArgs`: la dirección no se puede usar (ilegible, otro esquema,
+    ///   sin host, con usuario o contraseña, o un host remoto que no es
+    ///   `https`) o la clave no es válida.
+    /// - `Unavailable`: el llavero está bloqueado o no responde. No se abre
+    ///   ningún diálogo de desbloqueo: el motivo dice qué hacer.
+    ///
+    /// La clave nunca vuelve en un error ni va al registro.
+    fn set_provider_key(&self, url: &str, key: &str) -> Result<(), Error>;
+
+    /// Si hay una clave guardada en el llavero para `url` (normalizada igual
+    /// que en [`Self::set_provider_key`]), aunque el llavero esté bloqueado.
+    /// Si hay más de una para la misma dirección da `false`: el servicio no usa
+    /// ninguna hasta que quede una sola. Nunca devuelve la clave. `InvalidArgs` si la dirección no se puede usar,
+    /// `Unavailable` si el llavero no responde.
+    fn has_provider_key(&self, url: &str) -> Result<bool, Error>;
 }
 
 #[cfg(test)]
