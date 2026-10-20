@@ -19,13 +19,17 @@ use vasak_assistant_protocol::{
 };
 
 use crate::backend::{BackendError, ModelBackend};
+use crate::config::{is_local, normalize_url};
 use crate::conversations::Conversations;
+use crate::keyring::{ApiKey, SecretSource};
 
 pub struct AssistantService {
     pub backend: Arc<dyn ModelBackend>,
     pub conversations: Arc<Mutex<Conversations>>,
     /// Si la configuración permite un backend remoto (`allow_remote`).
     pub remote_allowed: bool,
+    /// El llavero, para guardar y consultar la clave del proveedor.
+    pub secrets: Arc<dyn SecretSource>,
 }
 
 #[interface(name = "ar.net.vasak.os.Assistant")]
@@ -106,6 +110,16 @@ impl AssistantService {
     ) -> Result<(), Error> {
         self.delete_as(owner(&header), conversation_id)
     }
+
+    /// Guarda en el llavero la clave del proveedor de esa dirección.
+    async fn set_provider_key(&self, url: &str, key: &str) -> Result<(), Error> {
+        self.store_provider_key(url, key).await
+    }
+
+    /// Si hay una clave guardada para esa dirección.
+    async fn has_provider_key(&self, url: &str) -> Result<bool, Error> {
+        self.has_provider_key_for(url).await
+    }
 }
 
 /// Lo mismo que la interfaz, con el dueño ya resuelto: se puede llamar sin bus.
@@ -164,6 +178,32 @@ impl AssistantService {
 
     pub fn delete_as(&self, owner: &str, conversation_id: &str) -> Result<(), Error> {
         self.conversations.lock().delete(owner, conversation_id)
+    }
+
+    /// La dirección se normaliza igual que al elegir el backend, así el ítem
+    /// queda con el mismo atributo `url` que después se busca. A un remoto sólo
+    /// se le guarda clave por `https`: por `http` viajaría en claro. Ni la
+    /// clave ni la dirección cruda van a un mensaje de error.
+    pub async fn store_provider_key(&self, url: &str, key: &str) -> Result<(), Error> {
+        let url = normalize_url(url).map_err(Error::InvalidArgs)?;
+        if !is_local(&url) && url.scheme() != "https" {
+            return Err(Error::InvalidArgs(format!(
+                "«{}» es un proveedor remoto: su clave sólo se guarda para una dirección https.",
+                url.host_str().unwrap_or_default()
+            )));
+        }
+        let key = ApiKey::parse(key.as_bytes()).ok_or_else(|| {
+            Error::InvalidArgs(
+                "La clave no es válida: no puede estar vacía, pasar de 4096 bytes ni llevar caracteres de control."
+                    .into(),
+            )
+        })?;
+        self.secrets.store_key(url.as_str(), &key).await
+    }
+
+    pub async fn has_provider_key_for(&self, url: &str) -> Result<bool, Error> {
+        let url = normalize_url(url).map_err(Error::InvalidArgs)?;
+        self.secrets.has_key(url.as_str()).await
     }
 }
 
@@ -269,7 +309,7 @@ mod tests {
 
     use super::*;
     use crate::backend::RejectedBackend;
-    use crate::test_support::{model_info, p2p_pair, FakeBackend};
+    use crate::test_support::{model_info, p2p_pair, FakeBackend, FixedKey};
     use vasak_assistant_protocol::{
         AssistantProxy, Role, DOMAIN_MAIL, DOMAIN_MEMORY, MAX_CONVERSATIONS,
         MAX_CONVERSATIONS_PER_OWNER, SERVICE_PATH,
@@ -283,6 +323,7 @@ mod tests {
             backend: Arc::new(backend),
             conversations: Arc::new(Mutex::new(Conversations::default())),
             remote_allowed,
+            secrets: FixedKey::new(None),
         }
     }
 
@@ -414,6 +455,7 @@ mod tests {
             backend: backend.clone(),
             conversations: Arc::default(),
             remote_allowed: false,
+            secrets: FixedKey::new(None),
         };
         let id = service.open(OWNER).unwrap();
 
@@ -453,6 +495,7 @@ mod tests {
             backend: backend.clone(),
             conversations: Arc::default(),
             remote_allowed: false,
+            secrets: FixedKey::new(None),
         };
         let id = service.open(OWNER).unwrap();
         service.chat_as(OWNER, &id, "primero").await.unwrap_err();
@@ -520,6 +563,7 @@ mod tests {
             backend: backend.clone(),
             conversations: Arc::default(),
             remote_allowed: false,
+            secrets: FixedKey::new(None),
         };
         let id = service.open(OWNER).unwrap();
         assert!(matches!(
@@ -691,6 +735,7 @@ mod tests {
             backend: backend.clone(),
             conversations: Arc::default(),
             remote_allowed: false,
+            secrets: FixedKey::new(None),
         };
         let id = service.open(":1.1").unwrap();
         service.chat_as(":1.1", &id, "secreto").await.unwrap();

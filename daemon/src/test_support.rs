@@ -12,7 +12,7 @@ use reqwest::{Client, Url};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
-use vasak_assistant_protocol::{Message, ModelInfo};
+use vasak_assistant_protocol::{Error, Message, ModelInfo};
 use zbus::{connection, Connection};
 
 use crate::backend::{BackendError, BoxFuture, ModelBackend};
@@ -253,10 +253,13 @@ pub fn local_selection(backend: &str, url: &str, model: Option<&str>) -> Selecti
 
 // ── Llavero de mentira ────────────────────────────────────────────────────────
 
-/// Una clave fija; guarda las direcciones por las que le preguntaron.
+/// Una clave fija; guarda las direcciones por las que le preguntaron y lo que
+/// le pidieron guardar.
 pub struct FixedKey {
     pub key: Option<ApiKey>,
     pub asked: Mutex<Vec<String>>,
+    /// Cada `store_key`: la dirección y la clave.
+    pub stored: Mutex<Vec<(String, ApiKey)>>,
 }
 
 impl FixedKey {
@@ -264,6 +267,7 @@ impl FixedKey {
         Arc::new(Self {
             key: key.and_then(|key| ApiKey::parse(key.as_bytes())),
             asked: Mutex::default(),
+            stored: Mutex::default(),
         })
     }
 }
@@ -273,6 +277,17 @@ impl SecretSource for FixedKey {
         self.asked.lock().push(url.to_owned());
         let key = self.key.clone();
         Box::pin(async move { key })
+    }
+
+    fn store_key<'a>(&'a self, url: &'a str, key: &'a ApiKey) -> BoxFuture<'a, Result<(), Error>> {
+        self.stored.lock().push((url.to_owned(), key.clone()));
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Hay clave si la fija existe o si se guardó una para esa dirección.
+    fn has_key<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<bool, Error>> {
+        let has = self.key.is_some() || self.stored.lock().iter().any(|(u, _)| u == url);
+        Box::pin(async move { Ok(has) })
     }
 }
 

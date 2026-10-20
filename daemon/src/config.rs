@@ -154,31 +154,7 @@ pub fn select_backend(settings: &Settings) -> Result<Selection, Rejection> {
         },
         reason,
     };
-    let mut url = Url::parse(raw_url).map_err(|error| {
-        reject_unparsed(format!("La dirección del modelo es inválida: {error}."))
-    })?;
-    if url.scheme() != "http" && url.scheme() != "https" {
-        return Err(reject_unparsed(
-            "La dirección del modelo tiene que ser http o https.".into(),
-        ));
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(reject_unparsed(
-            "La dirección del modelo no puede llevar usuario ni contraseña: la clave va en el llavero."
-                .into(),
-        ));
-    }
-    if url.host_str().is_none_or(str::is_empty) {
-        return Err(reject_unparsed(
-            "La dirección del modelo no tiene host.".into(),
-        ));
-    }
-    url.set_query(None);
-    url.set_fragment(None);
-    if !url.path().ends_with('/') {
-        let path = format!("{}/", url.path());
-        url.set_path(&path);
-    }
+    let url = normalize_url(raw_url).map_err(reject_unparsed)?;
 
     let selection = Selection {
         kind,
@@ -205,6 +181,39 @@ pub fn select_backend(settings: &Settings) -> Result<Selection, Rejection> {
         info: selection.info(),
         reason,
     })
+}
+
+/// La dirección base de un backend, normalizada: `http` o `https`, con host,
+/// sin usuario ni contraseña, sin consulta ni fragmento y terminada en `/`
+/// para que `join` agregue la ruta en vez de reemplazar el último tramo
+/// (`.../v1` + `models`).
+///
+/// Es también el atributo `url` del ítem de la clave en el llavero
+/// ([`crate::keyring`]): quien guarda la clave y quien la lee tienen que
+/// normalizar igual, o no se encuentran. `Err` lleva el motivo para la
+/// persona, sin la dirección (podría traer una contraseña).
+pub fn normalize_url(raw: &str) -> Result<Url, String> {
+    let mut url = Url::parse(raw.trim())
+        .map_err(|error| format!("La dirección del modelo es inválida: {error}."))?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err("La dirección del modelo tiene que ser http o https.".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(
+            "La dirección del modelo no puede llevar usuario ni contraseña: la clave va en el llavero."
+                .into(),
+        );
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err("La dirección del modelo no tiene host.".into());
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    if !url.path().ends_with('/') {
+        let path = format!("{}/", url.path());
+        url.set_path(&path);
+    }
+    Ok(url)
 }
 
 fn clean(value: Option<&str>) -> Option<&str> {

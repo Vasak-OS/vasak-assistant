@@ -75,6 +75,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let settings = config::read_settings();
     let client = http::client()?;
+    // El llavero lo usan el backend (para leer la clave) y el servicio (para
+    // guardarla desde Configuración).
+    let secrets = Arc::new(SecretService {
+        connection: Connection::session().await?,
+    });
     let backend: Arc<dyn ModelBackend> = match config::select_backend(&settings) {
         Ok(selection) => {
             info!(
@@ -90,10 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let backend: Arc<dyn ModelBackend> = match selection.kind {
                 BackendKind::Ollama => Arc::new(OllamaBackend::new(client, selection)),
                 BackendKind::OpenAi => {
-                    let secrets = SecretService {
-                        connection: Connection::session().await?,
-                    };
-                    Arc::new(OpenAiBackend::new(client, selection, Arc::new(secrets)))
+                    Arc::new(OpenAiBackend::new(client, selection, secrets.clone()))
                 }
             };
             Arc::new(Limited::new(backend))
@@ -112,6 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         backend,
         conversations: conversations.clone(),
         remote_allowed: settings.allow_remote,
+        secrets,
     };
 
     let connection = connection::Builder::session()?

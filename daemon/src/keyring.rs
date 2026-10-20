@@ -13,9 +13,12 @@
 //!   (terminada en `/`, p. ej. `https://api.openai.com/v1/`)
 //!
 //! La clave queda atada a la dirección: si alguien cambia la dirección en
-//! `vasak.conf` hacia otro servidor, la clave de antes no viaja a ése. Hasta que
-//! esté el panel (fase 3) se guarda con
+//! `vasak.conf` hacia otro servidor, la clave de antes no viaja a ése. La
+//! guarda el propio servicio ([`SecretSource::store_key`], el método
+//! `SetProviderKey`), que es lo que usa el panel de Configuración, o a mano
 //! `secret-tool store --label='Lince' service ar.net.vasak.os.Assistant url https://api.openai.com/v1/`.
+//! Que la escriba el servicio y no el panel deja un solo ejecutable creando el
+//! ítem, para cuando `vasak-keyring` lo restrinja a ése (vasak-keyring#55).
 //!
 //! Lo que esto **no** da: el ítem no lleva un esquema protegido como los tokens
 //! de `vasak-accounts`, así que otro proceso de la misma sesión puede leerlo,
@@ -32,6 +35,7 @@
 
 use std::collections::HashMap;
 
+use vasak_assistant_protocol::Error;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::Connection;
 
@@ -41,9 +45,14 @@ const SECRETS_NAME: &str = "org.freedesktop.secrets";
 const SECRETS_PATH: &str = "/org/freedesktop/secrets";
 const SECRETS_SERVICE: &str = "org.freedesktop.Secret.Service";
 const SECRETS_SESSION: &str = "org.freedesktop.Secret.Session";
+const SECRETS_COLLECTION: &str = "org.freedesktop.Secret.Collection";
+/// La colección por omisión (`login`, en una sesión normal).
+const DEFAULT_COLLECTION: &str = "/org/freedesktop/secrets/aliases/default";
 
 /// El valor del atributo `service` de los ítems del asistente.
 pub const ITEM_SERVICE: &str = "ar.net.vasak.os.Assistant";
+/// La etiqueta con la que se ve el ítem en el llavero.
+pub const ITEM_LABEL: &str = "Lince";
 
 /// El tope de una clave. Ninguna de verdad se le acerca.
 const MAX_KEY_BYTES: usize = 4096;
@@ -74,11 +83,23 @@ impl std::fmt::Debug for ApiKey {
     }
 }
 
-/// De dónde sale la clave. Un rasgo para que las pruebas pongan una de mentira.
+/// De dónde sale la clave y dónde se guarda. Un rasgo para que las pruebas
+/// pongan uno de mentira.
+///
+/// `url` es siempre la dirección ya normalizada
+/// ([`crate::config::normalize_url`]).
 pub trait SecretSource: Send + Sync {
     /// La clave guardada para esa dirección base, o `None` si no hay, el
     /// llavero está bloqueado o no responde.
     fn api_key<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Option<ApiKey>>;
+
+    /// Guarda la clave para esa dirección, reemplazando la que hubiera.
+    /// `Unavailable` si el llavero está bloqueado (no se abre ningún diálogo)
+    /// o no responde. El error nunca lleva la clave.
+    fn store_key<'a>(&'a self, url: &'a str, key: &'a ApiKey) -> BoxFuture<'a, Result<(), Error>>;
+
+    /// Si hay algún ítem para esa dirección, bloqueado o no.
+    fn has_key<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<bool, Error>>;
 }
 
 /// El llavero de la sesión, por la API del Secret Service.
@@ -99,15 +120,40 @@ impl SecretSource for SecretService {
             }
         })
     }
+
+    fn store_key<'a>(&'a self, url: &'a str, key: &'a ApiKey) -> BoxFuture<'a, Result<(), Error>> {
+        Box::pin(async move {
+            self.store(url, key).await.map_err(|error| {
+                // El error es del bus (la clave viaja en el cuerpo del pedido,
+                // nunca en un error); va al registro y a quien llamó.
+                tracing::warn!("no se pudo guardar la clave en el llavero: {error}");
+                Error::Unavailable(format!(
+                    "No se pudo guardar la clave en el llavero: {error}"
+                ))
+            })?
+        })
+    }
+
+    fn has_key<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<bool, Error>> {
+        Box::pin(async move {
+            let (unlocked, locked) = self.search(url).await.map_err(|error| {
+                Error::Unavailable(format!("No se pudo consultar el llavero: {error}"))
+            })?;
+            Ok(!unlocked.is_empty() || !locked.is_empty())
+        })
+    }
 }
 
 type Secret = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
 
 impl SecretService {
-    async fn lookup(&self, url: &str) -> zbus::Result<Option<ApiKey>> {
+    /// Los ítems del asistente para esa dirección: (desbloqueados, bloqueados).
+    async fn search(
+        &self,
+        url: &str,
+    ) -> zbus::Result<(Vec<OwnedObjectPath>, Vec<OwnedObjectPath>)> {
         let attributes = HashMap::from([("service", ITEM_SERVICE), ("url", url)]);
-        let (unlocked, locked): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) = self
-            .connection
+        self.connection
             .call_method(
                 Some(SECRETS_NAME),
                 SECRETS_PATH,
@@ -117,7 +163,40 @@ impl SecretService {
             )
             .await?
             .body()
+            .deserialize()
+    }
+
+    async fn open_session(&self) -> zbus::Result<OwnedObjectPath> {
+        let (_, session): (OwnedValue, OwnedObjectPath) = self
+            .connection
+            .call_method(
+                Some(SECRETS_NAME),
+                SECRETS_PATH,
+                Some(SECRETS_SERVICE),
+                "OpenSession",
+                &("plain", Value::from("")),
+            )
+            .await?
+            .body()
             .deserialize()?;
+        Ok(session)
+    }
+
+    async fn close_session(&self, session: &OwnedObjectPath) {
+        let _ = self
+            .connection
+            .call_method(
+                Some(SECRETS_NAME),
+                session.as_str(),
+                Some(SECRETS_SESSION),
+                "Close",
+                &(),
+            )
+            .await;
+    }
+
+    async fn lookup(&self, url: &str) -> zbus::Result<Option<ApiKey>> {
+        let (unlocked, locked) = self.search(url).await?;
         // Más de un ítem con los mismos atributos: cualquiera de la sesión puede
         // crear uno, así que otro proceso pudo haber plantado su clave al lado de
         // la verdadera. No se adivina cuál es cuál: no se usa ninguna.
@@ -137,18 +216,7 @@ impl SecretService {
             return Ok(None);
         };
 
-        let (_, session): (OwnedValue, OwnedObjectPath) = self
-            .connection
-            .call_method(
-                Some(SECRETS_NAME),
-                SECRETS_PATH,
-                Some(SECRETS_SERVICE),
-                "OpenSession",
-                &("plain", Value::from("")),
-            )
-            .await?
-            .body()
-            .deserialize()?;
+        let session = self.open_session().await?;
         let secrets = self
             .connection
             .call_method(
@@ -165,20 +233,82 @@ impl SecretService {
                     .deserialize::<HashMap<OwnedObjectPath, Secret>>()
             });
         // La sesión se cierra pase lo que pase con la lectura.
-        let _ = self
-            .connection
-            .call_method(
-                Some(SECRETS_NAME),
-                session.as_str(),
-                Some(SECRETS_SESSION),
-                "Close",
-                &(),
-            )
-            .await;
+        self.close_session(&session).await;
         Ok(secrets?
             .remove(&item)
             .and_then(|(_, _, value, _)| ApiKey::parse(&value)))
     }
+
+    /// `CreateItem` en la colección por omisión con `replace`. El `Err` de
+    /// afuera es del bus; el de adentro, el motivo ya armado para la persona.
+    async fn store(&self, url: &str, key: &ApiKey) -> zbus::Result<Result<(), Error>> {
+        // Se pregunta antes de escribir: con la colección bloqueada,
+        // `CreateItem` devolvería un diálogo de desbloqueo, y abrirlo es de
+        // quien usa el sistema, no de un servicio en segundo plano.
+        let locked: OwnedValue = self
+            .connection
+            .call_method(
+                Some(SECRETS_NAME),
+                DEFAULT_COLLECTION,
+                Some("org.freedesktop.DBus.Properties"),
+                "Get",
+                &(SECRETS_COLLECTION, "Locked"),
+            )
+            .await?
+            .body()
+            .deserialize()?;
+        if bool::try_from(locked).unwrap_or(true) {
+            return Ok(Err(locked_error()));
+        }
+
+        let attributes = HashMap::from([("service", ITEM_SERVICE), ("url", url)]);
+        let properties = HashMap::from([
+            ("org.freedesktop.Secret.Item.Label", Value::from(ITEM_LABEL)),
+            (
+                "org.freedesktop.Secret.Item.Attributes",
+                Value::from(attributes),
+            ),
+        ]);
+        let session = self.open_session().await?;
+        let secret = (
+            &session,
+            Vec::<u8>::new(),
+            key.expose().as_bytes(),
+            "text/plain",
+        );
+        let created = self
+            .connection
+            .call_method(
+                Some(SECRETS_NAME),
+                DEFAULT_COLLECTION,
+                Some(SECRETS_COLLECTION),
+                "CreateItem",
+                &(properties, secret, true),
+            )
+            .await
+            .and_then(|reply| {
+                reply
+                    .body()
+                    .deserialize::<(OwnedObjectPath, OwnedObjectPath)>()
+            });
+        self.close_session(&session).await;
+        let (_, prompt) = created?;
+        // Un prompt quiere decir que hace falta desbloquear (la colección se
+        // bloqueó entre la consulta y la escritura). No se llama a `Prompt`.
+        // shortcut: el objeto prompt queda sin `Dismiss`; el llavero lo descarta
+        // con la sesión del cliente. Si alguno lo mostrara solo, sumar `Dismiss`.
+        if prompt.as_str() != "/" {
+            return Ok(Err(locked_error()));
+        }
+        Ok(Ok(()))
+    }
+}
+
+fn locked_error() -> Error {
+    Error::Unavailable(
+        "El llavero está bloqueado: desbloquealo (al iniciar sesión, o desde el llavero) y volvé a guardar la clave."
+            .into(),
+    )
 }
 
 #[cfg(test)]
@@ -326,16 +456,92 @@ mod tests {
         }
     }
 
+    /// Cómo está la colección por omisión para `CreateItem`.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Collection {
+        Unlocked,
+        /// `Locked` da `true`: no se debería llegar a `CreateItem`.
+        Locked,
+        /// `Locked` da `false` pero `CreateItem` contesta con un prompt (se
+        /// bloqueó entre la consulta y la escritura).
+        Prompts,
+    }
+
+    /// Un `CreateItem` tal como llegó.
+    #[derive(Debug, Clone)]
+    struct Created {
+        label: String,
+        attributes: HashMap<String, String>,
+        session: String,
+        value: Vec<u8>,
+        content_type: String,
+        replace: bool,
+    }
+
+    /// La colección por omisión: anota cada `CreateItem`.
+    struct FakeCollection {
+        state: Collection,
+        created: Arc<Mutex<Vec<Created>>>,
+    }
+
+    #[interface(name = "org.freedesktop.Secret.Collection")]
+    impl FakeCollection {
+        #[zbus(property)]
+        fn locked(&self) -> bool {
+            self.state == Collection::Locked
+        }
+
+        fn create_item(
+            &self,
+            properties: HashMap<String, OwnedValue>,
+            secret: Secret,
+            replace: bool,
+        ) -> (OwnedObjectPath, OwnedObjectPath) {
+            let label = properties
+                .get("org.freedesktop.Secret.Item.Label")
+                .and_then(|value| String::try_from(value.try_clone().ok()?).ok())
+                .unwrap_or_default();
+            let attributes = properties
+                .get("org.freedesktop.Secret.Item.Attributes")
+                .and_then(|value| HashMap::<String, String>::try_from(value.try_clone().ok()?).ok())
+                .unwrap_or_default();
+            let (session, _, value, content_type) = secret;
+            self.created.lock().push(Created {
+                label,
+                attributes,
+                session: session.to_string(),
+                value,
+                content_type,
+                replace,
+            });
+            let prompt = match self.state {
+                Collection::Prompts => "/org/freedesktop/secrets/prompt/p1",
+                _ => "/",
+            };
+            (
+                OwnedObjectPath::try_from(ITEM).unwrap(),
+                OwnedObjectPath::try_from(prompt).unwrap(),
+            )
+        }
+    }
+
     struct Setup {
         service: SecretService,
         closed: Arc<Mutex<u32>>,
         sessions_opened: Arc<Mutex<Vec<String>>>,
+        created: Arc<Mutex<Vec<Created>>>,
         _server: Connection,
     }
 
     async fn secret_service(item: Item, secret: &[u8]) -> Setup {
+        secret_service_with(item, secret, Collection::Unlocked).await
+    }
+
+    /// El llavero de mentira con la colección por omisión en `collection`.
+    async fn secret_service_with(item: Item, secret: &[u8], collection: Collection) -> Setup {
         let closed = Arc::new(Mutex::new(0));
         let sessions_opened = Arc::new(Mutex::new(Vec::new()));
+        let created = Arc::new(Mutex::new(Vec::new()));
         let fake = FakeSecrets {
             url: "https://api.ejemplo.com/v1/".into(),
             secret: secret.to_vec(),
@@ -343,10 +549,15 @@ mod tests {
             sessions_opened: sessions_opened.clone(),
         };
         let session = FakeSession(closed.clone());
+        let collection = FakeCollection {
+            state: collection,
+            created: created.clone(),
+        };
         let (server, client) = p2p_pair(|builder| {
             builder
                 .serve_at(SECRETS_PATH, fake)?
-                .serve_at(SESSION, session)
+                .serve_at(SESSION, session)?
+                .serve_at(DEFAULT_COLLECTION, collection)
         })
         .await
         .unwrap();
@@ -354,6 +565,7 @@ mod tests {
             service: SecretService { connection: client },
             closed,
             sessions_opened,
+            created,
             _server: server,
         }
     }
