@@ -426,11 +426,8 @@ pub fn memory_status_off() -> vasak_assistant_protocol::MemoryStatus {
 
 /// Una carpeta temporal propia de la prueba, que se borra al soltarla. La
 /// memoria de una prueba va en `TempDir::new().memory_dir()`.
-// Infraestructura para las pruebas de la memoria, que escribe qa.
-#[allow(dead_code)]
 pub struct TempDir(PathBuf);
 
-#[allow(dead_code)]
 impl TempDir {
     pub fn new() -> Self {
         let path =
@@ -534,15 +531,12 @@ impl ModelBackend for FakeBackend {
 /// después la extracción de recuerdos en JSON, por ejemplo) y anota cada
 /// pedido en `seen`. Sin respuestas programadas contesta `""`. `local` decide
 /// si se presenta como local o remoto.
-// Infraestructura para las pruebas de la memoria, que escribe qa.
-#[allow(dead_code)]
 pub struct ScriptedBackend {
     pub replies: Mutex<std::collections::VecDeque<Result<String, BackendError>>>,
     pub seen: Mutex<Vec<Vec<Message>>>,
     pub local: bool,
 }
 
-#[allow(dead_code)]
 impl ScriptedBackend {
     pub fn new(replies: impl IntoIterator<Item = &'static str>) -> Arc<Self> {
         Arc::new(Self {

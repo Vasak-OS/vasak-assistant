@@ -340,6 +340,27 @@ mod tests {
         assert_eq!(signature::<ModelInfo>(), "(ssbs)");
         assert_eq!(signature::<ServiceStatus>(), "(bs(ssbs)u)");
         assert_eq!(signature::<Capability>(), "(sbs)");
+        assert_eq!(signature::<MemoryStatus>(), "(bbst)");
+    }
+
+    #[test]
+    fn el_estado_de_la_memoria_hace_ida_y_vuelta_por_dbus() {
+        for status in [
+            MemoryStatus {
+                enabled: true,
+                available: true,
+                reason: String::new(),
+                bytes: 4 << 20,
+            },
+            MemoryStatus {
+                enabled: false,
+                available: false,
+                reason: "La memoria está apagada".into(),
+                bytes: u64::MAX,
+            },
+        ] {
+            assert_eq!(round_trip(&status), status);
+        }
     }
 
     #[test]

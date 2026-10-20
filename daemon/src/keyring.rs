@@ -1069,9 +1069,7 @@ mod tests {
 
     struct Setup {
         service: SecretService,
-        /// Las llamadas al llavero, en orden. Para las pruebas de la memoria,
-        /// que escribe qa.
-        #[allow(dead_code)]
+        /// Las llamadas al llavero, en orden.
         calls: Calls,
         closed: Arc<Mutex<u32>>,
         sessions_opened: Arc<Mutex<Vec<String>>>,
@@ -1086,14 +1084,6 @@ mod tests {
     /// El llavero de mentira con la colección por omisión en `collection`.
     async fn secret_service_with(item: Item, secret: &[u8], collection: Collection) -> Setup {
         secret_service_full(item, secret, collection, true).await
-    }
-
-    /// Con los ítems de `item` guardados por una versión anterior: `{service,
-    /// url}` sin `xdg:schema`. Para probar la migración.
-    // Infraestructura para las pruebas de la migración, que escribe qa.
-    #[allow(dead_code)]
-    async fn secret_service_legacy(item: Item, secret: &[u8], collection: Collection) -> Setup {
-        secret_service_full(item, secret, collection, false).await
     }
 
     async fn secret_service_full(
@@ -1489,5 +1479,223 @@ mod tests {
         let text = String::from_utf8(log.0.lock().clone()).unwrap();
         assert!(text.contains("llavero bloqueado"), "{text}");
         assert!(!text.contains("hay 2 claves"), "{text}");
+    }
+
+    // ── La llave de la memoria y el esquema protegido ─────────────────────────
+
+    /// Planta un ítem como lo haría otro proceso de la sesión: con los
+    /// atributos que se le antojen.
+    async fn plant(setup: &Setup, attributes: &[(&str, &str)], value: &[u8]) {
+        setup
+            .service
+            .store_secret(
+                attributes.iter().copied().collect(),
+                "plantado",
+                value,
+                "application/octet-stream",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    fn memory_key_bytes(key: MemoryKey) -> Option<[u8; MEMORY_KEY_BYTES]> {
+        match key {
+            MemoryKey::Found(key) => Some(*key),
+            _ => None,
+        }
+    }
+
+    fn owned(attributes: HashMap<&str, &str>) -> HashMap<String, String> {
+        attributes
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect()
+    }
+
+    fn planted_memory_key(value: Vec<u8>) -> Created {
+        Created {
+            label: MEMORY_LABEL.into(),
+            attributes: owned(memory_attributes()),
+            session: SESSION.into(),
+            value,
+            content_type: String::new(),
+            replace: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn la_llave_de_la_memoria_se_crea_con_los_tres_atributos_etiqueta_y_reemplazo() {
+        let setup = secret_service(Item::Unlocked, b"").await;
+
+        setup.service.store_memory_key(&[9u8; 32]).await.unwrap();
+
+        let created = setup.created.lock();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].label, MEMORY_LABEL);
+        assert_eq!(
+            created[0].attributes,
+            HashMap::from([
+                ("service".to_owned(), ITEM_SERVICE.to_owned()),
+                ("purpose".to_owned(), MEMORY_PURPOSE.to_owned()),
+                ("xdg:schema".to_owned(), ITEM_SERVICE.to_owned()),
+            ])
+        );
+        assert_eq!(created[0].value, [9u8; 32]);
+        assert_eq!(created[0].content_type, "application/octet-stream");
+        assert!(created[0].replace);
+    }
+
+    #[tokio::test]
+    async fn la_llave_que_se_guarda_se_encuentra_con_los_mismos_atributos_y_vuelve_igual() {
+        let setup = secret_service(Item::Unlocked, b"").await;
+        assert!(matches!(
+            setup.service.memory_key().await.unwrap(),
+            MemoryKey::Missing
+        ));
+
+        setup.service.store_memory_key(&[9u8; 32]).await.unwrap();
+
+        let key = setup.service.memory_key().await.unwrap();
+        assert_eq!(memory_key_bytes(key), Some([9u8; 32]));
+        // Una sesión para guardar y otra para leer, las dos cerradas.
+        assert_eq!(*setup.closed.lock(), 2);
+    }
+
+    #[tokio::test]
+    async fn un_item_plantado_sin_esquema_con_service_y_purpose_no_se_usa_como_llave() {
+        let setup = secret_service(Item::Unlocked, b"").await;
+        plant(
+            &setup,
+            &[("service", ITEM_SERVICE), ("purpose", MEMORY_PURPOSE)],
+            &[6u8; 32],
+        )
+        .await;
+
+        let key = setup.service.memory_key().await.unwrap();
+
+        assert!(matches!(key, MemoryKey::Missing), "{key:?}");
+    }
+
+    #[tokio::test]
+    async fn con_la_llave_de_verdad_y_una_plantada_sin_esquema_gana_la_de_verdad() {
+        let setup = secret_service(Item::Unlocked, b"").await;
+        plant(
+            &setup,
+            &[("service", ITEM_SERVICE), ("purpose", MEMORY_PURPOSE)],
+            &[6u8; 32],
+        )
+        .await;
+        setup.service.store_memory_key(&[9u8; 32]).await.unwrap();
+
+        let key = setup.service.memory_key().await.unwrap();
+
+        assert_eq!(memory_key_bytes(key), Some([9u8; 32]));
+    }
+
+    #[tokio::test]
+    async fn una_llave_que_no_son_32_bytes_es_invalida_y_con_el_llavero_bloqueado_esta_bloqueada() {
+        let setup = secret_service(Item::Unlocked, b"").await;
+        plant(
+            &setup,
+            &[
+                ("service", ITEM_SERVICE),
+                ("purpose", MEMORY_PURPOSE),
+                ("xdg:schema", ITEM_SERVICE),
+            ],
+            &[1, 2, 3],
+        )
+        .await;
+        assert!(matches!(
+            setup.service.memory_key().await.unwrap(),
+            MemoryKey::Invalid
+        ));
+
+        let locked = secret_service_with(Item::Unlocked, b"", Collection::Locked).await;
+        locked
+            .created
+            .lock()
+            .push(planted_memory_key(vec![9u8; 32]));
+        assert!(matches!(
+            locked.service.memory_key().await.unwrap(),
+            MemoryKey::Locked
+        ));
+        // Un llavero bloqueado no entrega la llave ni abre una sesión.
+        assert!(locked.sessions_opened.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn borrar_la_llave_la_saca_y_con_el_llavero_bloqueado_da_unavailable() {
+        let setup = secret_service(Item::Unlocked, b"").await;
+        setup.service.store_memory_key(&[9u8; 32]).await.unwrap();
+        setup.service.delete_memory_key().await.unwrap();
+        assert!(matches!(
+            setup.service.memory_key().await.unwrap(),
+            MemoryKey::Missing
+        ));
+        // Borrar lo que no está tampoco falla.
+        setup.service.delete_memory_key().await.unwrap();
+
+        let prompts = secret_service_with(Item::Unlocked, b"", Collection::Prompts).await;
+        prompts
+            .created
+            .lock()
+            .push(planted_memory_key(vec![9u8; 32]));
+        assert!(matches!(
+            prompts.service.delete_memory_key().await,
+            Err(Error::Unavailable(text)) if text.contains("bloqueado")
+        ));
+    }
+
+    #[tokio::test]
+    async fn is_locked_sigue_a_la_coleccion_y_sin_llavero_es_unavailable() {
+        for (collection, esperado) in [(Collection::Unlocked, false), (Collection::Locked, true)] {
+            let setup = secret_service_with(Item::Unlocked, b"", collection).await;
+            assert_eq!(setup.service.is_locked().await.unwrap(), esperado);
+        }
+        let (_server, client) =
+            p2p_pair(|builder| builder.serve_at(SESSION, FakeSession(Arc::default())))
+                .await
+                .unwrap();
+        let service = SecretService { connection: client };
+        assert!(matches!(
+            service.is_locked().await,
+            Err(Error::Unavailable(_))
+        ));
+        assert!(matches!(
+            service.memory_key().await,
+            Err(Error::Unavailable(_))
+        ));
+        assert!(matches!(
+            service.delete_memory_key().await,
+            Err(Error::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn el_debug_de_la_llave_de_la_memoria_no_la_muestra() {
+        let key = MemoryKey::Found(Zeroizing::new([0xABu8; 32]));
+        assert_eq!(format!("{key:?}"), "Found(…)");
+        for (other, text) in [
+            (MemoryKey::Missing, "Missing"),
+            (MemoryKey::Locked, "Locked"),
+            (MemoryKey::Duplicated, "Duplicated"),
+            (MemoryKey::Invalid, "Invalid"),
+        ] {
+            assert_eq!(format!("{other:?}"), text);
+        }
+    }
+
+    #[tokio::test]
+    async fn la_clave_con_esquema_gana_y_no_dispara_ninguna_migracion() {
+        let setup = secret_service(Item::Unlocked, b"sk-nueva").await;
+
+        assert_eq!(
+            setup.service.api_key(URL).await.unwrap().expose(),
+            "sk-nueva"
+        );
+
+        assert!(setup.created.lock().is_empty());
+        assert!(!setup.calls.lock().contains(&"Delete"));
     }
 }

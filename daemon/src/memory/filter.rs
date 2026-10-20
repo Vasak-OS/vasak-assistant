@@ -133,3 +133,154 @@ pub fn normalize_terms(text: &str) -> String {
         .to_lowercase();
     folded.split_whitespace().collect::<Vec<_>>().join(" ")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cada_patron_de_secreto_se_detecta() {
+        for secreto in [
+            "usá sk-proj1234abcd5678 para eso",
+            "mi token es ghp_abcdefghijklmnop1234",
+            "github_pat_abcdefghijklmnop1234",
+            "glpat-abcdefghijklmnop1234",
+            "xoxb-123456789-abcdef",
+            "AKIAIOSFODNN7EXAMPLE",
+            "ASIAIOSFODNN7EXAMPLE",
+            "AIzaSyA-abcdefghijklmnopqrstu",
+            "hf_abcdefghijklmnop1234",
+            "eyJhbGciOiJI.eyJzdWIiOiIx.SflKxwRJSMeKKF2QT4",
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "-----BEGIN PRIVATE KEY-----",
+            "Authorization: Bearer abcdef123456",
+            "bearer   tokensecreto",
+            "postgres://usuario:clave@servidor/base",
+            "0123456789abcdef0123456789abcdef",
+            "password: hunter2",
+            "contraseña = hunter2",
+            "contrasena: hunter2",
+            "api_key=abc",
+            "API-KEY: abc",
+            "pin: 1234",
+            "token=xyz",
+            "secret: xyz",
+            "mi contraseña es hunter2",
+            "la clave es tal",
+            "el pin es cuatro",
+            "mi código es uno",
+            "mi token es este",
+            "QWxhZGRpbjpvcGVuIHNlc2FtZTEyMw",
+        ] {
+            assert!(contains_secret(secreto), "{secreto}");
+        }
+    }
+
+    #[test]
+    fn una_tarjeta_con_luhn_valido_es_secreto_y_con_un_digito_cambiado_no() {
+        for tarjeta in [
+            "4111111111111111",
+            "4111 1111 1111 1111",
+            "4111-1111-1111-1111",
+            "5500 0000 0000 0004",
+            "378282246310005",
+            "mi tarjeta 4012888888881881 vence pronto",
+        ] {
+            assert!(contains_secret(tarjeta), "{tarjeta}");
+        }
+        for casi in ["4111111111111112", "4111 1111 1111 1110", "1234567890123"] {
+            assert!(!contains_secret(casi), "{casi}");
+        }
+    }
+
+    #[test]
+    fn luhn_sobre_digitos_sueltos() {
+        assert!(luhn(&[7, 9, 9, 2, 7, 3, 9, 8, 7, 1, 3]));
+        assert!(!luhn(&[7, 9, 9, 2, 7, 3, 9, 8, 7, 1, 4]));
+        assert!(!luhn(&[]));
+        assert!(luhn(&[0]));
+    }
+
+    #[test]
+    fn lo_que_parece_secreto_pero_es_una_frase_normal_pasa() {
+        for frase in [
+            "me gusta el sk8",
+            "tengo 3 gatos",
+            "prefiero Python",
+            "prefiero respuestas cortas",
+            "me llamo Ana y soy diseñadora",
+            "trabajo de 9 a 17",
+            "uso Arch Linux desde 2019",
+            "mi clave de sol está desafinada",
+            "el pin de la tabla",
+            "Prefiere que lo trate de vos",
+            "internacionalizacióndelossistemasoperativos",
+        ] {
+            assert!(!contains_secret(frase), "{frase}");
+        }
+    }
+
+    #[test]
+    fn cada_clase_de_dato_de_la_persona_se_detecta() {
+        for dato in [
+            "escribile a ana@ejemplo.com",
+            "ana.perez+lince@sub.dominio.org",
+            "llamame al +54 9 11 5555-1234",
+            "mi número es 11 5555 1234",
+            "tel (011) 4555-1234",
+            "está en /home/ana/Documentos",
+            "guardalo en ~/Descargas",
+            "(/etc/hosts) es el archivo",
+            "abrí file:///tmp/a.txt",
+            "FILE://servidor/x",
+            r"el archivo C:\Users\ana",
+            "mirá https://ejemplo.com/ruta/privada",
+            "http://ejemplo.com?id=7",
+            "https://ejemplo.com/#seccion",
+            "mi CBU es 0170099220000067797370",
+            "el alias de la cuenta 1234567890123456789012",
+            "IBAN ES9121000418450200051332",
+            "nací el 12/03/1990",
+            "el 5-6-24 fue",
+            "el 3.4.2021",
+            "2024-05-17",
+            "el 15 de marzo",
+            "Es el 3 de Septiembre",
+            "en marzo de 2024",
+            "enero 2025",
+        ] {
+            assert!(is_user_data(dato), "{dato}");
+        }
+    }
+
+    #[test]
+    fn los_falsos_positivos_de_datos_de_la_persona_pasan() {
+        for frase in [
+            "me gusta el sk8",
+            "tengo 3 gatos",
+            "prefiero Python",
+            "prefiero las respuestas cortas",
+            "le interesa el 3D y la impresión",
+            "usa Linux y/o Windows",
+            "prefiere 24 horas",
+            "trabaja de lunes a viernes",
+            "le gusta marzo",
+            "https://ejemplo.com",
+            "le gustan las rutas con 1/2 de pendiente",
+            "dice que 2 + 2 es 4",
+            "tiene 1234567 puntos",
+        ] {
+            assert!(!is_user_data(frase), "{frase}");
+        }
+    }
+
+    #[test]
+    fn los_terminos_van_sin_tildes_en_minusculas_y_con_los_espacios_colapsados() {
+        assert_eq!(
+            normalize_terms("  Canción   NUEVA\tÑandú "),
+            "cancion nueva nandu"
+        );
+        assert_eq!(normalize_terms("canción"), normalize_terms("cancion"));
+        assert_eq!(normalize_terms(""), "");
+    }
+}

@@ -621,3 +621,619 @@ async fn blocking<T: Send + 'static>(
         .await
         .unwrap_or_else(|error| Err(error.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::learn::Item;
+    use super::*;
+    use crate::test_support::{FixedKey, ScriptedBackend, TempDir};
+
+    /// Una memoria de prueba: su carpeta, su llavero de mentira y la memoria.
+    struct Fixture {
+        tmp: TempDir,
+        keys: Arc<FixedKey>,
+        memory: Arc<Memory>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let tmp = TempDir::new();
+            let keys = FixedKey::new(None);
+            let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
+            Self { tmp, keys, memory }
+        }
+
+        /// Una memoria nueva sobre la misma carpeta y el mismo llavero: como
+        /// si el servicio se hubiera reiniciado.
+        fn restarted(&self) -> Arc<Memory> {
+            Arc::new(Memory::new(Some(self.tmp.memory_dir()), self.keys.clone()))
+        }
+
+        async fn enabled() -> Self {
+            let fixture = Self::new();
+            fixture.memory.set_enabled(true).await.unwrap();
+            fixture
+        }
+
+        fn files(&self) -> PathBuf {
+            self.tmp.memory_dir()
+        }
+
+        fn key_is_stored(&self) -> bool {
+            self.keys.memory_key.lock().is_some()
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.keys.calls.lock().clone()
+        }
+    }
+
+    fn preference(text: &str) -> Extraction {
+        Extraction {
+            items: vec![Item {
+                kind: MemoryKind::Preference,
+                text: text.into(),
+                phrase: None,
+                topics: Vec::new(),
+            }],
+            summary: None,
+        }
+    }
+
+    /// Todos los bytes de los archivos bajo `path`.
+    fn bytes_under(path: &Path) -> Vec<Vec<u8>> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(bytes_under(&path));
+            } else {
+                found.push(std::fs::read(&path).unwrap());
+            }
+        }
+        found
+    }
+
+    fn contains(haystack: &[u8], needle: &str) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes())
+    }
+
+    #[test]
+    fn la_carpeta_de_la_memoria_sale_del_estado_del_servicio_y_se_rechaza_una_relativa() {
+        let xdg = Some(PathBuf::from("/home/yo/.local/state"));
+        for (state_directory, state_dir, esperado) in [
+            (Some("/var/lib/va"), xdg.clone(), Some("/var/lib/va/memory")),
+            (
+                None,
+                xdg.clone(),
+                Some("/home/yo/.local/state/vasak-assistant/memory"),
+            ),
+            (
+                Some(""),
+                xdg.clone(),
+                Some("/home/yo/.local/state/vasak-assistant/memory"),
+            ),
+            (Some("relativa"), xdg.clone(), None),
+            (None, Some(PathBuf::from("relativa")), None),
+            (None, None, None),
+        ] {
+            assert_eq!(
+                memory_dir(state_directory.map(OsString::from), state_dir),
+                esperado.map(PathBuf::from),
+                "{state_directory:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn viene_apagada_y_no_toca_el_disco_ni_el_llavero() {
+        let fixture = Fixture::new();
+
+        let status = fixture.memory.status().await;
+
+        assert!(!status.enabled && !status.available);
+        assert_eq!(status.reason, REASON_OFF);
+        assert_eq!(status.bytes, 0);
+        assert!(!fixture.files().exists());
+        assert!(fixture.calls().is_empty());
+        assert_eq!(fixture.memory.database().await.err(), Some(REASON_OFF));
+        assert_eq!(fixture.memory.recall("hola", true).await, None);
+    }
+
+    #[tokio::test]
+    async fn sin_carpeta_de_estado_no_se_puede_encender_pero_apagar_no_falla() {
+        let memory = Memory::new(None, FixedKey::new(None));
+
+        let status = memory.status().await;
+        assert!(!status.enabled && !status.available);
+        assert_eq!(status.reason, REASON_NO_PLACE);
+        assert!(matches!(
+            memory.set_enabled(true).await,
+            Err(Error::Unavailable(text)) if text == REASON_NO_PLACE
+        ));
+        memory.set_enabled(false).await.unwrap();
+        memory.clear().await.unwrap();
+        assert_eq!(memory.database().await.err(), Some(REASON_NO_PLACE));
+        assert!(memory.store(preference("x"), "c").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn encender_crea_la_base_cifrada_con_una_llave_nueva_en_el_llavero() {
+        let fixture = Fixture::new();
+
+        fixture.memory.set_enabled(true).await.unwrap();
+
+        let status = fixture.memory.status().await;
+        assert!(status.enabled && status.available, "{status:?}");
+        assert!(status.reason.is_empty());
+        assert!(status.bytes > 0);
+        assert!(fixture.files().join(DB_FILE).is_file());
+        assert!(fixture.tmp.path().join("enabled").is_file());
+        assert!(!fixture.tmp.path().join("memory.tmp").exists());
+        assert_eq!(fixture.keys.memory_key.lock().as_ref().unwrap().len(), 32);
+        // Antes de generar una llave se mira que el llavero esté abierto.
+        let calls = fixture.calls();
+        let locked = calls.iter().position(|c| c == "is_locked").unwrap();
+        let stored = calls.iter().position(|c| c == "store_memory_key").unwrap();
+        assert!(locked < stored, "{calls:?}");
+    }
+
+    #[tokio::test]
+    async fn encender_con_el_llavero_bloqueado_no_genera_llave_ni_crea_nada() {
+        let fixture = Fixture::new();
+        *fixture.keys.locked.lock() = true;
+
+        let result = fixture.memory.set_enabled(true).await;
+
+        assert!(matches!(result, Err(Error::Unavailable(text)) if text.contains("bloqueado")));
+        assert!(!fixture.key_is_stored());
+        assert!(!fixture.files().exists());
+        assert!(!fixture.tmp.path().join("enabled").exists());
+        assert!(!fixture.calls().iter().any(|c| c == "store_memory_key"));
+        assert!(!fixture.memory.status().await.enabled);
+    }
+
+    #[tokio::test]
+    async fn encender_dos_veces_no_cambia_la_llave_ni_la_base() {
+        let fixture = Fixture::enabled().await;
+        fixture
+            .memory
+            .store(preference("Prefiere el mate"), "c")
+            .await
+            .unwrap();
+        let key = fixture.keys.memory_key.lock().clone();
+
+        fixture.memory.set_enabled(true).await.unwrap();
+
+        assert_eq!(*fixture.keys.memory_key.lock(), key);
+        assert!(fixture
+            .memory
+            .recall("mate", false)
+            .await
+            .unwrap()
+            .contains("mate"));
+    }
+
+    #[tokio::test]
+    async fn una_llave_que_no_se_puede_releer_deja_la_memoria_apagada_y_sin_carpeta() {
+        let fixture = Fixture::new();
+        // El llavero responde bien al guardar pero devuelve otra cosa al leer.
+        *fixture.keys.duplicated.lock() = true;
+
+        let result = fixture.memory.set_enabled(true).await;
+
+        assert!(matches!(result, Err(Error::Unavailable(_))));
+        assert!(!fixture.files().exists());
+        assert!(!fixture.tmp.path().join("enabled").exists());
+    }
+
+    #[tokio::test]
+    async fn lo_que_se_aprende_se_encuentra_despues_de_reiniciar_con_la_misma_llave() {
+        let fixture = Fixture::enabled().await;
+        fixture
+            .memory
+            .store(preference("Prefiere respuestas cortas"), "c")
+            .await
+            .unwrap();
+        fixture.memory.close().await;
+
+        let restarted = fixture.restarted();
+        let status = restarted.status().await;
+        assert!(status.enabled && status.available, "{status:?}");
+        // Por el bloque de recuperación y por la búsqueda de texto del índice.
+        assert!(restarted
+            .recall("otra cosa", false)
+            .await
+            .unwrap()
+            .contains("Prefiere respuestas cortas"));
+        let db = restarted.database().await.unwrap();
+        let found = blocking(move || {
+            Ok(db
+                .text_search(schema::LABEL, "terms", "respuestas", 5, None)
+                .map(|hits| hits.len()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(found.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn el_texto_aprendido_no_aparece_en_ningun_byte_de_los_archivos() {
+        let fixture = Fixture::enabled().await;
+        let canary = "canariodelamemoria";
+        fixture
+            .memory
+            .store(preference(&format!("Prefiere el {canary}")), "c")
+            .await
+            .unwrap();
+
+        // Con la base todavía abierta y después de cerrarla.
+        for closed in [false, true] {
+            if closed {
+                fixture.memory.close().await;
+            }
+            let files = bytes_under(&fixture.files());
+            assert!(
+                files.iter().any(|bytes| !bytes.is_empty()),
+                "no hay nada en disco"
+            );
+            for bytes in &files {
+                assert!(!contains(bytes, canary), "cerrada: {closed}");
+                assert!(!contains(bytes, "Prefiere"), "cerrada: {closed}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn con_otra_llave_la_base_no_abre_y_el_motivo_lo_dice() {
+        let fixture = Fixture::enabled().await;
+        fixture
+            .memory
+            .store(preference("Prefiere el mate"), "c")
+            .await
+            .unwrap();
+        fixture.memory.close().await;
+        *fixture.keys.memory_key.lock() = Some(vec![7u8; 32]);
+
+        let restarted = fixture.restarted();
+        let status = restarted.status().await;
+
+        assert!(status.enabled);
+        assert!(!status.available);
+        assert_eq!(status.reason, REASON_NOT_OPENED);
+        assert_eq!(restarted.recall("mate", true).await, None);
+        assert!(restarted.store(preference("otro"), "c").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cada_problema_con_la_llave_tiene_su_motivo_y_no_borra_nada() {
+        for (name, setup, esperado) in [
+            ("falta", 0, REASON_MISSING_KEY),
+            ("duplicada", 1, REASON_DUPLICATED_KEY),
+            ("bloqueada", 2, REASON_LOCKED),
+            ("invalida", 3, REASON_NOT_OPENED),
+            ("llavero caído", 4, REASON_NO_KEYRING),
+        ] {
+            let fixture = Fixture::enabled().await;
+            fixture.memory.close().await;
+            match setup {
+                0 => *fixture.keys.memory_key.lock() = None,
+                1 => *fixture.keys.duplicated.lock() = true,
+                2 => *fixture.keys.locked.lock() = true,
+                3 => *fixture.keys.memory_key.lock() = Some(vec![1, 2, 3]),
+                _ => *fixture.keys.unreachable.lock() = true,
+            }
+
+            let status = fixture.restarted().status().await;
+
+            assert!(status.enabled && !status.available, "{name}");
+            assert_eq!(status.reason, esperado, "{name}");
+            assert!(fixture.files().join(DB_FILE).is_file(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn encender_sobre_una_base_que_no_abre_es_unavailable_y_no_la_pisa() {
+        let fixture = Fixture::enabled().await;
+        fixture.memory.close().await;
+        *fixture.keys.memory_key.lock() = None;
+        let before = bytes_under(&fixture.files());
+
+        let result = fixture.restarted().set_enabled(true).await;
+
+        assert!(matches!(result, Err(Error::Unavailable(text)) if text == REASON_MISSING_KEY));
+        assert_eq!(bytes_under(&fixture.files()), before);
+    }
+
+    #[tokio::test]
+    async fn apagar_no_borra_nada_y_al_volver_a_encender_el_recuerdo_esta() {
+        let fixture = Fixture::enabled().await;
+        fixture
+            .memory
+            .store(preference("Prefiere el té de jengibre"), "c")
+            .await
+            .unwrap();
+        let key = fixture.keys.memory_key.lock().clone();
+
+        fixture.memory.set_enabled(false).await.unwrap();
+
+        assert!(fixture.files().join(DB_FILE).is_file());
+        assert_eq!(*fixture.keys.memory_key.lock(), key);
+        assert!(!fixture
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("delete_memory_key")));
+        assert!(!fixture.tmp.path().join("enabled").exists());
+        let status = fixture.memory.status().await;
+        assert!(!status.enabled && !status.available);
+        assert_eq!(status.reason, REASON_OFF);
+        // Los bytes se informan también apagada.
+        assert!(status.bytes > 0);
+        assert_eq!(fixture.memory.recall("té", true).await, None);
+        assert!(fixture.memory.store(preference("otro"), "c").await.is_err());
+
+        fixture.memory.set_enabled(true).await.unwrap();
+
+        assert_eq!(*fixture.keys.memory_key.lock(), key);
+        assert!(fixture
+            .memory
+            .recall("té", false)
+            .await
+            .unwrap()
+            .contains("jengibre"));
+    }
+
+    #[tokio::test]
+    async fn apagar_sin_haber_encendido_nunca_no_falla() {
+        let fixture = Fixture::new();
+        fixture.memory.set_enabled(false).await.unwrap();
+        assert!(!fixture.files().exists());
+    }
+
+    #[tokio::test]
+    async fn borrar_encendida_vacia_la_base_con_una_llave_nueva_y_sigue_encendida() {
+        let fixture = Fixture::enabled().await;
+        fixture
+            .memory
+            .store(preference("Prefiere el mate"), "c")
+            .await
+            .unwrap();
+        let old_key = fixture.keys.memory_key.lock().clone().unwrap();
+
+        fixture.memory.clear().await.unwrap();
+
+        let new_key = fixture.keys.memory_key.lock().clone().unwrap();
+        assert_ne!(new_key, old_key);
+        let status = fixture.memory.status().await;
+        assert!(status.enabled && status.available, "{status:?}");
+        assert_eq!(fixture.memory.recall("mate", true).await, None);
+        assert!(!fixture.tmp.path().join("memory.deleting").exists());
+        assert!(!fixture.tmp.path().join("memory.tmp").exists());
+        // La base nueva se puede escribir con la llave nueva.
+        fixture
+            .memory
+            .store(preference("Prefiere el café"), "c")
+            .await
+            .unwrap();
+        fixture.memory.close().await;
+        assert!(fixture.restarted().recall("café", false).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn borrar_apagada_borra_la_llave_y_todos_los_archivos() {
+        let fixture = Fixture::enabled().await;
+        fixture
+            .memory
+            .store(preference("Prefiere el mate"), "c")
+            .await
+            .unwrap();
+        fixture.memory.set_enabled(false).await.unwrap();
+        assert!(fixture.files().exists());
+
+        fixture.memory.clear().await.unwrap();
+
+        assert!(!fixture.key_is_stored());
+        assert!(!fixture.files().exists());
+        let status = fixture.memory.status().await;
+        assert!(!status.enabled);
+        assert_eq!(status.bytes, 0);
+        assert_eq!(status.reason, REASON_OFF);
+    }
+
+    #[tokio::test]
+    async fn borrar_con_el_llavero_bloqueado_no_toca_ni_la_llave_ni_los_archivos() {
+        let fixture = Fixture::enabled().await;
+        fixture
+            .memory
+            .store(preference("Prefiere el mate"), "c")
+            .await
+            .unwrap();
+        fixture.memory.close().await;
+        let key = fixture.keys.memory_key.lock().clone();
+        let before = bytes_under(&fixture.files());
+        *fixture.keys.locked.lock() = true;
+
+        let result = fixture.memory.clear().await;
+
+        assert!(matches!(result, Err(Error::Unavailable(text)) if text.contains("bloqueado")));
+        assert_eq!(*fixture.keys.memory_key.lock(), key);
+        assert_eq!(bytes_under(&fixture.files()), before);
+        assert!(fixture.tmp.path().join("enabled").is_file());
+        assert!(!fixture.calls().iter().any(|c| c == "delete_memory_key"));
+        // Desbloqueado, el recuerdo sigue ahí.
+        *fixture.keys.locked.lock() = false;
+        assert!(fixture.restarted().recall("mate", false).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn borrar_con_el_llavero_caido_no_toca_nada() {
+        let fixture = Fixture::enabled().await;
+        let before = bytes_under(&fixture.files());
+        *fixture.keys.unreachable.lock() = true;
+
+        assert!(matches!(
+            fixture.memory.clear().await,
+            Err(Error::Unavailable(_))
+        ));
+
+        assert!(fixture.key_is_stored());
+        assert_eq!(bytes_under(&fixture.files()).len(), before.len());
+    }
+
+    #[tokio::test]
+    async fn borrar_saca_primero_la_llave_y_despues_los_archivos() {
+        let fixture = Fixture::enabled().await;
+        fixture.memory.set_enabled(false).await.unwrap();
+        *fixture.keys.watch.lock() = Some(fixture.files());
+
+        fixture.memory.clear().await.unwrap();
+
+        // `delete_memory_key(true)`: cuando se borró la llave, la carpeta seguía.
+        assert!(
+            fixture
+                .calls()
+                .iter()
+                .any(|c| c == "delete_memory_key(true)"),
+            "{:?}",
+            fixture.calls()
+        );
+        assert!(!fixture.files().exists());
+    }
+
+    #[tokio::test]
+    async fn borrar_limpia_lo_que_dejo_un_corte_anterior() {
+        let fixture = Fixture::enabled().await;
+        fixture.memory.set_enabled(false).await.unwrap();
+        for leftover in ["memory.deleting", "memory.tmp"] {
+            let path = fixture.tmp.path().join(leftover);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("resto"), b"x").unwrap();
+        }
+
+        fixture.memory.clear().await.unwrap();
+
+        assert!(!fixture.tmp.path().join("memory.deleting").exists());
+        assert!(!fixture.tmp.path().join("memory.tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn con_un_backend_remoto_sin_permiso_la_memoria_no_se_lee_ni_se_escribe() {
+        let fixture = Fixture::enabled().await;
+        fixture
+            .memory
+            .store(preference("Prefiere el mate"), "c")
+            .await
+            .unwrap();
+        fixture.memory.close().await;
+        let remote = Arc::new(
+            Memory::new(Some(fixture.files()), fixture.keys.clone()).with_remote_blocked(true),
+        );
+
+        let status = remote.status().await;
+
+        assert!(status.enabled && !status.available);
+        assert_eq!(status.reason, REASON_REMOTE);
+        assert_eq!(remote.database().await.err(), Some(REASON_REMOTE));
+        assert_eq!(remote.recall("mate", true).await, None);
+        assert!(matches!(
+            remote.store(preference("otro"), "c").await,
+            Err(text) if text == REASON_REMOTE
+        ));
+        // Con permiso, el mismo recuerdo está.
+        let allowed = Memory::new(Some(fixture.files()), fixture.keys.clone());
+        assert!(allowed.recall("mate", true).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn pasado_el_tope_de_espacio_se_poda_y_si_sigue_pasado_no_se_escribe() {
+        let fixture = Fixture::enabled().await;
+        for n in 0..10 {
+            fixture
+                .memory
+                .store(preference(&format!("Prefiere la cosa número {n}")), "c")
+                .await
+                .unwrap();
+        }
+        let count = |memory: Arc<Memory>| async move {
+            let db = memory.database().await.unwrap();
+            blocking(move || Ok(schema::entries(&db, MemoryKind::Preference).len()))
+                .await
+                .unwrap()
+        };
+        assert_eq!(count(fixture.memory.clone()).await, 10);
+        // Un archivo que por sí solo pasa el tope.
+        std::fs::write(
+            fixture.files().join("relleno"),
+            vec![0u8; MAX_MEMORY_DISK_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        fixture
+            .memory
+            .store(preference("Prefiere lo nuevo"), "c")
+            .await
+            .unwrap();
+
+        // Podó el 10 % (uno), y como sigue pasada, no guardó lo nuevo.
+        assert_eq!(count(fixture.memory.clone()).await, 9);
+        assert!(!fixture
+            .memory
+            .recall("nuevo", false)
+            .await
+            .unwrap()
+            .contains("lo nuevo"));
+        // Sin el relleno vuelve a escribir.
+        std::fs::remove_file(fixture.files().join("relleno")).unwrap();
+        fixture
+            .memory
+            .store(preference("Prefiere lo nuevo"), "c")
+            .await
+            .unwrap();
+        assert!(fixture
+            .memory
+            .recall("nuevo", false)
+            .await
+            .unwrap()
+            .contains("lo nuevo"));
+    }
+
+    #[tokio::test]
+    async fn la_extraccion_en_segundo_plano_se_guarda_y_una_en_curso_hace_que_el_turno_no_se_aprenda(
+    ) {
+        let fixture = Fixture::enabled().await;
+        let backend = ScriptedBackend::new([
+            r#"{"items":[{"kind":"preference","text":"Prefiere el mate"}],"summary":null}"#,
+        ]);
+        let conversation = vec![
+            Message {
+                role: Role::User,
+                content: "prefiero el mate al café".into(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: "Anotado.".into(),
+            },
+        ];
+
+        // Con el permiso tomado por otra extracción, el turno se saltea.
+        let held = fixture.memory.learning.try_acquire().unwrap();
+        fixture
+            .memory
+            .learn_after(backend.clone(), "c1", conversation.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(backend.seen.lock().is_empty());
+        drop(held);
+
+        fixture
+            .memory
+            .learn_after(backend.clone(), "c1", conversation);
+        backend.wait_for_calls(1).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while fixture.memory.recall("mate", false).await.is_none() {
+            assert!(tokio::time::Instant::now() < deadline, "no se guardó");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+}

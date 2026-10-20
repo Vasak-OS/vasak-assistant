@@ -394,3 +394,394 @@ pub fn prune_tenth(db: &GrafeoDB, now: i64) -> grafeo::Result<()> {
     db.gc();
     db.wal_checkpoint()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: i64 = 1_800_000_000;
+    const DAY: i64 = 86_400;
+
+    fn db() -> GrafeoDB {
+        let db = GrafeoDB::new_in_memory();
+        ensure_indexes(&db).unwrap();
+        db
+    }
+
+    fn add(db: &GrafeoDB, kind: MemoryKind, text: &str, now: i64) -> NodeId {
+        upsert(
+            db,
+            &NewMemory {
+                kind,
+                text,
+                phrase: None,
+                conversation: None,
+            },
+            now,
+        )
+        .unwrap()
+    }
+
+    fn texts(db: &GrafeoDB, kind: MemoryKind) -> Vec<String> {
+        let mut all: Vec<String> = entries(db, kind).into_iter().map(|e| e.text).collect();
+        all.sort();
+        all
+    }
+
+    fn search(db: &GrafeoDB, query: &str) -> Vec<String> {
+        db.text_search(LABEL, "terms", &normalize_terms(query), 10, None)
+            .unwrap()
+            .into_iter()
+            .filter_map(|(node, _)| entry(db, node))
+            .map(|e| e.text)
+            .collect()
+    }
+
+    #[test]
+    fn las_clases_son_siete_con_sus_nombres_y_topes() {
+        assert_eq!(MemoryKind::ALL.len(), 7);
+        for (name, kind) in [
+            ("preference", MemoryKind::Preference),
+            ("Style", MemoryKind::Style),
+            ("HABIT", MemoryKind::Habit),
+            ("topic", MemoryKind::Topic),
+            ("correction", MemoryKind::Correction),
+            ("alias", MemoryKind::Alias),
+            ("conversation_summary", MemoryKind::ConversationSummary),
+            ("ConversationSummary", MemoryKind::ConversationSummary),
+        ] {
+            assert_eq!(MemoryKind::from_name(name), Some(kind), "{name}");
+        }
+        assert_eq!(MemoryKind::Style.max_nodes(), 20);
+        assert_eq!(MemoryKind::Habit.max_nodes(), 50);
+        assert_eq!(MemoryKind::Preference.max_nodes(), 100);
+        assert_eq!(MemoryKind::Topic.max_text(), 64);
+        assert_eq!(MemoryKind::ConversationSummary.max_text(), 600);
+        assert_eq!(MemoryKind::Correction.initial_weight(), 0.5);
+        assert_eq!(MemoryKind::Style.initial_weight(), 0.5);
+        assert_eq!(MemoryKind::Habit.initial_weight(), 0.3);
+    }
+
+    #[test]
+    fn no_hay_clase_para_correos_eventos_contactos_archivos_ni_cuentas() {
+        for name in [
+            "email",
+            "mail",
+            "event",
+            "calendar",
+            "contact",
+            "file",
+            "account",
+            "secret",
+            "key",
+            "password",
+            "",
+            "memory",
+            "LinceMeta",
+        ] {
+            assert_eq!(MemoryKind::from_name(name), None, "{name}");
+        }
+        let labels: Vec<_> = MemoryKind::ALL.iter().map(|k| k.label()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Preference",
+                "Style",
+                "Habit",
+                "Topic",
+                "Correction",
+                "Alias",
+                "ConversationSummary"
+            ]
+        );
+    }
+
+    #[test]
+    fn un_recuerdo_guarda_solo_las_propiedades_del_esquema() {
+        let db = db();
+        let node = upsert(
+            &db,
+            &NewMemory {
+                kind: MemoryKind::Alias,
+                text: "El bicho es su gato",
+                phrase: Some("el bicho"),
+                conversation: None,
+            },
+            NOW,
+        )
+        .unwrap();
+
+        let stored = db.get_node(node).unwrap();
+        let mut keys: Vec<String> = stored
+            .properties
+            .iter()
+            .map(|(key, _)| key.as_str().to_owned())
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "created_at",
+                "hits",
+                "id",
+                "key",
+                "phrase",
+                "terms",
+                "text",
+                "updated_at",
+                "weight"
+            ]
+        );
+        assert!(stored.has_label(LABEL) && stored.has_label("Alias"));
+    }
+
+    #[test]
+    fn la_clave_ignora_mayusculas_tildes_y_espacios_pero_no_la_clase() {
+        let a = key_for(MemoryKind::Habit, "Escucha  CANCIÓN vieja");
+        assert_eq!(a, key_for(MemoryKind::Habit, "escucha cancion vieja"));
+        assert_ne!(a, key_for(MemoryKind::Preference, "escucha cancion vieja"));
+        assert_ne!(a, key_for(MemoryKind::Habit, "escucha cancion nueva"));
+        assert_eq!(a.len(), 32);
+    }
+
+    #[test]
+    fn el_puntaje_se_reduce_a_la_mitad_cada_noventa_dias_y_el_refuerzo_suma_un_quinto_de_lo_que_falta(
+    ) {
+        assert!((score(0.8, NOW, NOW) - 0.8).abs() < 1e-9);
+        assert!((score(0.8, NOW - 90 * DAY, NOW) - 0.4).abs() < 1e-9);
+        assert!((score(0.8, NOW - 180 * DAY, NOW) - 0.2).abs() < 1e-9);
+        // Un recuerdo «del futuro» no sube el puntaje.
+        assert!((score(0.8, NOW + 10 * DAY, NOW) - 0.8).abs() < 1e-9);
+        assert!((reinforced(0.3) - 0.44).abs() < 1e-9);
+        assert!((reinforced(0.5) - 0.6).abs() < 1e-9);
+        assert!(reinforced(0.99) < 1.0);
+    }
+
+    #[test]
+    fn un_recuerdo_nace_con_el_peso_de_su_clase() {
+        let db = db();
+        add(&db, MemoryKind::Habit, "Madruga", NOW);
+        add(&db, MemoryKind::Style, "Lo trata de vos", NOW);
+        add(&db, MemoryKind::Correction, "No es Java", NOW);
+
+        let weight = |kind| entries(&db, kind)[0].weight;
+        assert_eq!(weight(MemoryKind::Habit), 0.3);
+        assert_eq!(weight(MemoryKind::Style), 0.5);
+        assert_eq!(weight(MemoryKind::Correction), 0.5);
+    }
+
+    #[test]
+    fn el_mismo_recuerdo_dos_veces_refuerza_y_no_se_duplica() {
+        let db = db();
+        let first = add(&db, MemoryKind::Habit, "Escucha canción vieja", NOW);
+        let again = add(&db, MemoryKind::Habit, "escucha CANCION vieja", NOW + DAY);
+
+        assert_eq!(first, again);
+        let all = entries(&db, MemoryKind::Habit);
+        assert_eq!(all.len(), 1);
+        assert!((all[0].weight - 0.44).abs() < 1e-9);
+        assert_eq!(all[0].updated_at, NOW + DAY);
+        let hits = db
+            .get_node(first)
+            .unwrap()
+            .get_property("hits")
+            .and_then(Value::as_int64);
+        assert_eq!(hits, Some(2));
+        // La misma frase en otra clase es otro recuerdo.
+        add(&db, MemoryKind::Preference, "Escucha canción vieja", NOW);
+        assert_eq!(entries(&db, MemoryKind::Preference).len(), 1);
+        assert_eq!(entries(&db, MemoryKind::Habit).len(), 1);
+    }
+
+    #[test]
+    fn el_tope_mas_uno_poda_el_de_menor_puntaje_en_cada_clase() {
+        for kind in MemoryKind::ALL {
+            let db = db();
+            let max = kind.max_nodes();
+            // El más viejo tiene el menor puntaje.
+            add(&db, kind, "el más viejo", NOW - 400 * DAY);
+            for n in 1..max {
+                add(&db, kind, &format!("recuerdo {n}"), NOW - DAY);
+            }
+            assert_eq!(entries(&db, kind).len(), max, "{kind:?}");
+
+            add(&db, kind, "el que llega", NOW);
+
+            let all = texts(&db, kind);
+            assert_eq!(all.len(), max, "{kind:?}");
+            assert!(!all.contains(&"el más viejo".to_owned()), "{kind:?}");
+            assert!(all.contains(&"el que llega".to_owned()), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn un_recuerdo_viejo_pero_reforzado_sobrevive_a_la_poda() {
+        let db = db();
+        let old = add(&db, MemoryKind::Style, "viejo y reforzado", NOW - 100 * DAY);
+        for _ in 0..8 {
+            reinforce(&db, old, NOW).unwrap();
+        }
+        for n in 1..MemoryKind::Style.max_nodes() {
+            add(
+                &db,
+                MemoryKind::Style,
+                &format!("flojo {n}"),
+                NOW - 30 * DAY,
+            );
+        }
+
+        add(&db, MemoryKind::Style, "nuevo", NOW);
+
+        assert!(texts(&db, MemoryKind::Style).contains(&"viejo y reforzado".to_owned()));
+    }
+
+    #[test]
+    fn un_recuerdo_no_apunta_a_mas_de_tres_temas_ni_repite_uno() {
+        let db = db();
+        let habit = add(&db, MemoryKind::Habit, "Riega a la mañana", NOW);
+
+        for topic in ["jardinería", "plantas", "jardineria", "mañanas", "huerta"] {
+            link_topic(&db, habit, topic, NOW).unwrap();
+        }
+
+        // «jardineria» es el mismo tema que «jardinería»; «huerta» ya no entra.
+        assert_eq!(
+            texts(&db, MemoryKind::Topic),
+            ["jardinería", "mañanas", "plantas"]
+        );
+        let topics = linked(&db, habit, Direction::Outgoing);
+        assert_eq!(topics.len(), MAX_ABOUT);
+    }
+
+    #[test]
+    fn about_topic_da_los_recuerdos_del_tema_sin_repetir_y_hasta_el_limite() {
+        let db = db();
+        let mut topic = None;
+        for n in 0..6 {
+            let habit = add(&db, MemoryKind::Habit, &format!("hábito {n}"), NOW);
+            link_topic(&db, habit, "jardinería", NOW).unwrap();
+            topic = topic.or_else(|| linked(&db, habit, Direction::Outgoing).first().copied());
+        }
+        let topic = topic.unwrap();
+
+        assert_eq!(about_topic(&db, topic, 4).len(), 4);
+        assert_eq!(about_topic(&db, topic, 100).len(), 6);
+        assert_eq!(entries(&db, MemoryKind::Topic).len(), 1);
+    }
+
+    #[test]
+    fn la_poda_del_diez_por_ciento_saca_el_de_menor_puntaje_de_cada_clase_y_los_temas_huerfanos() {
+        let db = db();
+        let mut weakest = None;
+        for n in 0..10 {
+            let age = if n == 0 { 300 } else { 1 };
+            let node = add(
+                &db,
+                MemoryKind::Habit,
+                &format!("hábito {n}"),
+                NOW - age * DAY,
+            );
+            if n == 0 {
+                weakest = Some(node);
+                link_topic(&db, node, "solo de este", NOW).unwrap();
+            }
+        }
+        add(&db, MemoryKind::Preference, "única", NOW);
+        assert_eq!(entries(&db, MemoryKind::Topic).len(), 1);
+
+        prune_tenth(&db, NOW).unwrap();
+
+        assert_eq!(entries(&db, MemoryKind::Habit).len(), 9);
+        assert!(entry(&db, weakest.unwrap()).is_none());
+        // Al menos uno por clase que tenga: la única preferencia también cae.
+        assert!(entries(&db, MemoryKind::Preference).is_empty());
+        // El tema se quedó sin recuerdos y se va con ellos.
+        assert!(entries(&db, MemoryKind::Topic).is_empty());
+    }
+
+    #[test]
+    fn la_busqueda_encuentra_con_y_sin_tildes_en_los_dos_sentidos() {
+        let db = db();
+        add(
+            &db,
+            MemoryKind::Preference,
+            "Le gusta esa canción de cuna",
+            NOW,
+        );
+        add(
+            &db,
+            MemoryKind::Preference,
+            "Prefiere la cancion sin tildes",
+            NOW,
+        );
+
+        for query in ["canción", "cancion", "CANCIÓN", "una cancion cualquiera"] {
+            let found = search(&db, query);
+            assert_eq!(found.len(), 2, "{query}: {found:?}");
+        }
+        assert!(search(&db, "zanahoria").is_empty());
+    }
+
+    #[test]
+    fn las_palabras_vacias_no_hacen_que_un_recuerdo_aparezca() {
+        let db = db();
+        add(&db, MemoryKind::Preference, "Prefiere el mate amargo", NOW);
+        assert!(search(&db, "el de la que").is_empty());
+        assert_eq!(search(&db, "el mate").len(), 1);
+    }
+
+    #[test]
+    fn asegurar_los_indices_dos_veces_no_falla_y_un_alias_se_busca_por_su_frase() {
+        let db = db();
+        ensure_indexes(&db).unwrap();
+        upsert(
+            &db,
+            &NewMemory {
+                kind: MemoryKind::Alias,
+                text: "Es su gato",
+                phrase: Some("El Bicho"),
+                conversation: None,
+            },
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(search(&db, "bicho"), ["Es su gato"]);
+    }
+
+    #[test]
+    fn un_nodo_que_no_es_un_recuerdo_no_se_lee_como_tal() {
+        let db = db();
+        let meta = db
+            .create_node_with_props(&["LinceMeta"], [("format", 1i64)])
+            .unwrap();
+        let other = db
+            .create_node_with_props(&[LABEL, "Desconocida"], [("text", "x")])
+            .unwrap();
+        assert!(entry(&db, meta).is_none());
+        assert!(entry(&db, other).is_none());
+        assert!(find_by_key(&db, "no existe").is_none());
+    }
+
+    #[test]
+    fn el_resumen_de_una_conversacion_lleva_su_id() {
+        let db = db();
+        let node = upsert(
+            &db,
+            &NewMemory {
+                kind: MemoryKind::ConversationSummary,
+                text: "Hablaron de gatos",
+                phrase: None,
+                conversation: Some("c-1"),
+            },
+            NOW,
+        )
+        .unwrap();
+        let conversation = db
+            .get_node(node)
+            .unwrap()
+            .get_property("conversation")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        assert_eq!(conversation.as_deref(), Some("c-1"));
+    }
+}

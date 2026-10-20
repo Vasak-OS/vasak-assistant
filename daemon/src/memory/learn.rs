@@ -256,3 +256,296 @@ pub fn truncate(text: &str, max: usize) -> &str {
     }
     &text[..end]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(role: Role, content: &str) -> Message {
+        Message {
+            role,
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn las_frases_en_primera_persona_o_de_correccion_pasan_la_puerta() {
+        for frase in [
+            "prefiero respuestas cortas",
+            "Me gusta la música en vivo",
+            "me llamo Ana, decime Ani",
+            "No, en realidad es otra cosa",
+            "te equivocaste con eso",
+            "hablame de vos, por favor",
+            "cuando digo «el bicho» es mi gato",
+            "PREFIERO PYTHON A JAVA",
+            "Prefiero las canciones sin tildes",
+        ] {
+            let gate = worth_learning(frase, "respuesta", 1).unwrap_or_else(|| panic!("{frase}"));
+            assert!(gate.items, "{frase}");
+            assert!(!gate.summary, "{frase}");
+        }
+    }
+
+    #[test]
+    fn lo_que_no_dice_nada_de_la_persona_no_dispara_la_extraccion() {
+        for frase in [
+            "cuánto es dos más dos",
+            "contame un chiste largo",
+            "corto",
+            "",
+        ] {
+            assert_eq!(worth_learning(frase, "respuesta", 1), None, "{frase}");
+        }
+        assert_eq!(worth_learning("prefiero respuestas cortas", "   ", 1), None);
+    }
+
+    #[test]
+    fn un_turno_con_un_secreto_no_se_aprende_aunque_diga_prefiero() {
+        for frase in [
+            "mi contraseña es hunter2",
+            "prefiero usar sk-abcdefgh12345678 para esto",
+            "mi tarjeta es 4111 1111 1111 1111 y prefiero pagar con ella",
+        ] {
+            assert_eq!(worth_learning(frase, "respuesta", 6), None, "{frase}");
+        }
+    }
+
+    #[test]
+    fn cada_seis_turnos_se_pide_ademas_un_resumen_aunque_no_haya_senales() {
+        let sin_senales = "cuánto es dos más dos";
+        for turn in [1, 2, 5, 7, 11] {
+            assert_eq!(worth_learning(sin_senales, "r", turn), None, "{turn}");
+        }
+        for turn in [6, 12] {
+            let gate = worth_learning(sin_senales, "r", turn).unwrap();
+            assert_eq!(
+                gate,
+                Gate {
+                    items: false,
+                    summary: true
+                },
+                "{turn}"
+            );
+        }
+        let both = worth_learning("prefiero el mate", "r", 6).unwrap();
+        assert_eq!(
+            both,
+            Gate {
+                items: true,
+                summary: true
+            }
+        );
+        assert_eq!(worth_learning(sin_senales, "r", 0), None);
+    }
+
+    #[test]
+    fn el_pedido_de_extraccion_lleva_la_conversacion_como_datos_y_cabe_en_el_tope() {
+        let exchange = vec![
+            message(Role::User, "hola"),
+            message(Role::Assistant, "buenas"),
+            message(Role::User, "prefiero respuestas cortas"),
+            message(Role::Assistant, &"x".repeat(1_500)),
+        ];
+
+        let request = extraction_request(
+            &exchange,
+            Gate {
+                items: true,
+                summary: false,
+            },
+        );
+
+        assert_eq!(request.len(), 2);
+        assert_eq!(request[0].role, Role::System);
+        assert!(request[0].content.contains("\"summary\" va en null"));
+        assert_eq!(request[1].role, Role::User);
+        assert!(request[1].content.len() <= EXTRACTION_INPUT_BYTES);
+        let json: serde_json::Value = serde_json::from_str(&request[1].content).unwrap();
+        // Sin resumen, sólo el último intercambio.
+        assert_eq!(json.as_array().unwrap().len(), 2);
+        assert_eq!(json[0]["persona"], "prefiero respuestas cortas");
+        assert!(json[1].get("asistente").is_some());
+    }
+
+    // Falla hoy: la respuesta larga del asistente (hasta 32 KiB) se come todo
+    // el presupuesto de 4 KiB y el mensaje de la persona, que es el que trae la
+    // señal, queda afuera del pedido. Se quita el `ignore` al arreglarlo.
+    #[test]
+    #[ignore = "bug: una respuesta de más de 4 KiB deja afuera el mensaje de la persona"]
+    fn una_respuesta_larga_del_asistente_no_deja_afuera_lo_que_dijo_la_persona() {
+        let exchange = vec![
+            message(Role::User, "prefiero respuestas cortas"),
+            message(Role::Assistant, &"x".repeat(10_000)),
+        ];
+
+        let request = extraction_request(
+            &exchange,
+            Gate {
+                items: true,
+                summary: false,
+            },
+        );
+
+        assert!(request[1].content.contains("prefiero respuestas cortas"));
+    }
+
+    #[test]
+    fn con_resumen_entra_toda_la_conversacion_que_quepa_y_nunca_el_bloque_de_la_memoria() {
+        let exchange = vec![
+            message(Role::System, "Notas tuyas: algo privado"),
+            message(Role::User, "uno"),
+            message(Role::Assistant, "dos"),
+            message(Role::User, "tres"),
+            message(Role::Assistant, "cuatro"),
+        ];
+
+        let request = extraction_request(
+            &exchange,
+            Gate {
+                items: false,
+                summary: true,
+            },
+        );
+
+        assert!(request[0].content.contains("resumen breve"));
+        assert!(!request[1].content.contains("privado"));
+        let json: serde_json::Value = serde_json::from_str(&request[1].content).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 4);
+        assert_eq!(json[0]["persona"], "uno");
+        assert_eq!(json[3]["asistente"], "cuatro");
+    }
+
+    #[test]
+    fn un_pedido_enorme_con_escapes_igual_no_pasa_el_tope() {
+        let hostile = "\"\\\n".repeat(5_000);
+        let exchange = vec![
+            message(Role::User, &hostile),
+            message(Role::Assistant, &hostile),
+        ];
+
+        let request = extraction_request(
+            &exchange,
+            Gate {
+                items: true,
+                summary: true,
+            },
+        );
+
+        assert!(request[1].content.len() <= EXTRACTION_INPUT_BYTES);
+    }
+
+    fn parse(items: &str) -> Extraction {
+        parse_extraction(&format!(r#"{{"items":{items},"summary":null}}"#))
+    }
+
+    #[test]
+    fn una_extraccion_valida_da_sus_recuerdos_con_clase_frase_y_temas() {
+        let extraction = parse_extraction(
+            r#"Acá va: {"items":[
+                {"kind":"Preference","text":"Prefiere respuestas cortas","topics":["estilo","trabajo"]},
+                {"kind":"alias","text":"El bicho es su gato","phrase":"el bicho"},
+                {"kind":"conversation_summary","text":"no se acepta como ítem"}
+              ],"summary":"Hablaron de gatos"} y fin"#,
+        );
+
+        assert_eq!(extraction.items.len(), 2);
+        assert_eq!(extraction.items[0].kind, MemoryKind::Preference);
+        assert_eq!(extraction.items[0].topics, ["estilo", "trabajo"]);
+        assert_eq!(extraction.items[1].kind, MemoryKind::Alias);
+        assert_eq!(extraction.items[1].phrase.as_deref(), Some("el bicho"));
+        assert_eq!(extraction.summary.as_deref(), Some("Hablaron de gatos"));
+    }
+
+    #[test]
+    fn una_clase_desconocida_o_un_alias_sin_frase_se_descartan() {
+        let extraction = parse(
+            r#"[{"kind":"email","text":"ana"},{"kind":"","text":"x"},{"kind":"alias","text":"sin frase"},{"kind":"habit","text":"Madruga"}]"#,
+        );
+        assert_eq!(extraction.items.len(), 1);
+        assert_eq!(extraction.items[0].text, "Madruga");
+    }
+
+    #[test]
+    fn un_texto_de_diez_kib_se_recorta_al_tope_de_su_clase_en_un_limite_de_caracter() {
+        let long = "ñ".repeat(5_000);
+        let extraction = parse(&format!(r#"[{{"kind":"preference","text":"{long}"}}]"#));
+        let text = &extraction.items[0].text;
+        assert!(text.len() <= MemoryKind::Preference.max_text());
+        assert!(text.chars().all(|c| c == 'ñ'));
+        // Un tope impar parte la «ñ» (2 bytes) por la mitad: no debe romper.
+        assert_eq!(truncate("ñññ", 3), "ñ");
+        assert_eq!(truncate("ñññ", 1), "");
+        assert_eq!(truncate("abc", 10), "abc");
+    }
+
+    #[test]
+    fn mas_de_cinco_items_se_cortan_en_cinco_y_mas_de_tres_temas_en_tres() {
+        let items: Vec<String> = (0..20)
+            .map(|n| {
+                format!(r#"{{"kind":"habit","text":"Hábito {n}","topics":["a","b","c","d","e"]}}"#)
+            })
+            .collect();
+        let extraction = parse(&format!("[{}]", items.join(",")));
+        assert_eq!(extraction.items.len(), MAX_ITEMS);
+        assert!(extraction.items.iter().all(|item| item.topics.len() == 3));
+    }
+
+    #[test]
+    fn los_caracteres_de_control_descartan_el_recuerdo() {
+        let extraction = parse(
+            r#"[{"kind":"habit","text":"linea\nnueva"},{"kind":"habit","text":"nul\u0000"},{"kind":"habit","text":"esc\u001b[31m"},{"kind":"habit","text":"normal"}]"#,
+        );
+        assert_eq!(extraction.items.len(), 1);
+        assert_eq!(extraction.items[0].text, "normal");
+    }
+
+    #[test]
+    fn una_respuesta_ilegible_da_una_extraccion_vacia_sin_panico() {
+        for reply in [
+            "",
+            "no hay json",
+            "{",
+            "{\"items\": [",
+            "{\"items\": 7}",
+            "{\"items\":[{\"kind\":3}]}",
+            "[1,2,3]",
+            "} {",
+            "{\"items\":[{\"kind\":\"habit\",\"text\":\"corta",
+            "\u{0}\u{1}",
+        ] {
+            assert_eq!(parse_extraction(reply), Extraction::default(), "{reply:?}");
+        }
+    }
+
+    #[test]
+    fn la_extraccion_sin_campos_es_vacia_y_un_resumen_con_secreto_se_descarta() {
+        assert_eq!(parse_extraction("{}"), Extraction::default());
+        let extraction =
+            parse_extraction(r#"{"items":[],"summary":"Dijo que mi contraseña es hunter2"}"#);
+        assert_eq!(extraction.summary, None);
+    }
+
+    #[test]
+    fn un_secreto_o_un_dato_de_la_persona_en_un_recuerdo_lo_descarta_y_deja_los_demas() {
+        let extraction = parse(
+            r#"[
+              {"kind":"preference","text":"Usa la clave sk-abcdefgh12345678"},
+              {"kind":"habit","text":"Su correo es ana@ejemplo.com"},
+              {"kind":"habit","text":"Guarda todo en /home/ana/docs"},
+              {"kind":"habit","text":"Nació el 12/03/1990"},
+              {"kind":"habit","text":"Su CBU es 0170099220000067797370"},
+              {"kind":"habit","text":"Madruga"},
+              {"kind":"topic","text":"Python","topics":["ana@ejemplo.com","jardinería"]}
+            ]"#,
+        );
+        let texts: Vec<_> = extraction.items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["Madruga", "Python"]);
+        // Un tema con un correo se descarta, el otro queda; y un tema no lleva temas.
+        assert!(extraction.items[1].topics.is_empty());
+        let with_topics = parse(
+            r#"[{"kind":"habit","text":"Madruga","topics":["ana@ejemplo.com","jardinería"]}]"#,
+        );
+        assert_eq!(with_topics.items[0].topics, ["jardinería"]);
+    }
+}

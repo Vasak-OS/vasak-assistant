@@ -1161,3 +1161,340 @@ mod tests {
         ));
     }
 }
+
+/// La memoria de punta a punta, por el servicio: aprender de un turno y
+/// recuperarlo en otro, lo apagado, lo remoto y lo que nunca se guarda.
+#[cfg(test)]
+mod memory_tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::memory::{REASON_OFF, REASON_REMOTE};
+    use crate::test_support::{FixedKey, ScriptedBackend, TempDir};
+    use vasak_assistant_protocol::{AssistantProxy, SERVICE_PATH};
+
+    const OWNER: &str = ":1.1";
+    const PREFERENCE: &str =
+        r#"{"items":[{"kind":"preference","text":"Prefiere respuestas cortas"}],"summary":null}"#;
+
+    struct World {
+        tmp: TempDir,
+        keys: Arc<FixedKey>,
+        backend: Arc<ScriptedBackend>,
+        service: AssistantService,
+    }
+
+    impl World {
+        /// Un servicio con la memoria encendida y un backend guionado.
+        async fn new(replies: impl IntoIterator<Item = &'static str>) -> Self {
+            let world = Self::off(replies, false);
+            world.service.memory.set_enabled(true).await.unwrap();
+            world
+        }
+
+        fn off(replies: impl IntoIterator<Item = &'static str>, remote_blocked: bool) -> Self {
+            let tmp = TempDir::new();
+            let keys = FixedKey::new(None);
+            let backend = ScriptedBackend::new(replies);
+            let memory = Arc::new(
+                Memory::new(Some(tmp.memory_dir()), keys.clone())
+                    .with_remote_blocked(remote_blocked),
+            );
+            let service = AssistantService {
+                backend: backend.clone(),
+                conversations: Arc::default(),
+                remote_allowed: false,
+                secrets: keys.clone(),
+                memory,
+            };
+            Self {
+                tmp,
+                keys,
+                backend,
+                service,
+            }
+        }
+
+        async fn say(&self, content: &str) -> (String, String) {
+            let id = self.service.open(OWNER).unwrap();
+            let reply = self.service.chat_as(OWNER, &id, content).await.unwrap();
+            (id, reply)
+        }
+
+        /// Espera a que lo extraído en segundo plano esté guardado.
+        async fn until_remembered(&self, needle: &str) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let notes = self.service.memory.recall("zzz", true).await;
+                if notes.is_some_and(|notes| notes.contains(needle)) {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "«{needle}» no se guardó"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// Da tiempo a que una extracción que no tendría que ocurrir ocurra.
+        async fn settle() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        fn first_of_call(&self, n: usize) -> Message {
+            self.backend.seen.lock()[n][0].clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn lo_que_se_aprende_en_un_turno_llega_al_modelo_en_otra_conversacion_y_no_al_historial()
+    {
+        let world = World::new(["Listo.", PREFERENCE, "Hola."]).await;
+
+        world.say("prefiero respuestas cortas").await;
+        world.backend.wait_for_calls(2).await;
+        world.until_remembered("Prefiere respuestas cortas").await;
+
+        let (id, _) = world.say("hola, ¿qué tal?").await;
+
+        let first = world.first_of_call(2);
+        assert_eq!(first.role, Role::System);
+        assert!(first.content.contains("Prefiere respuestas cortas"));
+        assert!(first.content.len() <= crate::memory::recall::MEMORY_CONTEXT_BYTES);
+        // El bloque va una sola vez y el mensaje de la persona sigue último.
+        let sent = world.backend.seen.lock()[2].clone();
+        assert_eq!(sent.iter().filter(|m| m.role == Role::System).count(), 1);
+        assert_eq!(sent.last().unwrap().content, "hola, ¿qué tal?");
+        // La historia no lo muestra.
+        let history = world.service.history_of(OWNER, &id).unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(history.iter().all(|m| m.role != Role::System));
+        assert!(history.iter().all(|m| !m.content.contains("Prefiere")));
+    }
+
+    #[tokio::test]
+    async fn el_pedido_de_extraccion_no_lleva_las_notas_de_la_memoria() {
+        let world = World::new(["Listo.", PREFERENCE, "Ok.", PREFERENCE]).await;
+        world.say("prefiero respuestas cortas").await;
+        world.backend.wait_for_calls(2).await;
+        world.until_remembered("Prefiere respuestas cortas").await;
+
+        world.say("además prefiero el mate").await;
+        world.backend.wait_for_calls(4).await;
+
+        let extraction = world.backend.seen.lock()[3].clone();
+        assert!(extraction
+            .iter()
+            .all(|m| !m.content.contains("Prefiere respuestas cortas")));
+    }
+
+    #[tokio::test]
+    async fn sin_recuerdos_el_modelo_recibe_solo_la_conversacion() {
+        let world = World::new(["Hola."]).await;
+
+        world.say("hola, ¿qué tal?").await;
+
+        let sent = world.backend.seen.lock()[0].clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].role, Role::User);
+    }
+
+    #[tokio::test]
+    async fn apagada_no_se_lee_ni_se_escribe_y_al_encender_el_recuerdo_esta() {
+        let world = World::new(["Listo.", PREFERENCE, "Ok.", "Hola."]).await;
+        world.say("prefiero respuestas cortas").await;
+        world.backend.wait_for_calls(2).await;
+        world.until_remembered("Prefiere respuestas cortas").await;
+        let key = world.keys.memory_key.lock().clone();
+        assert!(key.is_some());
+
+        world.service.memory.set_enabled(false).await.unwrap();
+        world.say("prefiero el mate amargo").await;
+        World::settle().await;
+
+        // Sólo la llamada del chat: ni notas ni una extracción.
+        assert_eq!(world.backend.seen.lock().len(), 3);
+        assert_eq!(world.first_of_call(2).role, Role::User);
+        // Los archivos y la llave quedan.
+        assert!(world.tmp.memory_dir().exists());
+        assert_eq!(*world.keys.memory_key.lock(), key);
+
+        world.service.memory.set_enabled(true).await.unwrap();
+        world.say("hola otra vez").await;
+        let first = world.first_of_call(3);
+        assert_eq!(first.role, Role::System);
+        assert!(first.content.contains("Prefiere respuestas cortas"));
+    }
+
+    #[tokio::test]
+    async fn con_un_backend_remoto_sin_permiso_no_se_inyecta_ni_se_extrae_y_se_ve_el_motivo() {
+        // Primero se aprende con un backend local...
+        let world = World::new(["Listo.", PREFERENCE]).await;
+        world.say("prefiero respuestas cortas").await;
+        world.backend.wait_for_calls(2).await;
+        world.until_remembered("Prefiere respuestas cortas").await;
+        world.service.memory.close().await;
+
+        // ...y la misma carpeta con un backend remoto sin el permiso.
+        let backend = Arc::new(ScriptedBackend {
+            replies: parking_lot::Mutex::default(),
+            seen: parking_lot::Mutex::default(),
+            local: false,
+        });
+        let remote =
+            Memory::new(Some(world.tmp.memory_dir()), world.keys.clone()).with_remote_blocked(true);
+        let service = AssistantService {
+            backend: backend.clone(),
+            conversations: Arc::default(),
+            remote_allowed: true,
+            secrets: world.keys.clone(),
+            memory: Arc::new(remote),
+        };
+        let id = service.open(OWNER).unwrap();
+
+        service
+            .chat_as(OWNER, &id, "prefiero el mate amargo")
+            .await
+            .unwrap();
+        World::settle().await;
+
+        let seen = backend.seen.lock().clone();
+        assert_eq!(seen.len(), 1, "ni una extracción");
+        assert!(seen[0].iter().all(|m| m.role != Role::System));
+        let status = service.memory.status().await;
+        assert_eq!(status.reason, REASON_REMOTE);
+        assert_eq!(
+            REASON_REMOTE,
+            "La memoria no se comparte con un proveedor remoto"
+        );
+        let all = capabilities(true, &status);
+        let memory = all.iter().find(|c| c.domain == DOMAIN_MEMORY).unwrap();
+        assert!(!memory.available);
+        assert_eq!(memory.reason, REASON_REMOTE);
+    }
+
+    #[tokio::test]
+    async fn un_recuerdo_con_un_secreto_o_un_dato_de_la_persona_no_se_guarda() {
+        const EXTRACTION: &str = r#"{"items":[
+            {"kind":"preference","text":"Usa la clave sk-abcdefgh12345678"},
+            {"kind":"habit","text":"Su correo es ana@ejemplo.com"},
+            {"kind":"habit","text":"Guarda todo en /home/ana/docs"},
+            {"kind":"habit","text":"Nació el 12/03/1990"},
+            {"kind":"habit","text":"Su tarjeta es 4111 1111 1111 1111"},
+            {"kind":"preference","text":"Madruga siempre"}
+          ],"summary":null}"#;
+        let world = World::new(["Listo.", EXTRACTION]).await;
+
+        world.say("suelo madrugar siempre").await;
+        world.backend.wait_for_calls(2).await;
+        world.until_remembered("Madruga siempre").await;
+
+        let notes = world.service.memory.recall("zzz", true).await.unwrap();
+        for forbidden in ["sk-", "ana@", "/home", "1990", "4111"] {
+            assert!(!notes.contains(forbidden), "{forbidden}: {notes}");
+        }
+        world.service.memory.close().await;
+        let db = world.service.memory.database().await.unwrap();
+        let count = tokio::task::spawn_blocking(move || {
+            crate::memory::schema::MemoryKind::ALL
+                .into_iter()
+                .map(|kind| crate::memory::schema::entries(&db, kind).len())
+                .sum::<usize>()
+        })
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn un_turno_con_un_secreto_no_dispara_la_extraccion() {
+        let world = World::new(["Listo."]).await;
+
+        world.say("mi contraseña es hunter2").await;
+        world.say("prefiero usar sk-abcdefgh12345678 siempre").await;
+        World::settle().await;
+
+        assert_eq!(world.backend.seen.lock().len(), 2, "sólo los dos chats");
+    }
+
+    #[tokio::test]
+    async fn una_extraccion_con_json_roto_no_rompe_el_chat_ni_guarda_nada() {
+        let world = World::new(["Listo.", "{\"items\": [{\"kind\": ", "Sigue."]).await;
+
+        world.say("prefiero respuestas cortas").await;
+        world.backend.wait_for_calls(2).await;
+        World::settle().await;
+        let (_, reply) = world.say("hola, ¿qué tal?").await;
+
+        assert_eq!(reply, "Sigue.");
+        assert_eq!(world.first_of_call(2).role, Role::User);
+    }
+
+    #[tokio::test]
+    async fn el_resumen_de_la_conversacion_se_pide_cada_seis_turnos_y_vuelve_en_la_siguiente() {
+        const SUMMARY: &str = r#"{"items":[],"summary":"Hablaron de plantas y de mate"}"#;
+        let world = World::new(["r", "r", "r", "r", "r", "r", SUMMARY, "Hola."]).await;
+        let id = world.service.open(OWNER).unwrap();
+        for n in 0..6 {
+            world
+                .service
+                .chat_as(OWNER, &id, &format!("pregunta {n} sobre el clima"))
+                .await
+                .unwrap();
+        }
+        world.backend.wait_for_calls(7).await;
+        world
+            .until_remembered("Hablaron de plantas y de mate")
+            .await;
+
+        world.say("hola").await;
+
+        let first = world.first_of_call(7);
+        assert_eq!(first.role, Role::System);
+        assert!(first
+            .content
+            .contains("Conversación anterior: Hablaron de plantas"));
+    }
+
+    #[tokio::test]
+    async fn por_dbus_el_estado_de_la_memoria_cambia_al_encender_apagar_y_borrar() {
+        let world = World::off([], false);
+        let (server, client) =
+            crate::test_support::p2p_pair(|b| b.serve_at(SERVICE_PATH, world.service))
+                .await
+                .unwrap();
+        let proxy = AssistantProxy::builder(&client)
+            .path(SERVICE_PATH)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let off = proxy.memory_status().await.unwrap();
+        assert!(!off.enabled && !off.available);
+        assert_eq!(off.reason, REASON_OFF);
+        assert_eq!(off.bytes, 0);
+
+        proxy.set_memory_enabled(true).await.unwrap();
+        let on = proxy.memory_status().await.unwrap();
+        assert!(on.enabled && on.available && on.reason.is_empty() && on.bytes > 0);
+        let capabilities = proxy.capabilities().await.unwrap();
+        assert!(
+            capabilities
+                .iter()
+                .find(|c| c.domain == DOMAIN_MEMORY)
+                .unwrap()
+                .available
+        );
+
+        proxy.set_memory_enabled(false).await.unwrap();
+        let apagada = proxy.memory_status().await.unwrap();
+        assert!(!apagada.enabled);
+        assert!(apagada.bytes > 0, "apagar no borra");
+
+        proxy.clear_memory().await.unwrap();
+        assert_eq!(proxy.memory_status().await.unwrap().bytes, 0);
+        drop(server);
+    }
+}

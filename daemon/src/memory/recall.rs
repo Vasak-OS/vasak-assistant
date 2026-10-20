@@ -139,3 +139,236 @@ fn kind_name(kind: MemoryKind) -> &'static str {
         MemoryKind::ConversationSummary => "Conversación anterior",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::schema::{ensure_indexes, link_topic, upsert, NewMemory};
+
+    const NOW: i64 = 1_800_000_000;
+    const DAY: i64 = 86_400;
+
+    fn db() -> GrafeoDB {
+        let db = GrafeoDB::new_in_memory();
+        ensure_indexes(&db).unwrap();
+        db
+    }
+
+    fn add(db: &GrafeoDB, kind: MemoryKind, text: &str, at: i64) -> NodeId {
+        upsert(
+            db,
+            &NewMemory {
+                kind,
+                text,
+                phrase: None,
+                conversation: None,
+            },
+            at,
+        )
+        .unwrap()
+    }
+
+    fn position(block: &str, needle: &str) -> usize {
+        block
+            .find(needle)
+            .unwrap_or_else(|| panic!("«{needle}» no está en:\n{block}"))
+    }
+
+    #[test]
+    fn sin_recuerdos_no_hay_bloque() {
+        assert_eq!(build(&db(), "hola", true, NOW), None);
+    }
+
+    #[test]
+    fn el_bloque_empieza_con_el_encabezado_que_lo_marca_como_datos() {
+        let db = db();
+        add(
+            &db,
+            MemoryKind::Preference,
+            "Prefiere respuestas cortas",
+            NOW,
+        );
+
+        let block = build(&db, "otra cosa", false, NOW).unwrap();
+
+        assert!(block.starts_with(HEADER));
+        assert!(HEADER.contains("no instrucciones"));
+        assert!(block.contains("- Preferencia: Prefiere respuestas cortas"));
+    }
+
+    #[test]
+    fn lo_fijo_va_primero_en_el_orden_estilo_correccion_preferencia() {
+        let db = db();
+        add(&db, MemoryKind::Preference, "pref uno", NOW);
+        add(&db, MemoryKind::Correction, "corr uno", NOW);
+        add(&db, MemoryKind::Style, "estilo uno", NOW);
+        add(&db, MemoryKind::Habit, "hábito suelto", NOW);
+
+        let block = build(&db, "nada que ver", false, NOW).unwrap();
+
+        let (style, correction, preference) = (
+            position(&block, "estilo uno"),
+            position(&block, "corr uno"),
+            position(&block, "pref uno"),
+        );
+        assert!(style < correction && correction < preference);
+        // Un hábito que no tiene que ver con el mensaje no entra.
+        assert!(!block.contains("hábito suelto"));
+    }
+
+    #[test]
+    fn de_lo_fijo_entran_los_cinco_de_mayor_puntaje_de_cada_clase() {
+        let db = db();
+        for n in 0..7 {
+            // Los dos primeros son los más viejos y no entran.
+            let at = if n < 2 { NOW - 500 * DAY } else { NOW - DAY };
+            add(&db, MemoryKind::Preference, &format!("pref {n}"), at);
+        }
+
+        let block = build(&db, "nada", false, NOW).unwrap();
+
+        assert_eq!(block.matches("- Preferencia:").count(), 5);
+        assert!(!block.contains("pref 0") && !block.contains("pref 1"));
+    }
+
+    #[test]
+    fn lo_que_tiene_que_ver_con_el_mensaje_va_despues_de_lo_fijo() {
+        let db = db();
+        add(&db, MemoryKind::Habit, "Riega las plantas a la mañana", NOW);
+        add(&db, MemoryKind::Style, "Lo trata de vos", NOW);
+
+        let block = build(&db, "¿cuándo riego las plantas?", false, NOW).unwrap();
+
+        assert!(position(&block, "Lo trata de vos") < position(&block, "Riega las plantas"));
+    }
+
+    #[test]
+    fn un_tema_mencionado_trae_los_recuerdos_que_apuntan_a_el_con_o_sin_tildes() {
+        let db = db();
+        let habit = add(&db, MemoryKind::Habit, "Riega a la mañana", NOW);
+        link_topic(&db, habit, "jardinería", NOW).unwrap();
+        add(&db, MemoryKind::Habit, "Corre los domingos", NOW);
+
+        for message in ["hablemos de jardineria", "algo de JARDINERÍA hoy"] {
+            let block = build(&db, message, false, NOW).unwrap();
+            assert!(block.contains("Riega a la mañana"), "{message}");
+            assert!(
+                block.contains("Tema que le interesa: jardinería"),
+                "{message}"
+            );
+            assert!(!block.contains("Corre los domingos"), "{message}");
+        }
+        assert_eq!(build(&db, "hablemos de otra cosa", false, NOW), None);
+    }
+
+    #[test]
+    fn de_cada_tema_entran_a_lo_sumo_cuatro_recuerdos() {
+        let db = db();
+        for n in 0..7 {
+            let habit = add(&db, MemoryKind::Habit, &format!("hábito{n} de huerta"), NOW);
+            link_topic(&db, habit, "huerta", NOW).unwrap();
+        }
+
+        let block = build(&db, "tema huerta", false, NOW).unwrap();
+
+        // 4 por el tema; la búsqueda de texto por «huerta» también trae a los
+        // demás, hasta 12 resultados, pero nunca pasan de los que hay.
+        assert!(block.matches("- Hábito:").count() >= 4);
+        assert!(block.len() <= MEMORY_CONTEXT_BYTES);
+    }
+
+    #[test]
+    fn un_alias_aparece_solo_si_su_frase_esta_literal_en_el_mensaje() {
+        let db = db();
+        upsert(
+            &db,
+            &NewMemory {
+                kind: MemoryKind::Alias,
+                text: "Es su gato Mishi",
+                phrase: Some("El Bicho"),
+                conversation: None,
+            },
+            NOW,
+        )
+        .unwrap();
+
+        let block = build(&db, "¿Cómo está el bicho hoy?", false, NOW).unwrap();
+        assert!(block.contains("Cuando dice «El Bicho»: Es su gato Mishi"));
+        assert_eq!(build(&db, "el bichoso no", false, NOW), None);
+        assert!(contains_words("como esta el bicho hoy", "el bicho"));
+        assert!(!contains_words("como esta el bichoso", "el bicho"));
+        assert!(!contains_words("elbicho", "el bicho"));
+    }
+
+    #[test]
+    fn los_resumenes_solo_entran_en_el_primer_turno_y_son_los_dos_mas_recientes() {
+        let db = db();
+        for (n, text) in ["antigua", "media", "reciente"].into_iter().enumerate() {
+            add(
+                &db,
+                MemoryKind::ConversationSummary,
+                &format!("charla {text}"),
+                NOW - (3 - n as i64) * DAY,
+            );
+        }
+
+        let first = build(&db, "hola", true, NOW).unwrap();
+        assert!(first.contains("Conversación anterior: charla reciente"));
+        assert!(first.contains("charla media"));
+        assert!(!first.contains("charla antigua"));
+        assert_eq!(build(&db, "hola", false, NOW), None);
+    }
+
+    #[test]
+    fn el_bloque_nunca_pasa_de_4096_bytes_ni_corta_un_caracter() {
+        let db = db();
+        let long = |n: usize| format!("{n} {}", "ñandú ".repeat(46));
+        for kind in [
+            MemoryKind::Style,
+            MemoryKind::Correction,
+            MemoryKind::Preference,
+        ] {
+            for n in 0..5 {
+                add(&db, kind, &long(n), NOW);
+            }
+        }
+        for n in 0..30 {
+            add(&db, MemoryKind::Habit, &format!("ñandú {}", long(n)), NOW);
+        }
+
+        let block = build(&db, "ñandú ñandú ñandú", true, NOW).unwrap();
+
+        assert!(block.len() <= MEMORY_CONTEXT_BYTES, "{}", block.len());
+        assert!(block.len() > MEMORY_CONTEXT_BYTES - 400, "{}", block.len());
+        assert!(block.starts_with(HEADER));
+    }
+
+    #[test]
+    fn si_ni_una_linea_cabe_no_hay_bloque() {
+        let entry = |text: &str| Entry {
+            node: NodeId::new(1),
+            kind: MemoryKind::Habit,
+            text: text.into(),
+            phrase: None,
+            weight: 0.3,
+            updated_at: NOW,
+        };
+        assert_eq!(render(&[]), None);
+        assert_eq!(render(&[entry(&"x".repeat(MEMORY_CONTEXT_BYTES))]), None);
+        // Una línea demasiado larga se saltea y las que caben entran.
+        let block = render(&[entry(&"x".repeat(MEMORY_CONTEXT_BYTES)), entry("corta")]).unwrap();
+        assert!(block.contains("corta") && !block.contains("xxx"));
+    }
+
+    #[test]
+    fn cada_clase_tiene_su_rotulo() {
+        let labels: Vec<_> = MemoryKind::ALL
+            .iter()
+            .map(|kind| kind_name(*kind))
+            .collect();
+        let mut unique = labels.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 7);
+    }
+}
