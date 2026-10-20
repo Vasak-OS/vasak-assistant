@@ -115,7 +115,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let conversations = Arc::new(Mutex::new(Conversations::default()));
-    let memory = Arc::new(Memory::from_env(secrets.clone()));
+    // Con un backend remoto, la memoria no se lee ni se escribe salvo que la
+    // persona lo haya permitido.
+    let remote_blocked = !backend.info().local && !settings.share_memory_with_remote;
+    let memory = Arc::new(Memory::from_env(secrets.clone()).with_remote_blocked(remote_blocked));
     let service = AssistantService {
         backend,
         conversations: conversations.clone(),

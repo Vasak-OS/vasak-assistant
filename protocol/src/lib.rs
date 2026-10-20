@@ -22,9 +22,19 @@
 //! ([`Assistant::set_memory_enabled`]). Apagarla no borra nada: deja de usarla
 //! y encenderla de nuevo la reabre. Borrar es sólo [`Assistant::clear_memory`].
 //! [`Assistant::memory_status`] dice si está encendida, si se puede usar y
-//! cuánto ocupa. No guarda datos sensibles que no son suyos (correo,
-//! calendario, contactos, archivos, cuentas, claves). En esta fase el almacén
-//! queda listo y vacío: nada de las conversaciones se guarda todavía.
+//! cuánto ocupa.
+//!
+//! Qué guarda: lo que la persona dice de sí misma —preferencias, cómo quiere
+//! que le hablen, hábitos, temas, correcciones, nombres que usa— y resúmenes
+//! breves de conversaciones. Lo aprende solo después de responder, y lo usa
+//! como notas en el contexto del modelo, nunca en el historial. **No guarda
+//! datos sensibles que no son suyos** (correo, calendario, contactos,
+//! archivos, cuentas, claves): esos se leen de su servicio en el momento. Con
+//! un proveedor remoto, la memoria no se lee ni se escribe salvo que la
+//! persona lo permita (`share_memory_with_remote` en `vasak.conf`); si no,
+//! `MemoryStatus` y `Capabilities` dicen «La memoria no se comparte con un
+//! proveedor remoto». No hay métodos para leer o editar recuerdos sueltos:
+//! sólo encender, apagar y borrar.
 
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::Type;
@@ -278,8 +288,8 @@ pub trait Assistant {
     fn has_provider_key(&self, url: &str) -> Result<bool, Error>;
 
     /// Cómo está la memoria. Nunca falla (salvo el bus): cualquier problema
-    /// llega como `available: false` con el motivo. `bytes` se mide sin abrir
-    /// la base.
+    /// llega como `available: false` con el motivo (también el de un
+    /// proveedor remoto sin permiso). `bytes` se mide sin abrir la base.
     fn memory_status(&self) -> Result<MemoryStatus, Error>;
 
     /// Enciende o apaga la memoria.

@@ -9,8 +9,22 @@
 //! calendario, contactos, archivos, cuentas ni claves. Esos se leen de su
 //! servicio en el momento de usarlos y no se persisten acá. Lo que sí va
 //! (preferencias, tono, hábitos, temas, correcciones, nombres, contexto) lleva
-//! un esquema que todavía no está definido: hasta entonces la base queda con
-//! su nodo de metadatos y nada más.
+//! el esquema de [`schema`]. Lo que pasa por la memoria se filtra dos veces
+//! ([`filter`]): un turno con un secreto no se aprende, y ningún recuerdo con
+//! un secreto o un dato de la persona entra en la base.
+//!
+//! # Lectura y escritura
+//!
+//! - [`recall`]: antes de mandar un mensaje al modelo, un bloque de notas
+//!   relevantes va como mensaje `system` al principio del contexto de ese
+//!   turno (nunca al historial).
+//! - [`learn`]: después de responder, si el turno tiene señales de algo que
+//!   recordar, el modelo extrae recuerdos en segundo plano, se validan y se
+//!   guardan.
+//! - **Remoto**: con un backend remoto, la memoria no se lee ni se escribe salvo
+//!   que la persona lo permita (`share_memory_with_remote` en `vasak.conf`).
+//! - **Espacio**: la base no pasa de [`MAX_MEMORY_DISK_BYTES`]; si se pasa se
+//!   poda el 10 % de cada clase, y si sigue pasada no se escribe más.
 //!
 //! # Encendida, apagada y borrada
 //!
@@ -44,11 +58,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use grafeo::{Config, EncryptionConfig, GrafeoDB, KeyChain};
-use tokio::sync::Mutex;
-use vasak_assistant_protocol::{Error, MemoryStatus};
+use tokio::sync::{Mutex, Semaphore};
+use vasak_assistant_protocol::{Error, MemoryStatus, Message, Role};
 use zeroize::Zeroizing;
 
+use crate::backend::ModelBackend;
 use crate::keyring::{MemoryKey, SecretSource, MEMORY_KEY_BYTES};
+
+pub mod filter;
+pub mod learn;
+pub mod recall;
+pub mod schema;
+
+use learn::Extraction;
+use schema::{MemoryKind, NewMemory};
 
 pub const REASON_OFF: &str = "La memoria está apagada";
 pub const REASON_LOCKED: &str = "El llavero está bloqueado";
@@ -57,6 +80,10 @@ pub const REASON_DUPLICATED_KEY: &str = "Hay más de una clave de la memoria en 
 pub const REASON_NOT_OPENED: &str = "La memoria no se pudo abrir";
 pub const REASON_NO_KEYRING: &str = "El llavero no responde";
 pub const REASON_NO_PLACE: &str = "No hay una carpeta de estado donde guardar la memoria";
+pub const REASON_REMOTE: &str = "La memoria no se comparte con un proveedor remoto";
+
+/// El tope de lo que ocupa la base en disco.
+pub const MAX_MEMORY_DISK_BYTES: u64 = 4 << 20;
 
 /// La versión del formato de la base, en el nodo `:LinceMeta`.
 pub const FORMAT_VERSION: i64 = 1;
@@ -65,10 +92,11 @@ pub const FORMAT_VERSION: i64 = 1;
 /// `lince.grafeo.wal/`).
 const DB_FILE: &str = "lince.grafeo";
 
-/// El presupuesto de memoria del motor, por debajo del `MemoryMax=512M` de la
-/// unidad. Una base cifrada no vuelca nada a disco (Grafeo no cifra los
-/// archivos de desborde), así que este tope no mueve datos: los acota.
-const MEMORY_LIMIT: usize = 256 << 20;
+/// El presupuesto de memoria del motor, muy por debajo del `MemoryMax=512M` de
+/// la unidad: la base no pasa de unos cientos de nodos y 4 MiB. Una base
+/// cifrada no vuelca nada a disco (Grafeo no cifra los archivos de desborde),
+/// así que este tope no mueve datos: los acota.
+const MEMORY_LIMIT: usize = 64 << 20;
 
 /// La carpeta `memory/`. `state_directory` es `$STATE_DIRECTORY` (systemd,
 /// con un solo `StateDirectory=`) y manda si está; si no, `state_dir` (la de
@@ -92,6 +120,12 @@ pub struct Memory {
     /// La base abierta. Un candado de Tokio: encender, apagar y borrar lo
     /// sostienen de punta a punta, con esperas al llavero y al disco.
     db: Mutex<Option<Arc<GrafeoDB>>>,
+    /// Con un backend remoto y sin `share_memory_with_remote`: ni se lee ni se
+    /// escribe.
+    remote_blocked: bool,
+    /// Una sola extracción a la vez, con `try_acquire`: si hay una en curso,
+    /// el turno no se aprende. Propio, aparte de los permisos del chat.
+    learning: Semaphore,
 }
 
 impl Memory {
@@ -100,7 +134,15 @@ impl Memory {
             dir,
             secrets,
             db: Mutex::new(None),
+            remote_blocked: false,
+            learning: Semaphore::new(1),
         }
+    }
+
+    /// Con un backend remoto que no tiene permiso de ver la memoria.
+    pub fn with_remote_blocked(mut self, blocked: bool) -> Self {
+        self.remote_blocked = blocked;
+        self
     }
 
     /// Con la carpeta del entorno del proceso.
@@ -125,10 +167,12 @@ impl Memory {
         };
         let mut db = self.db.lock().await;
         let enabled = is_file(&flag(dir)).await;
-        let reason = if enabled {
-            self.ensure_open(dir, &mut db).await.err().unwrap_or("")
-        } else {
+        let reason = if !enabled {
             REASON_OFF
+        } else if self.remote_blocked {
+            REASON_REMOTE
+        } else {
+            self.ensure_open(dir, &mut db).await.err().unwrap_or("")
         };
         MemoryStatus {
             enabled,
@@ -139,22 +183,107 @@ impl Memory {
     }
 
     /// La base abierta, para quien guarde o lea recuerdos. `Err` con el
-    /// motivo si está apagada o no se puede abrir.
-    // Sin llamador hasta que exista el esquema de contenido.
-    #[allow(dead_code)]
+    /// motivo si está apagada, el remoto no la puede ver o no se puede abrir.
     pub async fn database(&self) -> Result<Arc<GrafeoDB>, &'static str> {
         let dir = self.dir.as_ref().ok_or(REASON_NO_PLACE)?;
         let mut db = self.db.lock().await;
+        self.usable(dir, &mut db).await
+    }
+
+    /// Con el candado tomado: encendida, permitida y abierta.
+    async fn usable(
+        &self,
+        dir: &Path,
+        db: &mut Option<Arc<GrafeoDB>>,
+    ) -> Result<Arc<GrafeoDB>, &'static str> {
         if !is_file(&flag(dir)).await {
             return Err(REASON_OFF);
         }
-        self.ensure_open(dir, &mut db).await?;
+        if self.remote_blocked {
+            return Err(REASON_REMOTE);
+        }
+        self.ensure_open(dir, db).await?;
         db.clone().ok_or(REASON_NOT_OPENED)
+    }
+
+    /// El bloque de notas para este mensaje ([`recall`]). Nunca falla: sin
+    /// memoria utilizable, o si algo sale mal, `None` y la conversación sigue
+    /// sin notas.
+    pub async fn recall(&self, message: &str, first_turn: bool) -> Option<String> {
+        let db = self.database().await.ok()?;
+        let message = message.to_owned();
+        blocking(move || Ok(recall::build(&db, &message, first_turn, schema::now())))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Después de responder: si el turno pasa la puerta ([`learn::worth_learning`])
+    /// y no hay otra extracción en curso, extrae y guarda recuerdos en segundo
+    /// plano. No espera ni falla: lo que salga mal queda en el registro.
+    ///
+    /// `conversation` son los mensajes del turno (historial, mensaje y
+    /// respuesta), sin el bloque de la memoria.
+    pub fn learn_after(
+        self: &Arc<Self>,
+        backend: Arc<dyn ModelBackend>,
+        conversation_id: &str,
+        conversation: Vec<Message>,
+    ) {
+        let user_turns = conversation
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .count();
+        let (Some(user), Some(reply)) = (
+            conversation.iter().rev().find(|m| m.role == Role::User),
+            conversation.last().filter(|m| m.role == Role::Assistant),
+        ) else {
+            return;
+        };
+        let Some(gate) = learn::worth_learning(&user.content, &reply.content, user_turns) else {
+            return;
+        };
+        let memory = self.clone();
+        let conversation_id = conversation_id.to_owned();
+        tokio::spawn(async move {
+            let Ok(_permit) = memory.learning.try_acquire() else {
+                return;
+            };
+            // Antes de mandarle nada al modelo: que la memoria se pueda usar.
+            if memory.database().await.is_err() {
+                return;
+            }
+            let request = learn::extraction_request(&conversation, gate);
+            let reply = match backend.chat(&request).await {
+                Ok(reply) => reply,
+                Err(error) => {
+                    tracing::info!("la extracción de recuerdos no respondió: {error:?}");
+                    return;
+                }
+            };
+            let extraction = learn::parse_extraction(&reply);
+            if extraction.items.is_empty() && extraction.summary.is_none() {
+                return;
+            }
+            if let Err(reason) = memory.store(extraction, &conversation_id).await {
+                tracing::info!("no se guardaron los recuerdos: {reason}");
+            }
+        });
+    }
+
+    /// Guarda lo extraído, bajo el candado y volviendo a comprobar que la
+    /// memoria siga encendida y permitida.
+    pub async fn store(&self, extraction: Extraction, conversation_id: &str) -> Result<(), String> {
+        let dir = self.dir.as_ref().ok_or(REASON_NO_PLACE)?;
+        let mut guard = self.db.lock().await;
+        let db = self.usable(dir, &mut guard).await?;
+        let (dir, conversation_id) = (dir.clone(), conversation_id.to_owned());
+        blocking(move || write(&db, &dir, &extraction, &conversation_id).map_err(text)).await
     }
 
     /// Cierra la base si está abierta (vuelca el WAL al archivo). Se vuelve a
     /// abrir sola la próxima vez que se la necesite.
-    // Sin llamador hasta que exista el esquema de contenido.
+    // Sin llamador en el servicio todavía: apagar y borrar cierran por dentro.
     #[allow(dead_code)]
     pub async fn close(&self) {
         close(self.db.lock().await.take()).await;
@@ -233,7 +362,9 @@ impl Memory {
             if !path.is_file() {
                 return Err(format!("falta {}", path.display()));
             }
-            GrafeoDB::with_config(config(&path, &key)).map_err(text)
+            let db = GrafeoDB::with_config(config(&path, &key)).map_err(text)?;
+            schema::ensure_indexes(&db).map_err(text)?;
+            Ok(db)
         })
         .await;
         match opened {
@@ -337,13 +468,9 @@ fn text(error: impl Display) -> String {
     error.to_string()
 }
 
-/// La configuración de la base: cifrada, con WAL y con el tope de memoria.
-///
-/// Cuando haya contenido (el esquema lo define el architect), lo que se
-/// ajustaría acá y en la base: un índice de propiedad (`CREATE INDEX`) sobre la clave por la
-/// que se busque cada recuerdo, y `with_checkpoint_interval` para no esperar
-/// al cierre para volcar el WAL. El caché de planes de consulta de Grafeo ya
-/// viene encendido.
+/// La configuración de la base: cifrada, con WAL y con el tope de memoria. Los
+/// índices son de la base ([`schema::ensure_indexes`]); cada escritura termina
+/// con `wal_checkpoint`, así que no hace falta `with_checkpoint_interval`.
 fn config(path: &Path, key: &[u8; MEMORY_KEY_BYTES]) -> Config {
     Config::persistent(path)
         .with_encryption(EncryptionConfig::new(Arc::new(KeyChain::new(*key))))
@@ -369,8 +496,9 @@ fn create_files(dir: &Path, key: &[u8; MEMORY_KEY_BYTES]) -> Result<GrafeoDB, St
         .map_err(text)?;
     let built = (|| {
         let db = GrafeoDB::with_config(config(&tmp.join(DB_FILE), key)).map_err(text)?;
-        db.execute(&format!("INSERT (:LinceMeta {{format: {FORMAT_VERSION}}})"))
+        db.create_node_with_props(&["LinceMeta"], [("format", FORMAT_VERSION)])
             .map_err(text)?;
+        schema::ensure_indexes(&db).map_err(text)?;
         db.close().map_err(text)?;
         drop(db);
         std::fs::rename(&tmp, dir).map_err(text)
@@ -409,25 +537,73 @@ async fn is_dir(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_dir())
 }
 
-/// Lo que ocupan los archivos bajo `dir`, sin seguir enlaces ni abrir la base.
-async fn disk_usage(dir: PathBuf) -> u64 {
-    fn walk(path: &Path) -> u64 {
-        let Ok(metadata) = std::fs::symlink_metadata(path) else {
-            return 0;
-        };
-        if !metadata.is_dir() {
-            return metadata.len();
-        }
-        std::fs::read_dir(path)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| walk(&entry.path()))
-            .sum()
+/// Lo que ocupan los archivos bajo `path`, sin seguir enlaces ni abrir la base.
+fn dir_size(path: &Path) -> u64 {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !metadata.is_dir() {
+        return metadata.len();
     }
-    tokio::task::spawn_blocking(move || walk(&dir))
+    std::fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| dir_size(&entry.path()))
+        .sum()
+}
+
+async fn disk_usage(dir: PathBuf) -> u64 {
+    tokio::task::spawn_blocking(move || dir_size(&dir))
         .await
         .unwrap_or(0)
+}
+
+/// La escritura de lo extraído, fuera del runtime. Antes de escribir mira el
+/// espacio: pasado [`MAX_MEMORY_DISK_BYTES`] poda el 10 % de cada clase, y si
+/// sigue pasado no escribe. Termina con `wal_checkpoint`.
+fn write(
+    db: &GrafeoDB,
+    dir: &Path,
+    extraction: &Extraction,
+    conversation_id: &str,
+) -> grafeo::Result<()> {
+    let now = schema::now();
+    if dir_size(dir) > MAX_MEMORY_DISK_BYTES {
+        schema::prune_tenth(db, now)?;
+        if dir_size(dir) > MAX_MEMORY_DISK_BYTES {
+            tracing::warn!("la memoria llegó a su tope de espacio: no se guarda nada más");
+            return Ok(());
+        }
+    }
+    for item in &extraction.items {
+        let node = schema::upsert(
+            db,
+            &NewMemory {
+                kind: item.kind,
+                text: &item.text,
+                phrase: item.phrase.as_deref(),
+                conversation: None,
+            },
+            now,
+        )?;
+        for topic in &item.topics {
+            schema::link_topic(db, node, topic, now)?;
+        }
+    }
+    if let Some(summary) = &extraction.summary {
+        schema::upsert(
+            db,
+            &NewMemory {
+                kind: MemoryKind::ConversationSummary,
+                text: summary,
+                phrase: None,
+                conversation: Some(conversation_id),
+            },
+            now,
+        )?;
+    }
+    db.wal_checkpoint()
 }
 
 async fn close(db: Option<Arc<GrafeoDB>>) {

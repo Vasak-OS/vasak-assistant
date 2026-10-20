@@ -249,6 +249,7 @@ pub fn local_selection(backend: &str, url: &str, model: Option<&str>) -> Selecti
         url: Some(url.into()),
         model: model.map(str::to_owned),
         allow_remote: false,
+        share_memory_with_remote: false,
     })
     .unwrap_or_else(|rejection| panic!("la selección local se acepta: {}", rejection.reason))
 }
@@ -285,6 +286,12 @@ pub struct FixedKey {
     /// carpeta todavía en disco.
     pub calls: Mutex<Vec<String>>,
     pub watch: Mutex<Option<PathBuf>>,
+    /// Claves de proveedor guardadas por una versión anterior, sin el esquema
+    /// protegido (`{service, url}`), con los mismos atributos que la nueva.
+    /// Con la misma regla que `SecretService`: sin clave fija, si hay
+    /// exactamente una para la dirección, `api_key` la migra a `stored` y la
+    /// saca de acá; con más de una no se usa ninguna.
+    pub unprotected: Mutex<Vec<(String, ApiKey)>>,
 }
 
 impl FixedKey {
@@ -299,6 +306,7 @@ impl FixedKey {
             duplicated: Mutex::default(),
             calls: Mutex::default(),
             watch: Mutex::default(),
+            unprotected: Mutex::default(),
         })
     }
 
@@ -326,7 +334,16 @@ impl FixedKey {
 impl SecretSource for FixedKey {
     fn api_key<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Option<ApiKey>> {
         self.asked.lock().push(url.to_owned());
-        let key = self.key.clone();
+        let key = self.key.clone().or_else(|| {
+            let mut unprotected = self.unprotected.lock();
+            let matching: Vec<usize> = (0..unprotected.len())
+                .filter(|&i| unprotected[i].0 == url)
+                .collect();
+            let [only] = matching[..] else { return None };
+            let (url, key) = unprotected.remove(only);
+            self.stored.lock().push((url, key.clone()));
+            Some(key)
+        });
         Box::pin(async move { key })
     }
 
@@ -337,7 +354,15 @@ impl SecretSource for FixedKey {
 
     /// Hay clave si la fija existe o si se guardó una para esa dirección.
     fn has_key<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<bool, Error>> {
-        let has = self.key.is_some() || self.stored.lock().iter().any(|(u, _)| u == url);
+        let has = self.key.is_some()
+            || self.stored.lock().iter().any(|(u, _)| u == url)
+            || self
+                .unprotected
+                .lock()
+                .iter()
+                .filter(|(u, _)| u == url)
+                .count()
+                == 1;
         Box::pin(async move { Ok(has) })
     }
 
@@ -500,6 +525,70 @@ impl ModelBackend for FakeBackend {
                 gate.notified().await;
             }
             self.chat_result.lock().clone()
+        })
+    }
+}
+
+/// Un backend con respuestas programadas, para las pruebas de la memoria:
+/// contesta cada `chat` con la siguiente de `replies` (el chat de la persona y
+/// después la extracción de recuerdos en JSON, por ejemplo) y anota cada
+/// pedido en `seen`. Sin respuestas programadas contesta `""`. `local` decide
+/// si se presenta como local o remoto.
+// Infraestructura para las pruebas de la memoria, que escribe qa.
+#[allow(dead_code)]
+pub struct ScriptedBackend {
+    pub replies: Mutex<std::collections::VecDeque<Result<String, BackendError>>>,
+    pub seen: Mutex<Vec<Vec<Message>>>,
+    pub local: bool,
+}
+
+#[allow(dead_code)]
+impl ScriptedBackend {
+    pub fn new(replies: impl IntoIterator<Item = &'static str>) -> Arc<Self> {
+        Arc::new(Self {
+            replies: Mutex::new(replies.into_iter().map(|r| Ok(r.to_owned())).collect()),
+            seen: Mutex::default(),
+            local: true,
+        })
+    }
+
+    /// Espera hasta que haya `n` pedidos (la extracción corre en otra tarea).
+    /// Falla la prueba a los 5 segundos.
+    pub async fn wait_for_calls(&self, n: usize) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.seen.lock().len() < n {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "el backend recibió {} pedidos de {n}",
+                self.seen.lock().len()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+}
+
+impl ModelBackend for ScriptedBackend {
+    fn info(&self) -> ModelInfo {
+        ModelInfo {
+            local: self.local,
+            ..model_info("guionado")
+        }
+    }
+
+    fn models(&self) -> BoxFuture<'_, Result<Vec<String>, BackendError>> {
+        Box::pin(async { Ok(vec!["guionado".into()]) })
+    }
+
+    fn active_model(&self) -> BoxFuture<'_, Result<ModelInfo, BackendError>> {
+        let info = self.info();
+        Box::pin(async move { Ok(info) })
+    }
+
+    fn chat<'a>(&'a self, messages: &'a [Message]) -> BoxFuture<'a, Result<String, BackendError>> {
+        Box::pin(async move {
+            let reply = self.replies.lock().pop_front().unwrap_or(Ok(String::new()));
+            self.seen.lock().push(messages.to_vec());
+            reply
         })
     }
 }

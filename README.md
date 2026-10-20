@@ -55,6 +55,7 @@ arrancar: después de cambiarla, `systemctl --user restart vasak-assistant`.
 | `url` | `http://127.0.0.1:11434` con `ollama`, `http://127.0.0.1:8080/v1` (llama.cpp server) con `openai` |
 | `model` | el primero que ofrezca el backend; con un remoto es obligatorio |
 | `allow_remote` | `false` |
+| `share_memory_with_remote` | `false`: con un backend remoto, la memoria no se lee ni se escribe |
 
 **Local o remoto.** Lo decide la dirección, no una declaración: un host
 `localhost` o una IP de loopback es **local**; cualquier otro es **remoto**. Un
@@ -65,15 +66,26 @@ dónde.
 
 **La clave del proveedor nunca va en la configuración.** Se lee de
 `vasak-keyring` (el Secret Service de la sesión), del ítem con los atributos
-`service=ar.net.vasak.os.Assistant` y `url=` la dirección base terminada en
-`/`. Se guarda desde **Configuración → Asistente**, o con `secret-tool`:
+`service=ar.net.vasak.os.Assistant`, `url=` la dirección base terminada en `/`,
+`purpose=provider` y el esquema protegido `xdg:schema=ar.net.vasak.os.Assistant`.
+Se guarda desde **Configuración → Asistente**: Configuración no toca el
+llavero, le pasa la clave al servicio, que es quien crea el ítem.
+
+El esquema protegido es la defensa: `vasak-keyring` deja leer, crear y
+reemplazar esos ítems sólo a `/usr/bin/vasak-assistant` (vasak-keyring#55), y
+el servicio busca con el mismo esquema, así que un ítem común plantado por otro
+programa no se usa. Por eso, con esa restricción activa, `secret-tool` ya no
+puede guardar la clave. Antes de eso, el equivalente a mano es:
 
 ```bash
-secret-tool store --label='Lince' service ar.net.vasak.os.Assistant url https://api.openai.com/v1/
+secret-tool store --label='Lince' service ar.net.vasak.os.Assistant url https://api.openai.com/v1/ purpose provider xdg:schema ar.net.vasak.os.Assistant
 ```
 
-Configuración no toca el llavero: le pasa la clave al servicio, que es quien
-crea el ítem.
+Una clave guardada por una versión anterior (sin `purpose` ni `xdg:schema`) se
+pasa sola al ítem protegido la primera vez que se la lee, si es la única para
+esa dirección; con más de una no se usa ninguna (el registro lo dice) y hay que
+volver a guardarla desde Configuración. Con el llavero bloqueado no se migra ni
+se abre ningún diálogo.
 
 | Método | Qué hace |
 |---|---|
@@ -95,18 +107,33 @@ systemd, `$STATE_DIRECTORY`). No va en el almacén de cuentas.
   de `memory/`.
 - **Cifrada.** El archivo y su registro de escritura (WAL) van con AES-256-GCM,
   con una llave de 32 bytes que genera el servicio la primera vez que se
-  enciende y guarda en el llavero (atributos `service=ar.net.vasak.os.Assistant`
-  y `purpose=memory`). Sin la llave, lo que hay en disco no se puede leer.
+  enciende y guarda en el llavero (atributos `service=ar.net.vasak.os.Assistant`,
+  `purpose=memory` y el esquema protegido `xdg:schema=ar.net.vasak.os.Assistant`).
+  Sin la llave, lo que hay en disco no se puede leer.
 - **Apagar no borra.** Deja de usarla y de escribirla; encenderla de nuevo
   reabre la misma base con su llave.
 - **Borrar es `ClearMemory`.** Primero la llave del llavero y después los
   archivos; con el llavero bloqueado no se toca nada.
 - Si la llave falta o no abre la base, la memoria queda **no disponible** con el
   motivo; el servicio nunca la regenera ni la borra solo. La salida es borrarla.
+- **Qué guarda.** Lo que la persona dice de sí misma —preferencias, cómo
+  quiere que le hablen, hábitos, temas que le interesan, correcciones y los
+  nombres que usa («lo de la abuela» = la casa de su abuela)— y un resumen
+  breve cada seis turnos. Lo aprende el propio modelo después de responder, en
+  segundo plano, y sólo cuando el mensaje tiene señales de eso. Cada recuerdo
+  pasa por filtros: nada con claves, contraseñas, tarjetas ni tokens, y nada
+  con correos, teléfonos, rutas, cuentas bancarias o fechas. Un turno con un
+  secreto no se aprende. Topes por clase y 4 MiB en total; lo más viejo y menos
+  reforzado se poda primero.
+- **Cómo lo usa.** Antes de cada mensaje, las notas que vienen al caso (hasta 4
+  KiB) van al modelo como contexto de ese turno, marcadas como datos y no como
+  instrucciones. Nunca quedan en el historial ni en `History`.
 - **Sólo lo suyo.** No guarda correo, calendario, contactos, archivos, cuentas
   ni claves: eso se lee de su servicio en el momento y no se persiste.
-- Por ahora queda **lista y vacía**: todavía no se guarda nada de las
-  conversaciones.
+- **Con un proveedor remoto**, la memoria no se lee ni se escribe salvo que la
+  persona lo permita con `"share_memory_with_remote": true` en la sección
+  `assistant` de `vasak.conf`; si no, `MemoryStatus` dice «La memoria no se
+  comparte con un proveedor remoto».
 
 | Método | Qué hace |
 |---|---|

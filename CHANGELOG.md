@@ -4,8 +4,8 @@ Todas las novedades de este repositorio, por paquete.
 
 ## vasak-assistant 0.3.0
 
-La memoria de Lince (fase 4 de #1): el almacén, apagado por omisión. Todavía
-no guarda nada de las conversaciones.
+La memoria de Lince (fase 4 de #1), apagada por omisión, y la clave del
+proveedor en el esquema protegido del llavero.
 
 - **`protocol`** — `MemoryStatus` (`(bbst)`: encendida, disponible, motivo y
   bytes) y tres métodos nuevos en el proxy: `MemoryStatus()`,
@@ -19,9 +19,25 @@ no guarda nada de las conversaciones.
   Borrar (`ClearMemory`) saca primero la llave y después los archivos, y con el
   llavero bloqueado no toca nada. Al arrancar nunca se genera ni se borra nada
   solo. No guarda datos que no son suyos (correo, calendario, contactos,
-  archivos, cuentas, claves). El llavero (`keyring`) busca y guarda por un
-  mapa de atributos y suma el borrado de ítems. El binario se compila con
-  `lto = "fat"` y `codegen-units = 1`.
+  archivos, cuentas, claves).
+  - El esquema (`memory/schema`): nodos `:Memory` de siete clases
+    (preferencias, estilo, hábitos, temas, correcciones, alias y resúmenes de
+    conversación), con topes por clase, peso que se refuerza y decae, aristas
+    `ABOUT` a temas, índices de propiedad (`id`, `key`) y de texto (`terms`).
+  - La lectura (`memory/recall`): antes de cada mensaje, hasta 4 KiB de notas
+    como mensaje `system` en el contexto de ese turno, nunca en el historial.
+  - La escritura (`memory/learn`): después de responder, si el turno tiene
+    señales, el modelo extrae recuerdos en JSON en segundo plano; se validan y
+    se guardan con deduplicación. Topes de 4 MiB con poda.
+  - Los filtros (`memory/filter`): nada con secretos ni con datos de la persona.
+  - Con un proveedor remoto, la memoria no se lee ni se escribe salvo
+    `share_memory_with_remote` en `vasak.conf`.
+- **`daemon/keyring`** — busca y guarda por un mapa de atributos y suma el
+  borrado de ítems. La clave del proveedor y la llave de la memoria se buscan y
+  se crean con el mismo mapa, con `xdg:schema=ar.net.vasak.os.Assistant`
+  (protegido por vasak-keyring#55) y `purpose`. Una clave del proveedor de una
+  versión anterior, sin esquema, se migra al leerla si es la única.
+- El binario se compila con `lto = "fat"` y `codegen-units = 1`.
 - **`packaging`** — la unidad tiene `StateDirectory=vasak-assistant` (modo
   0700), `UMask=0077` y `MemoryMax=512M`.
 

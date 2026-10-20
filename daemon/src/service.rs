@@ -15,7 +15,7 @@ use zbus::names::BusName;
 use zbus::{interface, Connection};
 
 use vasak_assistant_protocol::{
-    Capability, Error, MemoryStatus, Message, ServiceStatus, DOMAINS, DOMAIN_MEMORY,
+    Capability, Error, MemoryStatus, Message, Role, ServiceStatus, DOMAINS, DOMAIN_MEMORY,
     DOMAIN_REMOTE_BACKENDS,
 };
 
@@ -181,18 +181,43 @@ impl AssistantService {
         conversation_id: &str,
         content: &str,
     ) -> Result<String, Error> {
-        let context = self
+        let mut context = self
             .conversations
             .lock()
             .begin_turn(owner, conversation_id, content)?;
+        // El guardián va antes de cualquier espera: si el pedido se abandona
+        // mientras se lee la memoria, la conversación igual se libera.
         let mut turn = Turn {
             conversations: &self.conversations,
             id: conversation_id,
             content,
             reply: None,
         };
-        let reply = self.backend.chat(&context).await.map_err(to_dbus)?;
+        let first_turn = context.iter().filter(|m| m.role == Role::User).count() == 1;
+        // Las notas de la memoria van sólo en el contexto de este turno: no al
+        // historial ni a `History`.
+        let notes = self.memory.recall(content, first_turn).await;
+        let with_notes = notes.map(|notes| {
+            let mut with_notes = Vec::with_capacity(context.len() + 1);
+            with_notes.push(Message {
+                role: Role::System,
+                content: notes,
+            });
+            with_notes.extend(context.iter().cloned());
+            with_notes
+        });
+        let reply = self
+            .backend
+            .chat(with_notes.as_deref().unwrap_or(&context))
+            .await
+            .map_err(to_dbus)?;
         turn.reply = Some(reply.clone());
+        context.push(Message {
+            role: Role::Assistant,
+            content: reply.clone(),
+        });
+        self.memory
+            .learn_after(self.backend.clone(), conversation_id, context);
         Ok(reply)
     }
 

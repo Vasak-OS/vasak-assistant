@@ -56,7 +56,7 @@ LimitCORE=0
 # Techos de recursos. Las conversaciones están acotadas por los topes del
 # contrato (32 conversaciones de hasta 512 KiB, respuestas de hasta 256 KiB,
 # cuatro pedidos al modelo a la vez): unas decenas de MiB. El motor de la
-# memoria tiene su propio presupuesto de 256 MiB (`daemon/src/memory.rs`), por
+# memoria tiene su propio presupuesto de 64 MiB (`daemon/src/memory/mod.rs`), por
 # debajo de este techo. Los hilos son los de Tokio (uno por núcleo más los de
 # E/S bloqueante); 256 alcanza aun en una máquina con muchos núcleos.
 MemoryMax=512M
