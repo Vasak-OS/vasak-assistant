@@ -489,6 +489,20 @@ mod tests {
         /// `Locked` da `false` pero `CreateItem` contesta con un prompt (se
         /// bloqueó entre la consulta y la escritura).
         Prompts,
+        /// `CreateItem` falla con `org.freedesktop.Secret.Error.IsLocked`.
+        IsLocked,
+        /// `CreateItem` falla con otro error de método.
+        Fails,
+    }
+
+    #[derive(Debug, zbus::DBusError)]
+    #[zbus(prefix = "org.freedesktop.Secret.Error")]
+    enum FakeError {
+        #[zbus(error)]
+        ZBus(zbus::Error),
+        IsLocked(String),
+        #[zbus(name = "org.freedesktop.DBus.Error.Failed")]
+        Failed(String),
     }
 
     /// Un `CreateItem` tal como llegó.
@@ -520,7 +534,7 @@ mod tests {
             properties: HashMap<String, OwnedValue>,
             secret: Secret,
             replace: bool,
-        ) -> (OwnedObjectPath, OwnedObjectPath) {
+        ) -> Result<(OwnedObjectPath, OwnedObjectPath), FakeError> {
             let label = properties
                 .get("org.freedesktop.Secret.Item.Label")
                 .and_then(|value| String::try_from(value.try_clone().ok()?).ok())
@@ -540,12 +554,14 @@ mod tests {
             });
             let prompt = match self.state {
                 Collection::Prompts => "/org/freedesktop/secrets/prompt/p1",
+                Collection::IsLocked => return Err(FakeError::IsLocked("bloqueada".into())),
+                Collection::Fails => return Err(FakeError::Failed("falló".into())),
                 _ => "/",
             };
-            (
+            Ok((
                 OwnedObjectPath::try_from(ITEM).unwrap(),
                 OwnedObjectPath::try_from(prompt).unwrap(),
-            )
+            ))
         }
     }
 
@@ -774,5 +790,92 @@ mod tests {
             service.has_key(URL).await,
             Err(Error::Unavailable(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn si_create_item_falla_con_is_locked_el_motivo_es_el_de_llavero_bloqueado() {
+        let setup = secret_service_with(Item::Unlocked, b"", Collection::IsLocked).await;
+
+        let Err(Error::Unavailable(text)) = setup.service.store_key(URL, &key()).await else {
+            panic!("tenía que ser Unavailable");
+        };
+
+        assert_eq!(text, locked_error_text());
+        assert!(!text.contains(CLAVE));
+        assert_eq!(*setup.closed.lock(), 1);
+    }
+
+    #[tokio::test]
+    async fn otro_error_de_create_item_da_el_unavailable_generico_sin_la_clave() {
+        let setup = secret_service_with(Item::Unlocked, b"", Collection::Fails).await;
+
+        let Err(Error::Unavailable(text)) = setup.service.store_key(URL, &key()).await else {
+            panic!("tenía que ser Unavailable");
+        };
+
+        assert!(
+            text.starts_with("No se pudo guardar la clave en el llavero"),
+            "{text}"
+        );
+        assert_ne!(text, locked_error_text());
+        assert!(!text.contains(CLAVE));
+        assert_eq!(*setup.closed.lock(), 1);
+    }
+
+    fn locked_error_text() -> String {
+        let Error::Unavailable(text) = locked_error() else {
+            unreachable!()
+        };
+        text
+    }
+
+    #[tokio::test]
+    async fn con_mas_de_un_item_desbloqueado_has_key_da_false() {
+        let setup = secret_service(Item::Duplicated, b"x").await;
+        assert!(!setup.service.has_key(URL).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn has_provider_key_de_punta_a_punta_da_false_con_la_clave_duplicada() {
+        use crate::test_support::FakeBackend;
+        for (item, esperado) in [
+            (Item::Duplicated, false),
+            (Item::Unlocked, true),
+            (Item::Locked, true),
+        ] {
+            let setup = secret_service(item, b"x").await;
+            let service = crate::service::AssistantService {
+                backend: Arc::new(FakeBackend::replying("")),
+                conversations: Arc::default(),
+                remote_allowed: false,
+                secrets: Arc::new(setup.service),
+            };
+            assert_eq!(
+                service
+                    .has_provider_key_for("https://api.ejemplo.com/v1")
+                    .await
+                    .unwrap(),
+                esperado
+            );
+        }
+    }
+
+    #[test]
+    fn has_usable_item_es_true_con_un_desbloqueado_o_solo_bloqueados() {
+        let paths = |n: usize| vec![OwnedObjectPath::try_from(ITEM).unwrap(); n];
+        for (unlocked, locked, esperado) in [
+            (0, 0, false),
+            (0, 1, true),
+            (1, 0, true),
+            (1, 1, true),
+            (2, 0, false),
+            (2, 1, false),
+        ] {
+            assert_eq!(
+                has_usable_item(&paths(unlocked), &paths(locked)),
+                esperado,
+                "{unlocked} desbloqueados, {locked} bloqueados"
+            );
+        }
     }
 }
