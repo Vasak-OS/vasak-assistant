@@ -415,6 +415,8 @@ mod tests {
         Locked,
         /// Dos ítems con los mismos atributos: uno plantado al lado del verdadero.
         Duplicated,
+        /// Dos ítems bloqueados con los mismos atributos.
+        LockedTwice,
     }
 
     struct FakeSecrets {
@@ -441,6 +443,10 @@ mod tests {
                 (true, Item::Duplicated) => (
                     vec![item, OwnedObjectPath::try_from(ITEM_2).unwrap()],
                     vec![],
+                ),
+                (true, Item::LockedTwice) => (
+                    vec![],
+                    vec![item, OwnedObjectPath::try_from(ITEM_2).unwrap()],
                 ),
                 (false, _) => (vec![], vec![]),
             }
@@ -876,6 +882,7 @@ mod tests {
             (0, 1, true),
             (1, 0, true),
             (1, 1, true),
+            (0, 2, false),
             (2, 0, false),
             (2, 1, false),
         ] {
@@ -885,5 +892,64 @@ mod tests {
                 "{unlocked} desbloqueados, {locked} bloqueados"
             );
         }
+    }
+
+    /// Un destino de `tracing` que junta lo que se escribe.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Captured {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn con_dos_claves_bloqueadas_no_hay_clave_y_el_aviso_dice_que_hay_varias() {
+        let log = Captured::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(log.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let setup = secret_service(Item::LockedTwice, b"x").await;
+
+        assert!(setup.service.api_key(URL).await.is_none());
+        assert!(!setup.service.has_key(URL).await.unwrap());
+        assert!(setup.sessions_opened.lock().is_empty());
+
+        let text = String::from_utf8(log.0.lock().clone()).unwrap();
+        assert!(text.contains("hay 2 claves"), "{text}");
+        assert!(!text.contains("llavero bloqueado"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn con_una_sola_clave_bloqueada_el_aviso_es_el_de_llavero_bloqueado() {
+        let log = Captured::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(log.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let setup = secret_service(Item::Locked, b"x").await;
+
+        assert!(setup.service.api_key(URL).await.is_none());
+
+        let text = String::from_utf8(log.0.lock().clone()).unwrap();
+        assert!(text.contains("llavero bloqueado"), "{text}");
+        assert!(!text.contains("hay 2 claves"), "{text}");
     }
 }
