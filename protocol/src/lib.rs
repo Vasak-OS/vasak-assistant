@@ -19,10 +19,12 @@
 //! El asistente puede tener una memoria propia: una base de grafos cifrada en
 //! la carpeta de estado del servicio, con la llave en el llavero de la sesión.
 //! **Viene apagada**: existe sólo desde que la persona la enciende
-//! ([`Assistant::set_memory_enabled`]) y apagarla la borra entera, archivos y
-//! llave. [`Assistant::memory_status`] dice si está encendida, si se puede usar
-//! y cuánto ocupa. En esta fase el almacén queda listo y vacío: nada de las
-//! conversaciones se guarda todavía.
+//! ([`Assistant::set_memory_enabled`]). Apagarla no borra nada: deja de usarla
+//! y encenderla de nuevo la reabre. Borrar es sólo [`Assistant::clear_memory`].
+//! [`Assistant::memory_status`] dice si está encendida, si se puede usar y
+//! cuánto ocupa. No guarda datos sensibles que no son suyos (correo,
+//! calendario, contactos, archivos, cuentas, claves). En esta fase el almacén
+//! queda listo y vacío: nada de las conversaciones se guarda todavía.
 
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::Type;
@@ -160,7 +162,7 @@ pub struct Capability {
 /// Cómo está la memoria del asistente. Firma `(bbst)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct MemoryStatus {
-    /// Si la persona la encendió (existe en disco), se pueda abrir o no.
+    /// Si la persona la encendió, se pueda abrir o no.
     pub enabled: bool,
     /// Si está encendida y abierta, lista para usarse.
     pub available: bool,
@@ -168,7 +170,8 @@ pub struct MemoryStatus {
     /// («La memoria está apagada», «El llavero está bloqueado», …). Vacío si
     /// está disponible.
     pub reason: String,
-    /// Cuánto ocupa en disco, en bytes. Se mide sin abrirla; 0 si está apagada.
+    /// Cuánto ocupa en disco, en bytes, encendida o apagada. Se mide sin
+    /// abrirla; 0 si no hay base.
     pub bytes: u64,
 }
 
@@ -281,19 +284,20 @@ pub trait Assistant {
 
     /// Enciende o apaga la memoria.
     ///
-    /// - Encender genera una llave nueva, la guarda en el llavero y crea la
-    ///   base vacía y cifrada. `Unavailable` si el llavero está bloqueado o no
-    ///   responde (nunca se abre un diálogo), o si no se pudo crear. Si ya
-    ///   estaba encendida y abierta, no hace nada.
-    /// - Apagar **borra**: primero la llave del llavero y después los
-    ///   archivos. Con el llavero bloqueado los archivos se borran igual. Si ya
-    ///   estaba apagada, borra lo que haya quedado suelto (una llave en el
-    ///   llavero, restos de un corte a mitad de camino) y devuelve Ok.
+    /// - Encender reabre la base que haya, con la llave que está en el
+    ///   llavero; si no hay, genera una llave nueva, la guarda en el llavero y
+    ///   crea la base vacía y cifrada. `Unavailable` si el llavero está
+    ///   bloqueado o no responde (nunca se abre un diálogo), si la llave falta
+    ///   o no abre la base existente, o si no se pudo crear. Si ya estaba
+    ///   encendida y abierta, no hace nada.
+    /// - Apagar **no borra nada**: deja de usarla y de escribirla; los archivos
+    ///   y la llave quedan.
     fn set_memory_enabled(&self, enabled: bool) -> Result<(), Error>;
 
-    /// Vacía la memoria: si está encendida, la borra y la vuelve a crear vacía
-    /// con una llave nueva; si está apagada, no hace nada. `Unavailable` si el
-    /// llavero está bloqueado (entonces no se toca nada) o no responde.
+    /// Borra la memoria: primero la llave del llavero y después los archivos.
+    /// Si estaba encendida, la recrea vacía con una llave nueva. `Unavailable`
+    /// si el llavero está bloqueado (entonces no se toca nada) o no responde.
+    /// Es la salida cuando la llave falta o no abre la base.
     fn clear_memory(&self) -> Result<(), Error>;
 }
 

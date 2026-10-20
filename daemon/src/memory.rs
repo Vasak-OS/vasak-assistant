@@ -3,29 +3,43 @@
 //! WAL— con una llave cruda de 32 bytes que vive en el llavero de la sesión
 //! (`crate::keyring`). No va en el almacén de cuentas.
 //!
-//! **Viene apagada.** «Encendida» quiere decir que existe la carpeta
-//! `memory/` dentro de la carpeta de estado del servicio
-//! (`$STATE_DIRECTORY`, que pone systemd, o `~/.local/state/vasak-assistant`);
-//! no hay nada en `vasak.conf`.
+//! # Qué guarda y qué no
 //!
-//! - **Encender**: con el llavero desbloqueado, una llave nueva al llavero, se
-//!   la relee, y la base se crea en `memory.tmp/` y se renombra a `memory/`
-//!   ya completa, con un nodo de metadatos con la versión del formato.
-//! - **Apagar es borrar**: primero la llave del llavero (sin ella lo que quede
-//!   en disco no se puede leer) y después los archivos, por
-//!   `memory.deleting/`. Con el llavero bloqueado los archivos se borran igual.
+//! **La memoria no guarda datos sensibles que no son suyos**: correo,
+//! calendario, contactos, archivos, cuentas ni claves. Esos se leen de su
+//! servicio en el momento de usarlos y no se persisten acá. Lo que sí va
+//! (preferencias, tono, hábitos, temas, correcciones, nombres, contexto) lleva
+//! un esquema que todavía no está definido: hasta entonces la base queda con
+//! su nodo de metadatos y nada más.
+//!
+//! # Encendida, apagada y borrada
+//!
+//! Todo vive en la carpeta de estado del servicio (`$STATE_DIRECTORY`, que pone
+//! systemd, o `~/.local/state/vasak-assistant`); nada en `vasak.conf`.
+//!
+//! - **Viene apagada.** «Encendida» quiere decir que existe el archivo
+//!   `enabled` al lado de `memory/`. La base y la llave son otra cosa: pueden
+//!   estar con la memoria apagada.
+//! - **Encender**: si ya hay base, se reabre con la llave que está en el
+//!   llavero. Si no, con el llavero desbloqueado, una llave nueva al llavero,
+//!   se la relee, y la base se crea en `memory.tmp/` y se renombra a
+//!   `memory/` ya completa, con un nodo de metadatos con la versión del
+//!   formato. El indicador se escribe sólo si la base quedó abierta.
+//! - **Apagar no borra nada**: se cierra la base y se saca el indicador; los
+//!   archivos y la llave quedan, y encender de nuevo los reabre.
+//! - **Borrar** es sólo [`Memory::clear`]: primero la llave del llavero (sin
+//!   ella lo que quede en disco no se puede leer) y después los archivos, por
+//!   `memory.deleting/`; si estaba encendida, se recrea vacía con una llave
+//!   nueva. Con el llavero bloqueado no se toca nada.
 //! - **Al arrancar** no se genera ni se borra nada solo: si la llave falta o no
 //!   abre la base, la memoria queda no disponible con el motivo, y la salida es
-//!   apagarla (borrarla). La base se abre la primera vez que alguien pregunta
-//!   por ella, así un llavero que se desbloquea después alcanza.
-//!
-//! En esta fase no se guarda nada de las conversaciones: el almacén queda
-//! listo y vacío.
+//!   borrarla. La base se abre la primera vez que alguien la necesita, así un
+//!   llavero que se desbloquea después alcanza.
 
 use std::ffi::OsString;
 use std::fmt::Display;
 use std::io;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -75,7 +89,7 @@ pub struct Memory {
     /// `None` si no hay carpeta de estado válida.
     dir: Option<PathBuf>,
     secrets: Arc<dyn SecretSource>,
-    /// La base abierta. Un candado de Tokio: encender, apagar y vaciar lo
+    /// La base abierta. Un candado de Tokio: encender, apagar y borrar lo
     /// sostienen de punta a punta, con esperas al llavero y al disco.
     db: Mutex<Option<Arc<GrafeoDB>>>,
 }
@@ -99,27 +113,51 @@ impl Memory {
     }
 
     /// Nunca falla: cualquier problema va como `available: false` y el motivo.
+    /// `bytes` se informa también con la memoria apagada.
     pub async fn status(&self) -> MemoryStatus {
         let Some(dir) = &self.dir else {
-            return off(REASON_NO_PLACE);
+            return MemoryStatus {
+                enabled: false,
+                available: false,
+                reason: REASON_NO_PLACE.to_owned(),
+                bytes: 0,
+            };
         };
         let mut db = self.db.lock().await;
-        if !is_dir(dir).await {
-            // Alguien la borró por fuera con la base abierta.
-            close(db.take()).await;
-            return off(REASON_OFF);
-        }
-        let bytes = disk_usage(dir.clone()).await;
-        let reason = match self.ensure_open(dir, &mut db).await {
-            Ok(()) => "",
-            Err(reason) => reason,
+        let enabled = is_file(&flag(dir)).await;
+        let reason = if enabled {
+            self.ensure_open(dir, &mut db).await.err().unwrap_or("")
+        } else {
+            REASON_OFF
         };
         MemoryStatus {
-            enabled: true,
+            enabled,
             available: reason.is_empty(),
             reason: reason.to_owned(),
-            bytes,
+            bytes: disk_usage(dir.clone()).await,
         }
+    }
+
+    /// La base abierta, para quien guarde o lea recuerdos. `Err` con el
+    /// motivo si está apagada o no se puede abrir.
+    // Sin llamador hasta que exista el esquema de contenido.
+    #[allow(dead_code)]
+    pub async fn database(&self) -> Result<Arc<GrafeoDB>, &'static str> {
+        let dir = self.dir.as_ref().ok_or(REASON_NO_PLACE)?;
+        let mut db = self.db.lock().await;
+        if !is_file(&flag(dir)).await {
+            return Err(REASON_OFF);
+        }
+        self.ensure_open(dir, &mut db).await?;
+        db.clone().ok_or(REASON_NOT_OPENED)
+    }
+
+    /// Cierra la base si está abierta (vuelca el WAL al archivo). Se vuelve a
+    /// abrir sola la próxima vez que se la necesite.
+    // Sin llamador hasta que exista el esquema de contenido.
+    #[allow(dead_code)]
+    pub async fn close(&self) {
+        close(self.db.lock().await.take()).await;
     }
 
     pub async fn set_enabled(&self, enabled: bool) -> Result<(), Error> {
@@ -132,33 +170,43 @@ impl Memory {
         };
         let mut db = self.db.lock().await;
         if !enabled {
-            return self.erase(dir, &mut db).await;
+            // Apagar no borra nada: deja de usarla y de escribirla.
+            close(db.take()).await;
+            return remove_flag(dir).await;
         }
         if is_dir(dir).await {
-            return self
-                .ensure_open(dir, &mut db)
+            self.ensure_open(dir, &mut db)
                 .await
-                .map_err(|reason| Error::Unavailable(reason.into()));
+                .map_err(|reason| Error::Unavailable(reason.into()))?;
+        } else {
+            self.create(dir, &mut db).await?;
         }
-        self.create(dir, &mut db).await
+        write_flag(dir).await
     }
 
-    /// Encendida: se borra y se recrea vacía con una llave nueva. Apagada: nada.
+    /// Borra la llave y los archivos; si estaba encendida, la recrea vacía con
+    /// una llave nueva. Con el llavero bloqueado no toca nada.
     pub async fn clear(&self) -> Result<(), Error> {
         let Some(dir) = &self.dir else {
             return Ok(());
         };
         let mut db = self.db.lock().await;
-        if !is_dir(dir).await {
-            return Ok(());
-        }
-        // Antes de borrar nada: con el llavero bloqueado no se podría recrear,
-        // y vaciar no puede terminar en apagar.
         if self.secrets.is_locked().await? {
             return Err(locked());
         }
-        self.erase(dir, &mut db).await?;
-        self.create(dir, &mut db).await
+        // Primero la llave: si no se pudo borrar, los archivos quedan con ella.
+        self.secrets.delete_memory_key().await?;
+        close(db.take()).await;
+        let target = dir.to_owned();
+        blocking(move || remove_files(&target).map_err(text))
+            .await
+            .map_err(|error| {
+                Error::Unavailable(format!("No se pudo borrar la memoria: {error}"))
+            })?;
+        if is_file(&flag(dir)).await {
+            self.create(dir, &mut db).await?;
+        }
+        Ok(())
     }
 
     /// Abre la base si no lo está. Nunca crea ni borra nada.
@@ -200,7 +248,7 @@ impl Memory {
         }
     }
 
-    /// Los pasos de encender, en orden. Con `memory/` ausente.
+    /// Crea la base vacía con una llave nueva. Con `memory/` ausente.
     async fn create(&self, dir: &Path, db: &mut Option<Arc<GrafeoDB>>) -> Result<(), Error> {
         // 1. Nunca se genera una llave sin saber que el llavero está abierto.
         if self.secrets.is_locked().await? {
@@ -241,29 +289,42 @@ impl Memory {
             }
         }
     }
+}
 
-    /// Apagar: la llave primero, después la base cerrada y los archivos.
-    async fn erase(&self, dir: &Path, db: &mut Option<Arc<GrafeoDB>>) -> Result<(), Error> {
-        if let Err(error) = self.secrets.delete_memory_key().await {
-            // Los archivos se borran igual; una llave que quedó no cifra nada
-            // y la próxima vez que se encienda se reemplaza.
-            tracing::warn!("no se pudo borrar la llave de la memoria: {error}");
-        }
-        close(db.take()).await;
-        let dir = dir.to_owned();
-        blocking(move || remove_files(&dir).map_err(text))
-            .await
-            .map_err(|error| Error::Unavailable(format!("No se pudo borrar la memoria: {error}")))
+/// El indicador de encendida, al lado de `memory/`.
+fn flag(dir: &Path) -> PathBuf {
+    dir.with_file_name("enabled")
+}
+
+async fn write_flag(dir: &Path) -> Result<(), Error> {
+    let path = flag(dir);
+    blocking(move || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .map(drop)
+            .map_err(text)
+    })
+    .await
+    .map_err(|error| Error::Unavailable(format!("No se pudo encender la memoria: {error}")))
+}
+
+async fn remove_flag(dir: &Path) -> Result<(), Error> {
+    match tokio::fs::remove_file(flag(dir)).await {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(Error::Unavailable(format!(
+            "No se pudo apagar la memoria: {error}"
+        ))),
+        _ => Ok(()),
     }
 }
 
-fn off(reason: &str) -> MemoryStatus {
-    MemoryStatus {
-        enabled: false,
-        available: false,
-        reason: reason.to_owned(),
-        bytes: 0,
-    }
+async fn is_file(path: &Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .is_ok_and(|metadata| metadata.is_file())
 }
 
 fn locked() -> Error {
@@ -278,8 +339,8 @@ fn text(error: impl Display) -> String {
 
 /// La configuración de la base: cifrada, con WAL y con el tope de memoria.
 ///
-/// Cuando haya contenido (todavía no hay esquema), lo que se ajustaría acá y
-/// en la base: un índice de propiedad (`CREATE INDEX`) sobre la clave por la
+/// Cuando haya contenido (el esquema lo define el architect), lo que se
+/// ajustaría acá y en la base: un índice de propiedad (`CREATE INDEX`) sobre la clave por la
 /// que se busque cada recuerdo, y `with_checkpoint_interval` para no esperar
 /// al cierre para volcar el WAL. El caché de planes de consulta de Grafeo ya
 /// viene encendido.

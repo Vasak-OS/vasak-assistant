@@ -91,24 +91,28 @@ Lince puede tener una memoria propia: una base de grafos
 systemd, `$STATE_DIRECTORY`). No va en el almacén de cuentas.
 
 - **Viene apagada.** Existe sólo desde que la persona la enciende; no hay nada
-  que tocar en `vasak.conf`.
+  que tocar en `vasak.conf`. Encendida o no lo dice el archivo `enabled` al lado
+  de `memory/`.
 - **Cifrada.** El archivo y su registro de escritura (WAL) van con AES-256-GCM,
-  con una llave de 32 bytes que genera el servicio al encenderla y guarda en el
-  llavero (atributos `service=ar.net.vasak.os.Assistant` y `purpose=memory`).
-  Sin la llave, lo que hay en disco no se puede leer.
-- **Apagar es borrar.** Primero la llave del llavero y después los archivos;
-  con el llavero bloqueado, los archivos se borran igual.
-- Si al arrancar la llave falta o no abre la base, la memoria queda **no
-  disponible** con el motivo; el servicio nunca la regenera ni la borra solo.
-  La salida es apagarla y volver a encenderla.
+  con una llave de 32 bytes que genera el servicio la primera vez que se
+  enciende y guarda en el llavero (atributos `service=ar.net.vasak.os.Assistant`
+  y `purpose=memory`). Sin la llave, lo que hay en disco no se puede leer.
+- **Apagar no borra.** Deja de usarla y de escribirla; encenderla de nuevo
+  reabre la misma base con su llave.
+- **Borrar es `ClearMemory`.** Primero la llave del llavero y después los
+  archivos; con el llavero bloqueado no se toca nada.
+- Si la llave falta o no abre la base, la memoria queda **no disponible** con el
+  motivo; el servicio nunca la regenera ni la borra solo. La salida es borrarla.
+- **Sólo lo suyo.** No guarda correo, calendario, contactos, archivos, cuentas
+  ni claves: eso se lee de su servicio en el momento y no se persiste.
 - Por ahora queda **lista y vacía**: todavía no se guarda nada de las
   conversaciones.
 
 | Método | Qué hace |
 |---|---|
-| `MemoryStatus() → (bbst)` | `enabled`, `available`, `reason` y `bytes` (lo que ocupa en disco, medido sin abrirla). Nunca falla: un problema llega como `available = false` con el motivo («La memoria está apagada», «El llavero está bloqueado», «La clave de la memoria no está en el llavero», «La memoria no se pudo abrir»). |
-| `SetMemoryEnabled(b enabled) → ()` | Encender: llave nueva al llavero y base vacía. `Unavailable` si el llavero está bloqueado (no abre ningún diálogo) o no responde. Apagar: la borra entera. |
-| `ClearMemory() → ()` | Si está encendida, la borra y la recrea vacía con una llave nueva; apagada, no hace nada. `Unavailable` con el llavero bloqueado, sin tocar nada. |
+| `MemoryStatus() → (bbst)` | `enabled`, `available`, `reason` y `bytes` (lo que ocupa en disco, encendida o apagada, medido sin abrirla). Nunca falla: un problema llega como `available = false` con el motivo («La memoria está apagada», «El llavero está bloqueado», «La clave de la memoria no está en el llavero», «La memoria no se pudo abrir»). |
+| `SetMemoryEnabled(b enabled) → ()` | Encender: reabre la base que haya o, si no hay, llave nueva al llavero y base vacía. `Unavailable` si el llavero está bloqueado (no abre ningún diálogo), no responde o la base no abre. Apagar: deja de usarla, sin borrar nada. |
+| `ClearMemory() → ()` | La borra (llave y archivos) y, si estaba encendida, la recrea vacía con una llave nueva. `Unavailable` con el llavero bloqueado, sin tocar nada. |
 
 `Capabilities` informa `memory` como disponible cuando está encendida y
 abierta.

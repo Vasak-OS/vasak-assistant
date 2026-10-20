@@ -42,10 +42,10 @@
 //! - `purpose` = `memory`
 //! - `xdg:schema` = `ar.net.vasak.os.Assistant`
 //!
-//! La genera y la borra sólo el servicio, al encender y al apagar la memoria;
-//! nunca sola al arrancar. Tiene el mismo modelo de acceso que la clave del
-//! proveedor (cualquier proceso de la sesión con el llavero abierto la puede
-//! leer) y el mismo criterio de duplicados: con más de una no se usa ninguna.
+//! La genera sólo el servicio, la primera vez que se enciende la memoria, y la
+//! borra sólo al borrar la memoria (`ClearMemory`); nunca sola al arrancar.
+//! Tiene el mismo modelo de acceso que la clave del proveedor (cualquier
+//! proceso de la sesión con el llavero abierto la puede leer) y el mismo criterio de duplicados: con más de una no se usa ninguna.
 
 use std::collections::HashMap;
 

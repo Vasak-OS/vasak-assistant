@@ -13,10 +13,13 @@ no guarda nada de las conversaciones.
   `memory` disponible cuando está encendida y abierta.
 - **`daemon`** — la memoria (`memory`): una base de grafos Grafeo embebida,
   cifrada con AES-256-GCM (archivo y WAL) en `$STATE_DIRECTORY/memory/`, con la
-  llave de 32 bytes en el llavero. Encender genera la llave sólo con el llavero
-  desbloqueado, la relee y crea la base en `memory.tmp/` antes de renombrarla.
-  Apagar borra primero la llave y después los archivos. Al arrancar nunca se
-  genera ni se borra nada solo. El llavero (`keyring`) busca y guarda por un
+  llave de 32 bytes en el llavero. Encender reabre la base que haya o, si no
+  hay, genera la llave sólo con el llavero desbloqueado, la relee y crea la base
+  en `memory.tmp/` antes de renombrarla. Apagar no borra nada: deja de usarla.
+  Borrar (`ClearMemory`) saca primero la llave y después los archivos, y con el
+  llavero bloqueado no toca nada. Al arrancar nunca se genera ni se borra nada
+  solo. No guarda datos que no son suyos (correo, calendario, contactos,
+  archivos, cuentas, claves). El llavero (`keyring`) busca y guarda por un
   mapa de atributos y suma el borrado de ítems. El binario se compila con
   `lto = "fat"` y `codegen-units = 1`.
 - **`packaging`** — la unidad tiene `StateDirectory=vasak-assistant` (modo
