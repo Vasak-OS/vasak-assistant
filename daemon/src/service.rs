@@ -10,8 +10,9 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use zbus::interface;
 use zbus::message::Header;
+use zbus::names::BusName;
+use zbus::{interface, Connection};
 
 use vasak_assistant_protocol::{
     Capability, Error, Message, ServiceStatus, DOMAINS, DOMAIN_REMOTE_BACKENDS,
@@ -46,8 +47,31 @@ impl AssistantService {
     }
 
     /// Abre una conversación nueva, de quien llama, y devuelve su id.
-    fn new_conversation(&self, #[zbus(header)] header: Header<'_>) -> Result<String, Error> {
-        self.open(owner(&header))
+    ///
+    /// zbus atiende cada llamada en su propia tarea, y `NameOwnerChanged` se
+    /// procesa en otra (`main.rs`): si el cliente pide la conversación y se va
+    /// enseguida, la liberación puede correr *antes* que el `create`, y ese
+    /// nombre único no vuelve nunca. Por eso, ya creada, se pregunta al bus si
+    /// la conexión sigue ahí ([`settle_new_conversation`] decide qué hacer).
+    async fn new_conversation(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> Result<String, Error> {
+        let id = self.open(owner(&header))?;
+        // Sin remitente es una conexión punto a punto: no hay bus a quien
+        // preguntar, y el único par es el que está llamando.
+        let Some(sender) = header.sender() else {
+            return Ok(id);
+        };
+        let still_connected = match zbus::fdo::DBusProxy::new(connection).await {
+            Ok(bus) => bus
+                .name_has_owner(BusName::Unique(sender.as_ref()))
+                .await
+                .map_err(zbus::Error::from),
+            Err(error) => Err(error),
+        };
+        settle_new_conversation(&self.conversations, sender.as_str(), id, still_connected)
     }
 
     /// Las conversaciones abiertas de quien llama.
@@ -140,6 +164,37 @@ impl AssistantService {
 
     pub fn delete_as(&self, owner: &str, conversation_id: &str) -> Result<(), Error> {
         self.conversations.lock().delete(owner, conversation_id)
+    }
+}
+
+/// Qué hacer con una conversación recién abierta según si su dueño sigue
+/// conectado. Sin bus de por medio, para poder probarla sola:
+///
+/// - sigue conectado: se devuelve el id;
+/// - ya se fue: se liberan todas sus conversaciones (la liberación por
+///   `NameOwnerChanged` pudo haber llegado antes que esta) y se contesta
+///   `NotFound`, que nadie va a leer;
+/// - no se pudo preguntar: se conserva la conversación y queda en el registro.
+///   Si de verdad se fue, el peor caso es una conversación huérfana, no romper
+///   el caso normal.
+pub fn settle_new_conversation(
+    conversations: &Mutex<Conversations>,
+    owner: &str,
+    id: String,
+    still_connected: zbus::Result<bool>,
+) -> Result<String, Error> {
+    match still_connected {
+        Ok(true) => Ok(id),
+        Ok(false) => {
+            conversations.lock().release_owner(owner);
+            Err(Error::NotFound(
+                "la conexión que pidió la conversación ya no está".into(),
+            ))
+        }
+        Err(error) => {
+            tracing::warn!("no se pudo comprobar si {owner} sigue conectado: {error}");
+            Ok(id)
+        }
     }
 }
 
