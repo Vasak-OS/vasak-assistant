@@ -9,7 +9,7 @@ archivos, la web— es un permiso que se concede, igual que los tokens de
 
 El diseño completo, las fases y el porqué viven en el issue ancla **#1**.
 
-## Lo que hay hoy (fase 1, y parte de la 2)
+## Lo que hay hoy (fases 1 a 4)
 
 El servicio y el contrato:
 
@@ -82,6 +82,36 @@ crea el ítem.
 
 La clave queda atada a esa dirección: si la configuración cambia de servidor, la
 clave de antes no viaja al nuevo.
+
+## La memoria
+
+Lince puede tener una memoria propia: una base de grafos
+([Grafeo](https://github.com/GrafeoDB/grafeo), embebida en el servicio) en
+`~/.local/state/vasak-assistant/memory/` (la carpeta de estado que le da
+systemd, `$STATE_DIRECTORY`). No va en el almacén de cuentas.
+
+- **Viene apagada.** Existe sólo desde que la persona la enciende; no hay nada
+  que tocar en `vasak.conf`.
+- **Cifrada.** El archivo y su registro de escritura (WAL) van con AES-256-GCM,
+  con una llave de 32 bytes que genera el servicio al encenderla y guarda en el
+  llavero (atributos `service=ar.net.vasak.os.Assistant` y `purpose=memory`).
+  Sin la llave, lo que hay en disco no se puede leer.
+- **Apagar es borrar.** Primero la llave del llavero y después los archivos;
+  con el llavero bloqueado, los archivos se borran igual.
+- Si al arrancar la llave falta o no abre la base, la memoria queda **no
+  disponible** con el motivo; el servicio nunca la regenera ni la borra solo.
+  La salida es apagarla y volver a encenderla.
+- Por ahora queda **lista y vacía**: todavía no se guarda nada de las
+  conversaciones.
+
+| Método | Qué hace |
+|---|---|
+| `MemoryStatus() → (bbst)` | `enabled`, `available`, `reason` y `bytes` (lo que ocupa en disco, medido sin abrirla). Nunca falla: un problema llega como `available = false` con el motivo («La memoria está apagada», «El llavero está bloqueado», «La clave de la memoria no está en el llavero», «La memoria no se pudo abrir»). |
+| `SetMemoryEnabled(b enabled) → ()` | Encender: llave nueva al llavero y base vacía. `Unavailable` si el llavero está bloqueado (no abre ningún diálogo) o no responde. Apagar: la borra entera. |
+| `ClearMemory() → ()` | Si está encendida, la borra y la recrea vacía con una llave nueva; apagada, no hace nada. `Unavailable` con el llavero bloqueado, sin tocar nada. |
+
+`Capabilities` informa `memory` como disponible cuando está encendida y
+abierta.
 
 ## Correrlo
 
