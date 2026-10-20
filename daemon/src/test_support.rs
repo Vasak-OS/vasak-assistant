@@ -371,3 +371,72 @@ pub async fn p2p_pair(
 pub fn parse_url(text: &str) -> Url {
     Url::parse(text).expect("la dirección de prueba es válida")
 }
+
+// ── Un bus de verdad, privado ─────────────────────────────────────────────────
+
+/// Un `dbus-daemon` propio de la prueba, en un socket temporal: dos conexiones
+/// a él son dos remitentes distintos (`:1.x`), lo que una conexión punto a
+/// punto no puede dar. Nunca toca el bus de sesión de quien corre las pruebas.
+pub struct PrivateBus {
+    child: std::process::Child,
+    pub address: String,
+}
+
+impl PrivateBus {
+    /// `None` si en la máquina no hay `dbus-daemon`.
+    pub fn start() -> Option<Self> {
+        use std::io::{BufRead, BufReader, Write};
+        let dir =
+            std::env::temp_dir().join(format!("vasak-assistant-bus-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).ok()?;
+        let config = dir.join("bus.conf");
+        let mut file = std::fs::File::create(&config).ok()?;
+        write!(
+            file,
+            r#"<busconfig>
+  <type>session</type>
+  <listen>unix:dir={}</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*"/>
+    <allow receive_sender="*"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>"#,
+            dir.display()
+        )
+        .ok()?;
+        let mut child = std::process::Command::new("dbus-daemon")
+            .arg(format!("--config-file={}", config.display()))
+            .args(["--nofork", "--print-address=1"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut address = String::new();
+        BufReader::new(child.stdout.take()?)
+            .read_line(&mut address)
+            .ok()?;
+        let address = address.trim().to_owned();
+        if address.is_empty() {
+            let _ = child.kill();
+            return None;
+        }
+        Some(Self { child, address })
+    }
+
+    pub async fn connect(&self) -> Connection {
+        connection::Builder::address(self.address.as_str())
+            .expect("la dirección del bus privado es válida")
+            .build()
+            .await
+            .expect("se conecta al bus privado")
+    }
+}
+
+impl Drop for PrivateBus {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}

@@ -538,4 +538,111 @@ mod tests {
         trim_history(&mut messages);
         assert_eq!(messages.len(), 2);
     }
+
+    // ── Dueños ────────────────────────────────────────────────────────────────
+
+    const OTHER: &str = ":1.2";
+
+    #[test]
+    fn otro_dueno_recibe_not_found_igual_que_con_un_id_que_no_existe() {
+        let (mut conversations, id) = with_turns(1);
+        let inexistente = Uuid::new_v4().to_string();
+        let texto = |e: Error| match e {
+            Error::NotFound(text) => text,
+            other => panic!("se esperaba NotFound, dio {other:?}"),
+        };
+
+        let ajeno = texto(conversations.history(OTHER, &id).unwrap_err());
+        assert_eq!(
+            ajeno,
+            texto(conversations.history(OTHER, &inexistente).unwrap_err())
+        );
+        assert_eq!(
+            texto(conversations.begin_turn(OTHER, &id, "hola").unwrap_err()),
+            ajeno
+        );
+        assert_eq!(texto(conversations.delete(OTHER, &id).unwrap_err()), ajeno);
+    }
+
+    #[test]
+    fn lo_que_intenta_otro_dueno_no_cambia_la_conversacion() {
+        let (mut conversations, id) = with_turns(1);
+        let antes = conversations.history(OWNER, &id).unwrap();
+
+        let _ = conversations.begin_turn(OTHER, &id, "intruso");
+        let _ = conversations.delete(OTHER, &id);
+
+        assert_eq!(conversations.history(OWNER, &id).unwrap(), antes);
+        // Tampoco la dejó ocupada para su dueño.
+        assert!(conversations.begin_turn(OWNER, &id, "yo").is_ok());
+    }
+
+    #[test]
+    fn cada_dueno_lista_y_cuenta_solo_lo_suyo() {
+        let mut conversations = Conversations::default();
+        let a = conversations.create(OWNER).unwrap();
+        let b1 = conversations.create(OTHER).unwrap();
+        let b2 = conversations.create(OTHER).unwrap();
+
+        assert_eq!(conversations.ids(OWNER), [a]);
+        let mut de_b = vec![b1, b2];
+        de_b.sort();
+        assert_eq!(conversations.ids(OTHER), de_b);
+        assert!(conversations.ids(":1.3").is_empty());
+        assert_eq!(conversations.count_for(OWNER), 1);
+        assert_eq!(conversations.count_for(OTHER), 2);
+        assert_eq!(conversations.count_for(":1.3"), 0);
+    }
+
+    #[test]
+    fn el_tope_por_dueno_no_bloquea_a_otro_dueno() {
+        let mut conversations = Conversations::default();
+        for _ in 0..MAX_CONVERSATIONS_PER_OWNER {
+            conversations.create(OWNER).unwrap();
+        }
+        assert!(matches!(
+            conversations.create(OWNER),
+            Err(Error::LimitExceeded(_))
+        ));
+        assert!(conversations.create(OTHER).is_ok());
+        assert_eq!(conversations.count_for(OWNER), MAX_CONVERSATIONS_PER_OWNER);
+    }
+
+    #[test]
+    fn cerrar_una_propia_libera_cupo_del_dueno() {
+        let mut conversations = Conversations::default();
+        let ids: Vec<String> = (0..MAX_CONVERSATIONS_PER_OWNER)
+            .map(|_| conversations.create(OWNER).unwrap())
+            .collect();
+        conversations.delete(OWNER, &ids[0]).unwrap();
+        assert!(conversations.create(OWNER).is_ok());
+    }
+
+    #[test]
+    fn al_irse_el_dueno_se_liberan_solo_sus_conversaciones() {
+        let mut conversations = Conversations::default();
+        for _ in 0..3 {
+            conversations.create(OWNER).unwrap();
+        }
+        let ajena = conversations.create(OTHER).unwrap();
+
+        assert_eq!(conversations.release_owner(OWNER), 3);
+
+        assert_eq!(conversations.len(), 1);
+        assert!(conversations.ids(OWNER).is_empty());
+        assert!(conversations.history(OTHER, &ajena).is_ok());
+        // Y su cupo queda libre.
+        assert!(conversations.create(OWNER).is_ok());
+        // Irse dos veces, o sin haber abierto nada, no libera nada más.
+        assert_eq!(conversations.release_owner(":1.99"), 0);
+    }
+
+    #[test]
+    fn terminar_el_turno_de_un_dueno_que_se_fue_no_resucita_nada() {
+        let (mut conversations, id) = with_turns(0);
+        conversations.begin_turn(OWNER, &id, "hola").unwrap();
+        conversations.release_owner(OWNER);
+        conversations.finish_turn(&id, "hola", Some("respuesta"));
+        assert_eq!(conversations.len(), 0);
+    }
 }

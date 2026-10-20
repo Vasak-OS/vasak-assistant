@@ -263,4 +263,17 @@ mod tests {
             other => panic!("se esperaba Failed, dio {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn localhost_va_al_loopback_con_el_puerto_de_la_direccion() {
+        let server = FakeServer::start(|_| Reply::new(200, "hola")).await;
+        let port = server.addr.port();
+        let response = client()
+            .get(format!("http://localhost:{port}/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(server.captured().len(), 1);
+    }
 }

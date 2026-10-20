@@ -464,4 +464,19 @@ mod tests {
             other => panic!("se esperaba Unavailable, dio {other:?}"),
         }
     }
+
+    #[test]
+    fn los_errores_de_json_no_repiten_lo_que_mando_el_servidor() {
+        // serde cita el valor que no esperaba: no debe llegar al registro ni a la persona.
+        let chat = parse_chat(br#"{"choices":"SECRETO-DEL-SERVIDOR"}"#).unwrap_err();
+        let lista = parse_models(br#"{"data":"SECRETO-DEL-SERVIDOR"}"#).unwrap_err();
+        assert_eq!(
+            chat,
+            BackendError::Failed("respuesta del modelo ilegible".into())
+        );
+        assert_eq!(
+            lista,
+            BackendError::Failed("lista de modelos ilegible".into())
+        );
+    }
 }

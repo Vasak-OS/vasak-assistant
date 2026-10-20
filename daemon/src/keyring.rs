@@ -244,12 +244,15 @@ mod tests {
     use crate::test_support::p2p_pair;
 
     const ITEM: &str = "/org/freedesktop/secrets/collection/login/1";
+    const ITEM_2: &str = "/org/freedesktop/secrets/collection/login/2";
     const SESSION: &str = "/org/freedesktop/secrets/session/s1";
 
     #[derive(Clone, Copy, PartialEq)]
     enum Item {
         Unlocked,
         Locked,
+        /// Dos ítems con los mismos atributos: uno plantado al lado del verdadero.
+        Duplicated,
     }
 
     struct FakeSecrets {
@@ -273,6 +276,10 @@ mod tests {
             match (coincide, self.item) {
                 (true, Item::Unlocked) => (vec![item], vec![]),
                 (true, Item::Locked) => (vec![], vec![item]),
+                (true, Item::Duplicated) => (
+                    vec![item, OwnedObjectPath::try_from(ITEM_2).unwrap()],
+                    vec![],
+                ),
                 (false, _) => (vec![], vec![]),
             }
         }
@@ -404,5 +411,13 @@ mod tests {
                 .unwrap();
         let service = SecretService { connection: client };
         assert!(service.api_key(URL).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn con_mas_de_una_clave_para_la_misma_direccion_no_se_usa_ninguna() {
+        let setup = secret_service(Item::Duplicated, b"sk-del-llavero").await;
+        assert!(setup.service.api_key(URL).await.is_none());
+        // Ni siquiera se abre sesión para leer una de las dos.
+        assert!(setup.sessions_opened.lock().is_empty());
     }
 }

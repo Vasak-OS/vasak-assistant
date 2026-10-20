@@ -404,4 +404,18 @@ mod tests {
             other => panic!("se esperaba Unavailable, dio {other:?}"),
         }
     }
+
+    #[test]
+    fn los_errores_de_json_no_repiten_lo_que_mando_el_servidor() {
+        let chat = parse_chat(br#"{"message":"SECRETO-DEL-SERVIDOR"}"#).unwrap_err();
+        let lista = parse_tags(br#"{"models":"SECRETO-DEL-SERVIDOR"}"#).unwrap_err();
+        assert_eq!(
+            chat,
+            BackendError::Failed("respuesta de Ollama ilegible".into())
+        );
+        assert_eq!(
+            lista,
+            BackendError::Failed("lista de modelos ilegible".into())
+        );
+    }
 }

@@ -181,4 +181,120 @@ mod tests {
     fn el_backend_rechazado_igual_dice_que_modelo_y_host_eran() {
         assert_eq!(rejected().info(), model_info("gpt"));
     }
+
+    // ── Limited: tope de pedidos simultáneos y caché del modelo activo ────────
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::{mpsc, Semaphore};
+
+    /// Un backend que cuenta cuántos `chat` hay a la vez y no contesta hasta
+    /// que se lo libera.
+    struct Counting {
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+        entered: mpsc::UnboundedSender<()>,
+        release: Semaphore,
+        active_calls: AtomicUsize,
+    }
+
+    impl ModelBackend for Counting {
+        fn info(&self) -> ModelInfo {
+            model_info("")
+        }
+
+        fn models(&self) -> BoxFuture<'_, Result<Vec<String>, BackendError>> {
+            Box::pin(async move { Ok(vec![]) })
+        }
+
+        fn active_model(&self) -> BoxFuture<'_, Result<ModelInfo, BackendError>> {
+            Box::pin(async move {
+                self.active_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(model_info("modelo"))
+            })
+        }
+
+        fn chat<'a>(&'a self, _: &'a [Message]) -> BoxFuture<'a, Result<String, BackendError>> {
+            Box::pin(async move {
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                self.entered.send(()).unwrap();
+                self.release.acquire().await.unwrap().forget();
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok("listo".into())
+            })
+        }
+    }
+
+    fn counting() -> (Arc<Counting>, mpsc::UnboundedReceiver<()>) {
+        let (entered, receiver) = mpsc::unbounded_channel();
+        let backend = Arc::new(Counting {
+            in_flight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            entered,
+            release: Semaphore::new(0),
+            active_calls: AtomicUsize::new(0),
+        });
+        (backend, receiver)
+    }
+
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn no_hay_mas_pedidos_al_backend_a_la_vez_que_el_tope_y_los_demas_esperan_su_turno() {
+        let (inner, mut entered) = counting();
+        let limited = Arc::new(Limited::new(inner.clone()));
+        let total = MAX_IN_FLIGHT + 3;
+        let tasks: Vec<_> = (0..total)
+            .map(|_| {
+                let limited = limited.clone();
+                tokio::spawn(async move { limited.chat(&[]).await })
+            })
+            .collect();
+
+        settle().await;
+        for _ in 0..MAX_IN_FLIGHT {
+            entered
+                .try_recv()
+                .expect("debían haber entrado los primeros");
+        }
+        assert!(entered.try_recv().is_err(), "entró uno de más");
+        assert_eq!(inner.in_flight.load(Ordering::SeqCst), MAX_IN_FLIGHT);
+
+        // Al liberar dos, entran dos de los que esperaban, no más.
+        inner.release.add_permits(2);
+        settle().await;
+        assert!(entered.try_recv().is_ok());
+        assert!(entered.try_recv().is_ok());
+        assert!(entered.try_recv().is_err());
+
+        inner.release.add_permits(total);
+        for task in tasks {
+            assert_eq!(task.await.unwrap().unwrap(), "listo");
+        }
+        assert_eq!(inner.peak.load(Ordering::SeqCst), MAX_IN_FLIGHT);
+    }
+
+    #[tokio::test]
+    async fn el_modelo_activo_se_pregunta_una_vez_dentro_del_plazo_de_la_cache() {
+        let (inner, _entered) = counting();
+        let limited = Limited::new(inner.clone());
+        let primero = limited.active_model().await.unwrap();
+        let segundo = limited.active_model().await.unwrap();
+        assert_eq!(primero, segundo);
+        assert_eq!(inner.active_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn limited_deja_pasar_la_info_y_los_errores_del_backend() {
+        let rejected = Limited::new(Arc::new(rejected()));
+        assert_eq!(rejected.info(), model_info("gpt"));
+        let esperado = BackendError::Unavailable("No se puede usar esta configuración.".into());
+        assert_eq!(rejected.models().await.unwrap_err(), esperado);
+        assert_eq!(rejected.active_model().await.unwrap_err(), esperado);
+        assert_eq!(rejected.chat(&[]).await.unwrap_err(), esperado);
+    }
 }

@@ -218,7 +218,7 @@ mod tests {
     use vasak_assistant_protocol::{
         AssistantProxy, Role, DOMAIN_MAIL, DOMAIN_MEMORY, MAX_CONVERSATIONS_PER_OWNER, SERVICE_PATH,
     };
-    use zbus::DBusError;
+    use zbus::{connection, Connection, DBusError};
 
     const OWNER: &str = ":1.1";
 
@@ -617,5 +617,139 @@ mod tests {
             proxy.new_conversation().await,
             Err(Error::LimitExceeded(_))
         ));
+    }
+
+    // ── Dos remitentes: las conversaciones son de quien las abrió ─────────────
+
+    fn error_text(error: &Error) -> String {
+        match error {
+            Error::NotFound(text) | Error::InvalidArgs(text) => text.clone(),
+            other => panic!("se esperaba NotFound, dio {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn otro_dueno_no_ve_lee_escribe_ni_borra_lo_ajeno() {
+        let backend = Arc::new(FakeBackend::replying("respuesta"));
+        let service = AssistantService {
+            backend: backend.clone(),
+            conversations: Arc::default(),
+            remote_allowed: false,
+        };
+        let id = service.open(":1.1").unwrap();
+        service.chat_as(":1.1", &id, "secreto").await.unwrap();
+
+        assert!(service.list(":1.2").is_empty());
+        assert_eq!(service.status_for(":1.2").await.conversations, 0);
+        assert_eq!(service.status_for(":1.1").await.conversations, 1);
+        let leer = service.history_of(":1.2", &id).unwrap_err();
+        let escribir = service.chat_as(":1.2", &id, "intruso").await.unwrap_err();
+        let borrar = service.delete_as(":1.2", &id).unwrap_err();
+        assert!(matches!(leer, Error::NotFound(_)));
+        assert!(matches!(escribir, Error::NotFound(_)));
+        assert!(matches!(borrar, Error::NotFound(_)));
+        // Es el mismo NotFound que da un id que no existe: no confirma el id.
+        let inexistente = service
+            .history_of(":1.2", &uuid::Uuid::new_v4().to_string())
+            .unwrap_err();
+        assert_eq!(error_text(&leer), error_text(&inexistente));
+
+        // Nada de eso tocó la conversación ni llegó al modelo.
+        let history = service.history_of(":1.1", &id).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "secreto");
+        assert_eq!(backend.seen.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pasarse_del_tope_por_dueno_no_bloquea_a_otro_dueno() {
+        let service = service(FakeBackend::replying("x"), false);
+        for _ in 0..MAX_CONVERSATIONS_PER_OWNER {
+            service.open(":1.1").unwrap();
+        }
+        assert!(matches!(service.open(":1.1"), Err(Error::LimitExceeded(_))));
+        assert!(service.open(":1.2").is_ok());
+        assert_eq!(service.list(":1.1").len(), MAX_CONVERSATIONS_PER_OWNER);
+    }
+
+    /// Un bus privado con el servicio y dos clientes con remitentes distintos.
+    async fn two_clients(
+        service: AssistantService,
+    ) -> Option<(
+        crate::test_support::PrivateBus,
+        Connection,
+        AssistantProxy<'static>,
+        AssistantProxy<'static>,
+    )> {
+        let bus = crate::test_support::PrivateBus::start()?;
+        let server = connection::Builder::address(bus.address.as_str())
+            .unwrap()
+            .serve_at(SERVICE_PATH, service)
+            .unwrap()
+            .name(vasak_assistant_protocol::SERVICE_NAME)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let (a, b) = (bus.connect().await, bus.connect().await);
+        assert_ne!(
+            a.unique_name().unwrap().as_str(),
+            b.unique_name().unwrap().as_str()
+        );
+        let proxy =
+            |c: Connection| async move { AssistantProxy::builder(&c).build().await.unwrap() };
+        let (a, b) = (proxy(a).await, proxy(b).await);
+        Some((bus, server, a, b))
+    }
+
+    #[tokio::test]
+    async fn por_un_bus_real_la_segunda_conexion_no_ve_lee_escribe_ni_borra_lo_de_la_primera() {
+        let Some((_bus, _server, a, b)) =
+            two_clients(service(FakeBackend::replying("respuesta"), false)).await
+        else {
+            eprintln!("sin dbus-daemon: se salta la prueba del bus privado");
+            return;
+        };
+        let id = a.new_conversation().await.unwrap();
+        a.chat(&id, "secreto").await.unwrap();
+
+        assert_eq!(a.conversations().await.unwrap(), std::slice::from_ref(&id));
+        assert!(b.conversations().await.unwrap().is_empty());
+        assert_eq!(a.status().await.unwrap().conversations, 1);
+        assert_eq!(b.status().await.unwrap().conversations, 0);
+        assert!(matches!(b.history(&id).await, Err(Error::NotFound(_))));
+        assert!(matches!(
+            b.chat(&id, "intruso").await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            b.delete_conversation(&id).await,
+            Err(Error::NotFound(_))
+        ));
+
+        let history = a.history(&id).await.unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "secreto");
+        // El dueño sí puede cerrarla.
+        a.delete_conversation(&id).await.unwrap();
+        assert!(a.conversations().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn por_un_bus_real_el_tope_de_una_conexion_no_bloquea_a_la_otra() {
+        let Some((_bus, _server, a, b)) =
+            two_clients(service(FakeBackend::replying("x"), false)).await
+        else {
+            eprintln!("sin dbus-daemon: se salta la prueba del bus privado");
+            return;
+        };
+        for _ in 0..MAX_CONVERSATIONS_PER_OWNER {
+            a.new_conversation().await.unwrap();
+        }
+        assert!(matches!(
+            a.new_conversation().await,
+            Err(Error::LimitExceeded(_))
+        ));
+        assert!(b.new_conversation().await.is_ok());
     }
 }
