@@ -6,25 +6,35 @@
 //! atributos y lee el secreto. Nada nuevo en el llavero, nada en disco ni en el
 //! entorno.
 //!
-//! El ítem se busca por dos atributos:
+//! El ítem se busca y se crea con **el mismo mapa** de atributos:
 //!
 //! - `service` = `ar.net.vasak.os.Assistant`
 //! - `url` = la dirección base del backend tal como la normaliza el servicio
 //!   (terminada en `/`, p. ej. `https://api.openai.com/v1/`)
+//! - `purpose` = `provider`
+//! - `xdg:schema` = `ar.net.vasak.os.Assistant`
 //!
 //! La clave queda atada a la dirección: si alguien cambia la dirección en
 //! `vasak.conf` hacia otro servidor, la clave de antes no viaja a ése. La
 //! guarda el propio servicio ([`SecretSource::store_key`], el método
-//! `SetProviderKey`), que es lo que usa el panel de Configuración, o a mano
-//! `secret-tool store --label='Lince' service ar.net.vasak.os.Assistant url https://api.openai.com/v1/`.
-//! Que la escriba el servicio y no el panel deja un solo ejecutable creando el
-//! ítem, para cuando `vasak-keyring` lo restrinja a ése (vasak-keyring#55).
+//! `SetProviderKey`), que es lo que usa el panel de Configuración.
 //!
-//! Lo que esto **no** da: el ítem no lleva un esquema protegido como los tokens
-//! de `vasak-accounts`, así que otro proceso de la misma sesión puede leerlo,
-//! como cualquier secreto del llavero. Restringirlo a este binario pide un
-//! cambio en `vasak-keyring` (otro esquema protegido con su ejecutable
-//! autorizado).
+//! # El esquema protegido
+//!
+//! `vasak-keyring` restringe los ítems con `xdg:schema=ar.net.vasak.os.Assistant`
+//! al ejecutable `/usr/bin/vasak-assistant` (vasak-keyring#55): ningún otro
+//! proceso de la sesión los lee, los reemplaza ni los planta. Por eso el
+//! esquema va también en la **búsqueda**: si se buscara sin él, un ítem común
+//! con los mismos atributos plantado por otro proceso entraría en la
+//! búsqueda, y con la llave de la memoria eso quiere decir cifrar con una
+//! llave que conoce quien la plantó.
+//!
+//! **Migración**: una clave de proveedor guardada por una versión anterior
+//! (`{service, url}`, sin `xdg:schema`) se pasa al ítem protegido la primera
+//! vez que se la lee, si es la única y no hay una nueva: se copia y se borra la
+//! vieja. Con más de una vieja no se usa ninguna (queda en el registro). Con el
+//! llavero bloqueado no se migra ni se abre ningún diálogo. La llave de la
+//! memoria no se migra: siempre se creó con el esquema.
 //!
 //! La sesión es `plain`: el secreto viaja sin cifrar por el bus de sesión. No es
 //! más débil que el modelo de acceso de arriba —quien puede espiar el bus de la
@@ -68,6 +78,8 @@ const DEFAULT_COLLECTION: &str = "/org/freedesktop/secrets/aliases/default";
 pub const ITEM_SERVICE: &str = "ar.net.vasak.os.Assistant";
 /// La etiqueta con la que se ve el ítem en el llavero.
 pub const ITEM_LABEL: &str = "Lince";
+/// El valor del atributo `purpose` del ítem de la clave del proveedor.
+pub const PROVIDER_PURPOSE: &str = "provider";
 /// El valor del atributo `purpose` del ítem de la llave de la memoria.
 pub const MEMORY_PURPOSE: &str = "memory";
 /// La etiqueta del ítem de la llave de la memoria.
@@ -76,6 +88,7 @@ pub const MEMORY_LABEL: &str = "Lince: llave de la memoria";
 pub const MEMORY_KEY_BYTES: usize = 32;
 
 /// Los atributos con los que se crea el ítem de la llave de la memoria.
+/// Se usan igual para buscar, crear y borrar.
 fn memory_attributes() -> HashMap<&'static str, &'static str> {
     HashMap::from([
         ("service", ITEM_SERVICE),
@@ -216,6 +229,11 @@ impl SecretSource for SecretService {
                 .search(&provider_attributes(url))
                 .await
                 .map_err(unreachable)?;
+            if unlocked.is_empty() && locked.is_empty() {
+                // Una vieja sin esquema cuenta: se migra al leerla.
+                let (unlocked, locked) = self.legacy_items(url).await.map_err(unreachable)?;
+                return Ok(has_usable_item(&unlocked, &locked));
+            }
             Ok(has_usable_item(&unlocked, &locked))
         })
     }
@@ -249,21 +267,32 @@ impl SecretSource for SecretService {
     }
 
     fn delete_memory_key(&self) -> BoxFuture<'_, Result<(), Error>> {
-        Box::pin(async move { self.delete(&memory_search()).await.map_err(unreachable)? })
+        Box::pin(async move {
+            self.delete(&memory_attributes())
+                .await
+                .map_err(unreachable)?
+        })
     }
 }
 
 type Secret = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
 
 /// Los atributos del ítem de la clave del proveedor de esa dirección.
+/// Se usan igual para buscar y para crear.
 fn provider_attributes(url: &str) -> HashMap<&str, &str> {
-    HashMap::from([("service", ITEM_SERVICE), ("url", url)])
+    HashMap::from([
+        ("service", ITEM_SERVICE),
+        ("url", url),
+        ("purpose", PROVIDER_PURPOSE),
+        ("xdg:schema", ITEM_SERVICE),
+    ])
 }
 
-/// Con qué se busca la llave de la memoria: `service` y `purpose` alcanzan
-/// (ningún ítem de proveedor lleva `purpose`).
-fn memory_search() -> HashMap<&'static str, &'static str> {
-    HashMap::from([("service", ITEM_SERVICE), ("purpose", MEMORY_PURPOSE)])
+/// Los atributos de una clave de proveedor de antes del esquema protegido.
+/// Buscar con ellos también encuentra las nuevas: [`SecretService::legacy_items`]
+/// se queda con las que no tienen `xdg:schema`.
+fn legacy_provider_attributes(url: &str) -> HashMap<&str, &str> {
+    HashMap::from([("service", ITEM_SERVICE), ("url", url)])
 }
 
 fn unreachable(error: zbus::Error) -> Error {
@@ -331,6 +360,9 @@ impl SecretService {
             );
             return Ok(None);
         }
+        if unlocked.is_empty() && locked.is_empty() {
+            return self.migrate(url).await;
+        }
         let Some(item) = unlocked.into_iter().next() else {
             if locked.len() > 1 {
                 // Desbloquear no alcanzaría: con más de una tampoco se usaría.
@@ -348,6 +380,95 @@ impl SecretService {
 
         let value = self.read_secret(&item).await?;
         Ok(value.and_then(|value| ApiKey::parse(&value)))
+    }
+
+    /// Las claves viejas de esa dirección: las que tienen `{service, url}` y no
+    /// `xdg:schema`. (desbloqueadas, bloqueadas)
+    async fn legacy_items(
+        &self,
+        url: &str,
+    ) -> zbus::Result<(Vec<OwnedObjectPath>, Vec<OwnedObjectPath>)> {
+        let (unlocked, locked) = self.search(&legacy_provider_attributes(url)).await?;
+        let mut legacy = (Vec::new(), Vec::new());
+        for (items, out) in [(unlocked, &mut legacy.0), (locked, &mut legacy.1)] {
+            for item in items {
+                if !self
+                    .item_attributes(&item)
+                    .await?
+                    .contains_key("xdg:schema")
+                {
+                    out.push(item);
+                }
+            }
+        }
+        Ok(legacy)
+    }
+
+    async fn item_attributes(
+        &self,
+        item: &OwnedObjectPath,
+    ) -> zbus::Result<HashMap<String, String>> {
+        let value: OwnedValue = self
+            .connection
+            .call_method(
+                Some(SECRETS_NAME),
+                item.as_str(),
+                Some("org.freedesktop.DBus.Properties"),
+                "Get",
+                &("org.freedesktop.Secret.Item", "Attributes"),
+            )
+            .await?
+            .body()
+            .deserialize()?;
+        Ok(HashMap::try_from(value)?)
+    }
+
+    /// Pasa la clave vieja (sin esquema) al ítem protegido, si hay exactamente
+    /// una desbloqueada. La devuelve aunque la copia falle: ya se usaba así.
+    async fn migrate(&self, url: &str) -> zbus::Result<Option<ApiKey>> {
+        let (unlocked, locked) = self.legacy_items(url).await?;
+        let item = match (unlocked.as_slice(), locked.len()) {
+            ([], 0) => return Ok(None),
+            ([item], 0) => item,
+            ([], 1) => {
+                tracing::info!(
+                    "hay una clave del proveedor de una versión anterior en un llavero bloqueado: se pasará al desbloquearlo"
+                );
+                return Ok(None);
+            }
+            _ => {
+                tracing::warn!(
+                    "hay {} claves del proveedor de una versión anterior para la misma dirección; no se usa ninguna: guardá la clave de nuevo desde Configuración",
+                    unlocked.len() + locked.len()
+                );
+                return Ok(None);
+            }
+        };
+        let Some(key) = self
+            .read_secret(item)
+            .await?
+            .and_then(|value| ApiKey::parse(&value))
+        else {
+            return Ok(None);
+        };
+        match self.store(url, &key).await {
+            Ok(Ok(())) => match self.delete_item(item).await {
+                Ok(true) => tracing::info!("la clave del proveedor pasó al ítem protegido"),
+                Ok(false) => tracing::warn!(
+                    "la clave vieja del proveedor no se pudo borrar (llavero bloqueado)"
+                ),
+                Err(error) => {
+                    tracing::warn!("la clave vieja del proveedor no se pudo borrar: {error}")
+                }
+            },
+            Ok(Err(error)) => tracing::info!(
+                "la clave del proveedor no se pudo pasar al ítem protegido: {error:?}"
+            ),
+            Err(error) => {
+                tracing::warn!("la clave del proveedor no se pudo pasar al ítem protegido: {error}")
+            }
+        }
+        Ok(Some(key))
     }
 
     /// El secreto de un ítem, por una sesión `plain` que se cierra pase lo que
@@ -381,7 +502,7 @@ impl SecretService {
     /// La llave de la memoria, con el mismo criterio de duplicados que la
     /// clave del proveedor ([`has_usable_item`]).
     async fn read_memory_key(&self) -> zbus::Result<MemoryKey> {
-        let (unlocked, locked) = self.search(&memory_search()).await?;
+        let (unlocked, locked) = self.search(&memory_attributes()).await?;
         let item = match (unlocked.as_slice(), locked.len()) {
             ([item], _) => item,
             ([], 0) => return Ok(MemoryKey::Missing),
@@ -438,30 +559,34 @@ impl SecretService {
         let (unlocked, locked) = self.search(attributes).await?;
         let mut left = !locked.is_empty();
         for item in &unlocked {
-            let deleted = self
-                .connection
-                .call_method(
-                    Some(SECRETS_NAME),
-                    item.as_str(),
-                    Some("org.freedesktop.Secret.Item"),
-                    "Delete",
-                    &(),
-                )
-                .await
-                .and_then(|reply| reply.body().deserialize::<OwnedObjectPath>());
-            match deleted {
-                Ok(prompt) if prompt.as_str() == "/" => {}
-                // Un prompt: se bloqueó entre la búsqueda y el borrado.
-                Ok(_) => left = true,
-                Err(zbus::Error::MethodError(name, _, _))
-                    if name.as_str() == "org.freedesktop.Secret.Error.IsLocked" =>
-                {
-                    left = true
-                }
-                Err(error) => return Err(error),
-            }
+            left |= !self.delete_item(item).await?;
         }
         Ok(if left { Err(locked_error()) } else { Ok(()) })
+    }
+
+    /// `Item.Delete` de un ítem. `false` si no se borró porque el llavero se
+    /// bloqueó (contestó un prompt o `IsLocked`).
+    async fn delete_item(&self, item: &OwnedObjectPath) -> zbus::Result<bool> {
+        let deleted = self
+            .connection
+            .call_method(
+                Some(SECRETS_NAME),
+                item.as_str(),
+                Some("org.freedesktop.Secret.Item"),
+                "Delete",
+                &(),
+            )
+            .await
+            .and_then(|reply| reply.body().deserialize::<OwnedObjectPath>());
+        match deleted {
+            Ok(prompt) => Ok(prompt.as_str() == "/"),
+            Err(zbus::Error::MethodError(name, _, _))
+                if name.as_str() == "org.freedesktop.Secret.Error.IsLocked" =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// `CreateItem` en la colección por omisión con `replace`. El `Err` de
@@ -611,6 +736,8 @@ mod tests {
     const ITEM: &str = "/org/freedesktop/secrets/collection/login/1";
     const ITEM_2: &str = "/org/freedesktop/secrets/collection/login/2";
     const SESSION: &str = "/org/freedesktop/secrets/session/s1";
+    /// Donde está la clave de proveedor creada con `CreateItem`, si se creó.
+    const CREATED_ITEM: &str = "/org/freedesktop/secrets/collection/login/created";
     /// Donde está el ítem de la llave de la memoria, si se creó.
     const MEMORY_ITEM: &str = "/org/freedesktop/secrets/collection/login/memory";
 
@@ -646,6 +773,32 @@ mod tests {
         /// Para saber si la llave de la memoria está en un llavero bloqueado.
         collection: Collection,
         calls: Calls,
+        /// Si los ítems de `item` llevan el esquema protegido (`purpose` y
+        /// `xdg:schema`) o son de antes (`{service, url}` solos).
+        schema: bool,
+        /// Los ítems de `item` borrados con `Item.Delete`.
+        deleted: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// Los atributos de los ítems de `item`, con o sin el esquema protegido.
+    fn item_attributes(url: &str, schema: bool) -> HashMap<String, String> {
+        let mut attributes = HashMap::from([
+            ("service".to_owned(), ITEM_SERVICE.to_owned()),
+            ("url".to_owned(), url.to_owned()),
+        ]);
+        if schema {
+            attributes.insert("purpose".into(), PROVIDER_PURPOSE.into());
+            attributes.insert("xdg:schema".into(), ITEM_SERVICE.into());
+        }
+        attributes
+    }
+
+    /// Si un ítem con `item` responde a una búsqueda con `query` (como en el
+    /// Secret Service: la búsqueda es un subconjunto de sus atributos).
+    fn matches(query: &HashMap<String, String>, item: &HashMap<String, String>) -> bool {
+        query
+            .iter()
+            .all(|(key, value)| item.get(key) == Some(value))
     }
 
     #[interface(name = "org.freedesktop.Secret.Service")]
@@ -671,23 +824,44 @@ mod tests {
                     (true, true) => (vec![], vec![item]),
                 };
             }
-            let coincide = attributes.len() == 2
-                && attributes.get("service").map(String::as_str) == Some(ITEM_SERVICE)
-                && attributes.get("url") == Some(&self.url);
-            let item = OwnedObjectPath::try_from(ITEM).unwrap();
-            match (coincide, self.item) {
-                (true, Item::Unlocked) => (vec![item], vec![]),
-                (true, Item::Locked) => (vec![], vec![item]),
-                (true, Item::Duplicated) => (
-                    vec![item, OwnedObjectPath::try_from(ITEM_2).unwrap()],
-                    vec![],
-                ),
-                (true, Item::LockedTwice) => (
-                    vec![],
-                    vec![item, OwnedObjectPath::try_from(ITEM_2).unwrap()],
-                ),
+            let coincide = matches(&attributes, &item_attributes(&self.url, self.schema));
+            let deleted = self.deleted.lock().clone();
+            let path = |path: &str| {
+                (!deleted.iter().any(|gone| gone == path))
+                    .then(|| OwnedObjectPath::try_from(path).unwrap())
+            };
+            let (mut unlocked, mut locked): (Vec<_>, Vec<_>) = match (coincide, self.item) {
+                (true, Item::Unlocked) => (path(ITEM).into_iter().collect(), vec![]),
+                (true, Item::Locked) => (vec![], path(ITEM).into_iter().collect()),
+                (true, Item::Duplicated) => {
+                    (path(ITEM).into_iter().chain(path(ITEM_2)).collect(), vec![])
+                }
+                (true, Item::LockedTwice) => {
+                    (vec![], path(ITEM).into_iter().chain(path(ITEM_2)).collect())
+                }
                 (false, _) => (vec![], vec![]),
+            };
+            // Una clave de proveedor creada con `CreateItem` (la migración, o
+            // guardar y después leer) también se encuentra.
+            let created = self.created.lock().iter().any(|created| {
+                created.attributes.get("purpose").map(String::as_str) == Some(PROVIDER_PURPOSE)
+                    && matches(&attributes, &created.attributes)
+            });
+            if created {
+                // `CreateItem` con `replace` reemplaza al ítem con los mismos
+                // atributos: el de `item` con esquema deja de estar.
+                if self.schema {
+                    unlocked.clear();
+                    locked.clear();
+                }
+                let item = OwnedObjectPath::try_from(CREATED_ITEM).unwrap();
+                if self.collection == Collection::Locked {
+                    locked.push(item);
+                } else {
+                    unlocked.push(item);
+                }
             }
+            (unlocked, locked)
         }
 
         fn open_session(
@@ -713,9 +887,16 @@ mod tests {
             items
                 .into_iter()
                 .map(|item| {
-                    let value = if item.as_str() == MEMORY_ITEM {
+                    let value = if item.as_str() == MEMORY_ITEM || item.as_str() == CREATED_ITEM {
+                        let purpose = if item.as_str() == MEMORY_ITEM {
+                            MEMORY_PURPOSE
+                        } else {
+                            PROVIDER_PURPOSE
+                        };
                         let created = self.created.lock();
-                        let last = created.iter().rev().find(|created| is_memory(created));
+                        let last = created.iter().rev().find(|created| {
+                            created.attributes.get("purpose").map(String::as_str) == Some(purpose)
+                        });
                         last.map(|created| created.value.clone())
                             .unwrap_or_default()
                     } else {
@@ -855,6 +1036,37 @@ mod tests {
         }
     }
 
+    /// Un ítem de `item` (en `ITEM` o `ITEM_2`): sus atributos, para saber si
+    /// lleva el esquema, y `Delete`, para la migración.
+    struct FakeProviderItem {
+        path: &'static str,
+        attributes: HashMap<String, String>,
+        state: Collection,
+        deleted: Arc<Mutex<Vec<String>>>,
+        calls: Calls,
+    }
+
+    #[interface(name = "org.freedesktop.Secret.Item")]
+    impl FakeProviderItem {
+        #[zbus(property)]
+        fn attributes(&self) -> HashMap<String, String> {
+            self.attributes.clone()
+        }
+
+        fn delete(&self) -> Result<OwnedObjectPath, FakeError> {
+            self.calls.lock().push("Delete");
+            let prompt = match self.state {
+                Collection::Prompts => "/org/freedesktop/secrets/prompt/p3",
+                Collection::IsLocked => return Err(FakeError::IsLocked("bloqueada".into())),
+                _ => {
+                    self.deleted.lock().push(self.path.to_owned());
+                    "/"
+                }
+            };
+            Ok(OwnedObjectPath::try_from(prompt).unwrap())
+        }
+    }
+
     struct Setup {
         service: SecretService,
         /// Las llamadas al llavero, en orden. Para las pruebas de la memoria,
@@ -873,10 +1085,28 @@ mod tests {
 
     /// El llavero de mentira con la colección por omisión en `collection`.
     async fn secret_service_with(item: Item, secret: &[u8], collection: Collection) -> Setup {
+        secret_service_full(item, secret, collection, true).await
+    }
+
+    /// Con los ítems de `item` guardados por una versión anterior: `{service,
+    /// url}` sin `xdg:schema`. Para probar la migración.
+    // Infraestructura para las pruebas de la migración, que escribe qa.
+    #[allow(dead_code)]
+    async fn secret_service_legacy(item: Item, secret: &[u8], collection: Collection) -> Setup {
+        secret_service_full(item, secret, collection, false).await
+    }
+
+    async fn secret_service_full(
+        item: Item,
+        secret: &[u8],
+        collection: Collection,
+        schema: bool,
+    ) -> Setup {
         let closed = Arc::new(Mutex::new(0));
         let sessions_opened = Arc::new(Mutex::new(Vec::new()));
         let created = Arc::new(Mutex::new(Vec::new()));
         let calls = Calls::default();
+        let deleted = Arc::new(Mutex::new(Vec::new()));
         let fake = FakeSecrets {
             url: "https://api.ejemplo.com/v1/".into(),
             secret: secret.to_vec(),
@@ -885,7 +1115,17 @@ mod tests {
             created: created.clone(),
             collection,
             calls: calls.clone(),
+            schema,
+            deleted: deleted.clone(),
         };
+        let provider_item = |path: &'static str| FakeProviderItem {
+            path,
+            attributes: item_attributes("https://api.ejemplo.com/v1/", schema),
+            state: collection,
+            deleted: deleted.clone(),
+            calls: calls.clone(),
+        };
+        let (item_1, item_2) = (provider_item(ITEM), provider_item(ITEM_2));
         let session = FakeSession(closed.clone());
         let memory_item = FakeItem {
             state: collection,
@@ -902,7 +1142,9 @@ mod tests {
                 .serve_at(SECRETS_PATH, fake)?
                 .serve_at(SESSION, session)?
                 .serve_at(DEFAULT_COLLECTION, collection)?
-                .serve_at(MEMORY_ITEM, memory_item)
+                .serve_at(MEMORY_ITEM, memory_item)?
+                .serve_at(ITEM, item_1)?
+                .serve_at(ITEM_2, item_2)
         })
         .await
         .unwrap();
@@ -1000,6 +1242,8 @@ mod tests {
             HashMap::from([
                 ("service".to_owned(), ITEM_SERVICE.to_owned()),
                 ("url".to_owned(), URL.to_owned()),
+                ("purpose".to_owned(), PROVIDER_PURPOSE.to_owned()),
+                ("xdg:schema".to_owned(), ITEM_SERVICE.to_owned()),
             ])
         );
         assert_eq!(item.value, CLAVE.as_bytes());
@@ -1021,8 +1265,9 @@ mod tests {
         let setup = secret_service(Item::Unlocked, CLAVE.as_bytes()).await;
         setup.service.store_key(URL, &key()).await.unwrap();
         let attributes = setup.created.lock()[0].attributes.clone();
-        // La lectura busca exactamente `service` y `url`, y esa búsqueda acierta.
-        assert_eq!(attributes.len(), 2);
+        // La lectura busca con el mismo mapa (con el esquema protegido), y
+        // esa búsqueda acierta.
+        assert_eq!(attributes.len(), 4);
         assert_eq!(attributes["url"], URL);
         assert_eq!(setup.service.api_key(URL).await.unwrap().expose(), CLAVE);
     }
