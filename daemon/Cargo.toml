@@ -1,0 +1,35 @@
+[package]
+name = "vasak-assistant-daemon"
+description = "Asistente de IA residente de VasakOS: conversación con un modelo local"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vasak-assistant"
+path = "src/main.rs"
+
+[dependencies]
+vasak-assistant-protocol.workspace = true
+serde.workspace = true
+serde_json = "1"
+zbus.workspace = true
+tokio.workspace = true
+# rustls y no OpenSSL, como el resto del workspace: un proveedor remoto va por
+# https, y así no hace falta ninguna biblioteca de TLS del sistema.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+uuid = { version = "1", features = ["v4"] }
+# Los directorios base XDG, como en vasak-health-service: la regla de que una
+# ruta relativa o vacía se ignora vive ahí y no en una copia acá.
+dirs = "6"
+parking_lot = "0.12"
+# `StreamExt::next` para la señal `NameOwnerChanged`. Ya estaba en el grafo
+# (por hyper-util); no suma ningún crate.
+futures-util = { version = "0.3", default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# Para las pruebas del servicio: una conexión D-Bus punto a punto, sin bus.
+zbus = { workspace = true, features = ["p2p"] }

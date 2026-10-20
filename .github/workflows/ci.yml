@@ -1,0 +1,38 @@
+# Los chequeos viven en el repositorio `.github` de la organización, así que
+# acá sólo se los llama. Cambiarlos es cambiarlos en un solo lugar.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  app:
+    # Sólo lectura. Estos chequeos clonan, instalan dependencias y comprueban:
+    # no comentan, no etiquetan, no publican.
+    #
+    # El workflow llamado declara lo mismo en su trabajo, que es donde el
+    # permiso se aplica; esto lo escribe también acá porque el análisis
+    # estático de este repositorio no puede ver el otro archivo, y ahí un
+    # trabajo sin `permissions` se lee como permisos por omisión.
+    permissions:
+      contents: read
+    uses: Vasak-OS/.github/.github/workflows/app.yml@main
+    # Sólo el token de SonarQube Cloud, y por nombre: `secrets: inherit`
+    # le daría también el de crates.io y el de npm a un trabajo que
+    # instala dependencias de terceros.
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    with:
+      # Las pruebas de Rust corren en `revisar` y de esa misma corrida sale la
+      # cobertura que se le pasa a Sonar.
+      pruebas_rust: -p vasak-assistant-protocol -p vasak-assistant-daemon
+      # Lo que pide el grafo en Linux, mirado con `cargo tree -i`:
+      #
+      #   build-essential  el compilador de C de `ring` (vía `cc`), que trae
+      #                    rustls para el https de los proveedores remotos
+      #
+      # Nada más: no hay `pkg-config` ni otro `-sys`, y sin OpenSSL.
+      paquetes_rust: >-
+        build-essential

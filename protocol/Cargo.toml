@@ -1,0 +1,11 @@
+[package]
+name = "vasak-assistant-protocol"
+description = "Contrato D-Bus compartido del asistente de IA residente de VasakOS"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+zbus.workspace = true

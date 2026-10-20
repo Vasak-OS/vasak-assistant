@@ -1,0 +1,69 @@
+[Unit]
+Description=Asistente de IA residente de VasakOS
+Documentation=https://github.com/Vasak-OS/vasak-assistant
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/vasak-assistant
+Restart=on-failure
+RestartSec=3
+# El backend se elige en la sección `assistant` de ~/.config/vasak/vasak.conf
+# (ver el README); la clave de un proveedor, en el llavero. Ninguna de las dos
+# cosas va acá.
+
+# En esta fase el servicio sólo conversa: guarda las conversaciones en memoria,
+# no escribe nada en disco, lee `vasak.conf` y la clave del llavero, y habla
+# con un único servidor de modelo. Se le saca todo lo demás.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+# AF_UNIX para el bus de sesión. AF_INET y AF_INET6 porque los backends hablan
+# HTTP por TCP: Ollama o llama.cpp en 127.0.0.1 por omisión, y un proveedor
+# remoto sólo si la persona lo permitió (`allow_remote`) y sólo por https.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Sin `IPAddressAllow=`/`IPAddressDeny=` ni `RestrictNetworkInterfaces=`: son
+# filtros BPF y el gestor de usuario de systemd no los aplica («unit configures
+# an IP firewall, but not running as root»); quedarían escritos sin hacer nada.
+# Que la conversación no salga de la caja sin permiso lo decide el servicio
+# (`daemon/src/config.rs`), que además no sigue redirecciones ni usa el proxy
+# del entorno (`daemon/src/http.rs`).
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# El servicio no genera código en memoria ni lanza nada que lo haga.
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Un volcado de memoria tendría conversaciones y, con un proveedor remoto, la
+# clave: no se escribe ninguno.
+LimitCORE=0
+# Techos de recursos. La memoria propia está acotada por los topes del
+# contrato (32 conversaciones de hasta 512 KiB, respuestas de hasta 256 KiB,
+# cuatro pedidos al modelo a la vez): unas decenas de MiB. 256M deja margen de
+# sobra y frena a cualquier cosa que se descontrole. Los hilos son los de
+# Tokio (uno por núcleo más los de E/S bloqueante); 256 alcanza aun en una
+# máquina con muchos núcleos.
+MemoryMax=256M
+TasksMax=256
+
+# `strict`: no escribe nada en ningún lado, así que todo el sistema de archivos
+# queda de sólo lectura. `read-only` en la carpeta personal: sólo lee
+# `vasak.conf` (la memoria, fase 4, vivirá en el almacén cifrado).
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=graphical-session.target
