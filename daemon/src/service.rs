@@ -15,13 +15,15 @@ use zbus::names::BusName;
 use zbus::{interface, Connection};
 
 use vasak_assistant_protocol::{
-    Capability, Error, Message, ServiceStatus, DOMAINS, DOMAIN_REMOTE_BACKENDS,
+    Capability, Error, MemoryStatus, Message, ServiceStatus, DOMAINS, DOMAIN_MEMORY,
+    DOMAIN_REMOTE_BACKENDS,
 };
 
 use crate::backend::{BackendError, ModelBackend};
 use crate::config::{is_local, normalize_url};
 use crate::conversations::Conversations;
 use crate::keyring::{ApiKey, SecretSource};
+use crate::memory::Memory;
 
 pub struct AssistantService {
     pub backend: Arc<dyn ModelBackend>,
@@ -30,6 +32,8 @@ pub struct AssistantService {
     pub remote_allowed: bool,
     /// El llavero, para guardar y consultar la clave del proveedor.
     pub secrets: Arc<dyn SecretSource>,
+    /// La memoria del asistente (apagada hasta que la persona la enciende).
+    pub memory: Arc<Memory>,
 }
 
 #[interface(name = "ar.net.vasak.os.Assistant")]
@@ -40,9 +44,10 @@ impl AssistantService {
     }
 
     /// Las capacidades sobre cada dominio. Las de datos del usuario no están
-    /// en esta fase: se dicen no disponibles, nunca rotas.
-    fn capabilities(&self) -> Vec<Capability> {
-        capabilities(self.remote_allowed)
+    /// en esta fase: se dicen no disponibles, nunca rotas. `memory`, según la
+    /// memoria esté encendida y abierta.
+    async fn capabilities(&self) -> Vec<Capability> {
+        capabilities(self.remote_allowed, &self.memory.status().await)
     }
 
     /// Los modelos instalados en el backend.
@@ -119,6 +124,21 @@ impl AssistantService {
     /// Si hay una clave guardada para esa dirección.
     async fn has_provider_key(&self, url: &str) -> Result<bool, Error> {
         self.has_provider_key_for(url).await
+    }
+
+    /// Cómo está la memoria. Nunca falla: el problema va en el motivo.
+    async fn memory_status(&self) -> MemoryStatus {
+        self.memory.status().await
+    }
+
+    /// Enciende (crea vacía) o apaga (borra) la memoria.
+    async fn set_memory_enabled(&self, enabled: bool) -> Result<(), Error> {
+        self.memory.set_enabled(enabled).await
+    }
+
+    /// Vacía la memoria si está encendida.
+    async fn clear_memory(&self) -> Result<(), Error> {
+        self.memory.clear().await
     }
 }
 
@@ -265,12 +285,14 @@ impl Drop for Turn<'_> {
 }
 
 /// Las capacidades de [`DOMAINS`]. `remote_backends` está si la configuración
-/// permite un proveedor remoto; las demás, todavía no.
-pub fn capabilities(remote_allowed: bool) -> Vec<Capability> {
+/// permite un proveedor remoto; `memory`, si la memoria está encendida y
+/// abierta, con el motivo de `memory` si no; las demás, todavía no.
+pub fn capabilities(remote_allowed: bool, memory: &MemoryStatus) -> Vec<Capability> {
     DOMAINS
         .iter()
         .map(|&domain| {
             let (available, reason) = match domain {
+                DOMAIN_MEMORY => (memory.enabled && memory.available, memory.reason.as_str()),
                 DOMAIN_REMOTE_BACKENDS if remote_allowed => (true, ""),
                 DOMAIN_REMOTE_BACKENDS => (
                     false,
@@ -309,7 +331,9 @@ mod tests {
 
     use super::*;
     use crate::backend::RejectedBackend;
-    use crate::test_support::{model_info, p2p_pair, FakeBackend, FixedKey};
+    use crate::test_support::{
+        memory_off, memory_status_off, model_info, p2p_pair, FakeBackend, FixedKey,
+    };
     use vasak_assistant_protocol::{
         AssistantProxy, Role, DOMAIN_MAIL, DOMAIN_MEMORY, MAX_CONVERSATIONS,
         MAX_CONVERSATIONS_PER_OWNER, SERVICE_PATH,
@@ -324,6 +348,7 @@ mod tests {
             conversations: Arc::new(Mutex::new(Conversations::default())),
             remote_allowed,
             secrets: FixedKey::new(None),
+            memory: memory_off(),
         }
     }
 
@@ -347,7 +372,7 @@ mod tests {
 
     #[test]
     fn las_capacidades_cubren_todos_los_dominios_en_orden_y_ninguna_de_datos_esta_disponible() {
-        let all = capabilities(false);
+        let all = capabilities(false, &memory_status_off());
         assert_eq!(
             all.iter().map(|c| c.domain.as_str()).collect::<Vec<_>>(),
             DOMAINS
@@ -360,12 +385,12 @@ mod tests {
 
     #[test]
     fn remote_backends_esta_disponible_solo_si_la_configuracion_lo_permite() {
-        let permitido = capabilities(true);
+        let permitido = capabilities(true, &memory_status_off());
         let remoto = capability(&permitido, DOMAIN_REMOTE_BACKENDS);
         assert!(remoto.available);
         assert!(remoto.reason.is_empty());
 
-        let prohibido = capabilities(false);
+        let prohibido = capabilities(false, &memory_status_off());
         let remoto = capability(&prohibido, DOMAIN_REMOTE_BACKENDS);
         assert!(!remoto.available);
         assert!(remoto.reason.contains("allow_remote"));
@@ -373,7 +398,7 @@ mod tests {
 
     #[test]
     fn permitir_lo_remoto_no_habilita_las_capacidades_sobre_datos_del_usuario() {
-        let all = capabilities(true);
+        let all = capabilities(true, &memory_status_off());
         assert!(!capability(&all, DOMAIN_MAIL).available);
         assert!(!capability(&all, DOMAIN_MEMORY).available);
     }
@@ -456,6 +481,7 @@ mod tests {
             conversations: Arc::default(),
             remote_allowed: false,
             secrets: FixedKey::new(None),
+            memory: memory_off(),
         };
         let id = service.open(OWNER).unwrap();
 
@@ -496,6 +522,7 @@ mod tests {
             conversations: Arc::default(),
             remote_allowed: false,
             secrets: FixedKey::new(None),
+            memory: memory_off(),
         };
         let id = service.open(OWNER).unwrap();
         service.chat_as(OWNER, &id, "primero").await.unwrap_err();
@@ -564,6 +591,7 @@ mod tests {
             conversations: Arc::default(),
             remote_allowed: false,
             secrets: FixedKey::new(None),
+            memory: memory_off(),
         };
         let id = service.open(OWNER).unwrap();
         assert!(matches!(
@@ -736,6 +764,7 @@ mod tests {
             conversations: Arc::default(),
             remote_allowed: false,
             secrets: FixedKey::new(None),
+            memory: memory_off(),
         };
         let id = service.open(":1.1").unwrap();
         service.chat_as(":1.1", &id, "secreto").await.unwrap();

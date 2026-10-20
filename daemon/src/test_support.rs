@@ -5,6 +5,7 @@
 //! `127.0.0.1:0` y la conexión D-Bus es un par de sockets de la misma prueba.
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -17,7 +18,8 @@ use zbus::{connection, Connection};
 
 use crate::backend::{BackendError, BoxFuture, ModelBackend};
 use crate::config::{select_backend, Selection, Settings};
-use crate::keyring::{ApiKey, SecretSource};
+use crate::keyring::{ApiKey, MemoryKey, SecretSource, MEMORY_KEY_BYTES};
+use crate::memory::Memory;
 
 /// Quien lee o cambia variables de entorno que `reqwest` mira al armar el
 /// cliente toma este candado: las pruebas corren en paralelo y el entorno es
@@ -255,11 +257,34 @@ pub fn local_selection(backend: &str, url: &str, model: Option<&str>) -> Selecti
 
 /// Una clave fija; guarda las direcciones por las que le preguntaron y lo que
 /// le pidieron guardar.
+///
+/// También hace de llavero para la llave de la memoria: la guarda en
+/// `memory_key`, se puede bloquear (`locked`) o dejar sin responder
+/// (`unreachable`), y anota cada llamada en `calls`, en orden.
 pub struct FixedKey {
     pub key: Option<ApiKey>,
     pub asked: Mutex<Vec<String>>,
     /// Cada `store_key`: la dirección y la clave.
     pub stored: Mutex<Vec<(String, ApiKey)>>,
+    /// La llave de la memoria tal como está en el llavero (cualquier largo,
+    /// para probar una inválida). `None`: no hay ítem.
+    pub memory_key: Mutex<Option<Vec<u8>>>,
+    /// Si es `true`, el llavero está bloqueado: `is_locked` da `true`,
+    /// `memory_key` da `Locked` si hay llave, y guardar o borrar dan
+    /// `Unavailable` sin tocarla.
+    pub locked: Mutex<bool>,
+    /// Si es `true`, el llavero no responde: todo lo de la memoria da
+    /// `Unavailable`.
+    pub unreachable: Mutex<bool>,
+    /// Si es `true`, `memory_key` da `Duplicated` (dos ítems).
+    pub duplicated: Mutex<bool>,
+    /// Las llamadas sobre la memoria en orden (`is_locked`, `memory_key`,
+    /// `store_memory_key`, `delete_memory_key`). Con `watch` puesto, cada una
+    /// lleva entre paréntesis si esa ruta existía en ese momento:
+    /// `delete_memory_key(true)` quiere decir que la llave se borró con la
+    /// carpeta todavía en disco.
+    pub calls: Mutex<Vec<String>>,
+    pub watch: Mutex<Option<PathBuf>>,
 }
 
 impl FixedKey {
@@ -268,7 +293,33 @@ impl FixedKey {
             key: key.and_then(|key| ApiKey::parse(key.as_bytes())),
             asked: Mutex::default(),
             stored: Mutex::default(),
+            memory_key: Mutex::default(),
+            locked: Mutex::default(),
+            unreachable: Mutex::default(),
+            duplicated: Mutex::default(),
+            calls: Mutex::default(),
+            watch: Mutex::default(),
         })
+    }
+
+    /// Anota la llamada y dice si el llavero responde.
+    fn call(&self, name: &str) -> Result<(), Error> {
+        let entry = match &*self.watch.lock() {
+            Some(path) => format!("{name}({})", path.exists()),
+            None => name.to_owned(),
+        };
+        self.calls.lock().push(entry);
+        if *self.unreachable.lock() {
+            return Err(Error::Unavailable("el llavero no responde".into()));
+        }
+        Ok(())
+    }
+
+    fn locked_error(&self) -> Result<(), Error> {
+        if *self.locked.lock() {
+            return Err(Error::Unavailable("El llavero está bloqueado".into()));
+        }
+        Ok(())
     }
 }
 
@@ -288,6 +339,94 @@ impl SecretSource for FixedKey {
     fn has_key<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<bool, Error>> {
         let has = self.key.is_some() || self.stored.lock().iter().any(|(u, _)| u == url);
         Box::pin(async move { Ok(has) })
+    }
+
+    fn is_locked(&self) -> BoxFuture<'_, Result<bool, Error>> {
+        let result = self.call("is_locked").map(|()| *self.locked.lock());
+        Box::pin(async move { result })
+    }
+
+    fn memory_key(&self) -> BoxFuture<'_, Result<MemoryKey, Error>> {
+        let result = self.call("memory_key").map(|()| {
+            let stored = self.memory_key.lock().clone();
+            match stored {
+                None => MemoryKey::Missing,
+                Some(_) if *self.duplicated.lock() => MemoryKey::Duplicated,
+                Some(_) if *self.locked.lock() => MemoryKey::Locked,
+                Some(bytes) => <[u8; MEMORY_KEY_BYTES]>::try_from(bytes.as_slice())
+                    .map(|key| MemoryKey::Found(zeroize::Zeroizing::new(key)))
+                    .unwrap_or(MemoryKey::Invalid),
+            }
+        });
+        Box::pin(async move { result })
+    }
+
+    fn store_memory_key<'a>(
+        &'a self,
+        key: &'a [u8; MEMORY_KEY_BYTES],
+    ) -> BoxFuture<'a, Result<(), Error>> {
+        let result = self
+            .call("store_memory_key")
+            .and_then(|()| self.locked_error())
+            .map(|()| *self.memory_key.lock() = Some(key.to_vec()));
+        Box::pin(async move { result })
+    }
+
+    fn delete_memory_key(&self) -> BoxFuture<'_, Result<(), Error>> {
+        let result = self
+            .call("delete_memory_key")
+            .and_then(|()| self.locked_error())
+            .map(|()| *self.memory_key.lock() = None);
+        Box::pin(async move { result })
+    }
+}
+
+// ── Memoria de prueba ─────────────────────────────────────────────────────────
+
+/// Una memoria sin carpeta de estado: apagada y sin poder encenderse. La de
+/// las pruebas que no son de la memoria.
+pub fn memory_off() -> Arc<Memory> {
+    Arc::new(Memory::new(None, FixedKey::new(None)))
+}
+
+/// El estado de una memoria apagada, para `service::capabilities`.
+pub fn memory_status_off() -> vasak_assistant_protocol::MemoryStatus {
+    vasak_assistant_protocol::MemoryStatus {
+        enabled: false,
+        available: false,
+        reason: crate::memory::REASON_OFF.into(),
+        bytes: 0,
+    }
+}
+
+/// Una carpeta temporal propia de la prueba, que se borra al soltarla. La
+/// memoria de una prueba va en `TempDir::new().memory_dir()`.
+// Infraestructura para las pruebas de la memoria, que escribe qa.
+#[allow(dead_code)]
+pub struct TempDir(PathBuf);
+
+#[allow(dead_code)]
+impl TempDir {
+    pub fn new() -> Self {
+        let path =
+            std::env::temp_dir().join(format!("vasak-assistant-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).expect("se crea la carpeta temporal");
+        Self(path)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+
+    /// Donde va `memory/`, como si esta carpeta fuera `$STATE_DIRECTORY`.
+    pub fn memory_dir(&self) -> PathBuf {
+        self.0.join("memory")
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

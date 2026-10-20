@@ -13,6 +13,16 @@
 //! [`Assistant::capabilities`] las lista como **no disponibles**, nunca como un
 //! error ni como un método que falla (decisión de producto,
 //! vasak-accounts#24). Lo que falta se ve que falta.
+//!
+//! # La memoria
+//!
+//! El asistente puede tener una memoria propia: una base de grafos cifrada en
+//! la carpeta de estado del servicio, con la llave en el llavero de la sesión.
+//! **Viene apagada**: existe sólo desde que la persona la enciende
+//! ([`Assistant::set_memory_enabled`]) y apagarla la borra entera, archivos y
+//! llave. [`Assistant::memory_status`] dice si está encendida, si se puede usar
+//! y cuánto ocupa. En esta fase el almacén queda listo y vacío: nada de las
+//! conversaciones se guarda todavía.
 
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::Type;
@@ -147,6 +157,21 @@ pub struct Capability {
     pub reason: String,
 }
 
+/// Cómo está la memoria del asistente. Firma `(bbst)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct MemoryStatus {
+    /// Si la persona la encendió (existe en disco), se pueda abrir o no.
+    pub enabled: bool,
+    /// Si está encendida y abierta, lista para usarse.
+    pub available: bool,
+    /// Por qué no está disponible, en palabras para mostrarle a la persona
+    /// («La memoria está apagada», «El llavero está bloqueado», …). Vacío si
+    /// está disponible.
+    pub reason: String,
+    /// Cuánto ocupa en disco, en bytes. Se mide sin abrirla; 0 si está apagada.
+    pub bytes: u64,
+}
+
 // ── Los errores ───────────────────────────────────────────────────────────────
 
 /// Los errores que devuelve el servicio, con nombre propio en el bus
@@ -199,7 +224,9 @@ pub trait Assistant {
 
     /// Las capacidades sobre cada dominio de [`DOMAINS`]. En esta fase las de
     /// datos del usuario vienen como no disponibles; `remote_backends` dice si
-    /// la configuración permite un proveedor remoto.
+    /// la configuración permite un proveedor remoto, y `memory` está
+    /// disponible si la memoria está encendida y abierta (si no, el motivo es
+    /// el de [`Self::memory_status`], o «La memoria está apagada»).
     fn capabilities(&self) -> Result<Vec<Capability>, Error>;
 
     /// Los modelos instalados en el backend. `Unavailable` si no responde.
@@ -246,6 +273,28 @@ pub trait Assistant {
     /// ninguna hasta que quede una sola. Nunca devuelve la clave. `InvalidArgs` si la dirección no se puede usar,
     /// `Unavailable` si el llavero no responde.
     fn has_provider_key(&self, url: &str) -> Result<bool, Error>;
+
+    /// Cómo está la memoria. Nunca falla (salvo el bus): cualquier problema
+    /// llega como `available: false` con el motivo. `bytes` se mide sin abrir
+    /// la base.
+    fn memory_status(&self) -> Result<MemoryStatus, Error>;
+
+    /// Enciende o apaga la memoria.
+    ///
+    /// - Encender genera una llave nueva, la guarda en el llavero y crea la
+    ///   base vacía y cifrada. `Unavailable` si el llavero está bloqueado o no
+    ///   responde (nunca se abre un diálogo), o si no se pudo crear. Si ya
+    ///   estaba encendida y abierta, no hace nada.
+    /// - Apagar **borra**: primero la llave del llavero y después los
+    ///   archivos. Con el llavero bloqueado los archivos se borran igual. Si ya
+    ///   estaba apagada, borra lo que haya quedado suelto (una llave en el
+    ///   llavero, restos de un corte a mitad de camino) y devuelve Ok.
+    fn set_memory_enabled(&self, enabled: bool) -> Result<(), Error>;
+
+    /// Vacía la memoria: si está encendida, la borra y la vuelve a crear vacía
+    /// con una llave nueva; si está apagada, no hace nada. `Unavailable` si el
+    /// llavero está bloqueado (entonces no se toca nada) o no responde.
+    fn clear_memory(&self) -> Result<(), Error>;
 }
 
 #[cfg(test)]

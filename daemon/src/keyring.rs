@@ -32,12 +32,27 @@
 //! traería una pila de cripto para nada.
 //!
 //! La clave nunca se escribe en el registro: [`ApiKey`] no se puede imprimir.
+//!
+//! # La llave de la memoria
+//!
+//! La base de la memoria (`crate::memory`) se cifra con una llave cruda de 32
+//! bytes que vive en el mismo llavero, en un ítem aparte:
+//!
+//! - `service` = `ar.net.vasak.os.Assistant`
+//! - `purpose` = `memory`
+//! - `xdg:schema` = `ar.net.vasak.os.Assistant`
+//!
+//! La genera y la borra sólo el servicio, al encender y al apagar la memoria;
+//! nunca sola al arrancar. Tiene el mismo modelo de acceso que la clave del
+//! proveedor (cualquier proceso de la sesión con el llavero abierto la puede
+//! leer) y el mismo criterio de duplicados: con más de una no se usa ninguna.
 
 use std::collections::HashMap;
 
 use vasak_assistant_protocol::Error;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::Connection;
+use zeroize::Zeroizing;
 
 use crate::backend::BoxFuture;
 
@@ -53,6 +68,46 @@ const DEFAULT_COLLECTION: &str = "/org/freedesktop/secrets/aliases/default";
 pub const ITEM_SERVICE: &str = "ar.net.vasak.os.Assistant";
 /// La etiqueta con la que se ve el ítem en el llavero.
 pub const ITEM_LABEL: &str = "Lince";
+/// El valor del atributo `purpose` del ítem de la llave de la memoria.
+pub const MEMORY_PURPOSE: &str = "memory";
+/// La etiqueta del ítem de la llave de la memoria.
+pub const MEMORY_LABEL: &str = "Lince: llave de la memoria";
+/// El largo de la llave de la memoria: AES-256.
+pub const MEMORY_KEY_BYTES: usize = 32;
+
+/// Los atributos con los que se crea el ítem de la llave de la memoria.
+fn memory_attributes() -> HashMap<&'static str, &'static str> {
+    HashMap::from([
+        ("service", ITEM_SERVICE),
+        ("purpose", MEMORY_PURPOSE),
+        ("xdg:schema", ITEM_SERVICE),
+    ])
+}
+
+/// La llave de la memoria tal como se encontró en el llavero.
+pub enum MemoryKey {
+    Found(Zeroizing<[u8; MEMORY_KEY_BYTES]>),
+    /// No hay ningún ítem.
+    Missing,
+    /// Está, pero en un llavero bloqueado.
+    Locked,
+    /// Hay más de uno: no se usa ninguno.
+    Duplicated,
+    /// Hay uno, pero no son 32 bytes.
+    Invalid,
+}
+
+impl std::fmt::Debug for MemoryKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Found(_) => "Found(…)",
+            Self::Missing => "Missing",
+            Self::Locked => "Locked",
+            Self::Duplicated => "Duplicated",
+            Self::Invalid => "Invalid",
+        })
+    }
+}
 
 /// El tope de una clave. Ninguna de verdad se le acerca.
 const MAX_KEY_BYTES: usize = 4096;
@@ -103,6 +158,24 @@ pub trait SecretSource: Send + Sync {
     /// uno solo bloqueado (está, pero hay que desbloquear el llavero). Con más
     /// de uno la lectura no usa ninguno, así que acá da `false`.
     fn has_key<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<bool, Error>>;
+
+    /// Si la colección por omisión está bloqueada. `Unavailable` si el
+    /// llavero no responde.
+    fn is_locked(&self) -> BoxFuture<'_, Result<bool, Error>>;
+
+    /// La llave de la memoria. `Unavailable` sólo si el llavero no responde.
+    fn memory_key(&self) -> BoxFuture<'_, Result<MemoryKey, Error>>;
+
+    /// Guarda la llave de la memoria, reemplazando la que hubiera.
+    /// `Unavailable` si el llavero está bloqueado o no responde.
+    fn store_memory_key<'a>(
+        &'a self,
+        key: &'a [u8; MEMORY_KEY_BYTES],
+    ) -> BoxFuture<'a, Result<(), Error>>;
+
+    /// Borra todos los ítems de la llave de la memoria. `Unavailable` si
+    /// quedó alguno (llavero bloqueado) o el llavero no responde.
+    fn delete_memory_key(&self) -> BoxFuture<'_, Result<(), Error>>;
 }
 
 /// El llavero de la sesión, por la API del Secret Service.
@@ -139,30 +212,77 @@ impl SecretSource for SecretService {
 
     fn has_key<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<bool, Error>> {
         Box::pin(async move {
-            let (unlocked, locked) = self.search(url).await.map_err(|error| {
-                Error::Unavailable(format!("No se pudo consultar el llavero: {error}"))
-            })?;
+            let (unlocked, locked) = self
+                .search(&provider_attributes(url))
+                .await
+                .map_err(unreachable)?;
             Ok(has_usable_item(&unlocked, &locked))
         })
+    }
+
+    fn is_locked(&self) -> BoxFuture<'_, Result<bool, Error>> {
+        Box::pin(async move { self.collection_locked().await.map_err(unreachable) })
+    }
+
+    fn memory_key(&self) -> BoxFuture<'_, Result<MemoryKey, Error>> {
+        Box::pin(async move { self.read_memory_key().await.map_err(unreachable) })
+    }
+
+    fn store_memory_key<'a>(
+        &'a self,
+        key: &'a [u8; MEMORY_KEY_BYTES],
+    ) -> BoxFuture<'a, Result<(), Error>> {
+        Box::pin(async move {
+            self.store_secret(
+                memory_attributes(),
+                MEMORY_LABEL,
+                key,
+                "application/octet-stream",
+            )
+            .await
+            .map_err(|error| {
+                Error::Unavailable(format!(
+                    "No se pudo guardar la llave de la memoria en el llavero: {error}"
+                ))
+            })?
+        })
+    }
+
+    fn delete_memory_key(&self) -> BoxFuture<'_, Result<(), Error>> {
+        Box::pin(async move { self.delete(&memory_search()).await.map_err(unreachable)? })
     }
 }
 
 type Secret = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
 
+/// Los atributos del ítem de la clave del proveedor de esa dirección.
+fn provider_attributes(url: &str) -> HashMap<&str, &str> {
+    HashMap::from([("service", ITEM_SERVICE), ("url", url)])
+}
+
+/// Con qué se busca la llave de la memoria: `service` y `purpose` alcanzan
+/// (ningún ítem de proveedor lleva `purpose`).
+fn memory_search() -> HashMap<&'static str, &'static str> {
+    HashMap::from([("service", ITEM_SERVICE), ("purpose", MEMORY_PURPOSE)])
+}
+
+fn unreachable(error: zbus::Error) -> Error {
+    Error::Unavailable(format!("No se pudo consultar el llavero: {error}"))
+}
+
 impl SecretService {
-    /// Los ítems del asistente para esa dirección: (desbloqueados, bloqueados).
+    /// Los ítems con esos atributos: (desbloqueados, bloqueados).
     async fn search(
         &self,
-        url: &str,
+        attributes: &HashMap<&str, &str>,
     ) -> zbus::Result<(Vec<OwnedObjectPath>, Vec<OwnedObjectPath>)> {
-        let attributes = HashMap::from([("service", ITEM_SERVICE), ("url", url)]);
         self.connection
             .call_method(
                 Some(SECRETS_NAME),
                 SECRETS_PATH,
                 Some(SECRETS_SERVICE),
                 "SearchItems",
-                &attributes,
+                attributes,
             )
             .await?
             .body()
@@ -199,7 +319,7 @@ impl SecretService {
     }
 
     async fn lookup(&self, url: &str) -> zbus::Result<Option<ApiKey>> {
-        let (unlocked, locked) = self.search(url).await?;
+        let (unlocked, locked) = self.search(&provider_attributes(url)).await?;
         // Más de un ítem con los mismos atributos: cualquiera de la sesión puede
         // crear uno, así que otro proceso pudo haber plantado su clave al lado de
         // la verdadera. No se adivina cuál es cuál: no se usa ninguna.
@@ -226,6 +346,16 @@ impl SecretService {
             return Ok(None);
         };
 
+        let value = self.read_secret(&item).await?;
+        Ok(value.and_then(|value| ApiKey::parse(&value)))
+    }
+
+    /// El secreto de un ítem, por una sesión `plain` que se cierra pase lo que
+    /// pase con la lectura. `Zeroizing` porque puede ser la llave de la memoria.
+    async fn read_secret(
+        &self,
+        item: &OwnedObjectPath,
+    ) -> zbus::Result<Option<Zeroizing<Vec<u8>>>> {
         let session = self.open_session().await?;
         let secrets = self
             .connection
@@ -234,7 +364,7 @@ impl SecretService {
                 SECRETS_PATH,
                 Some(SECRETS_SERVICE),
                 "GetSecrets",
-                &(vec![&item], &session),
+                &(vec![item], &session),
             )
             .await
             .and_then(|reply| {
@@ -242,19 +372,39 @@ impl SecretService {
                     .body()
                     .deserialize::<HashMap<OwnedObjectPath, Secret>>()
             });
-        // La sesión se cierra pase lo que pase con la lectura.
         self.close_session(&session).await;
         Ok(secrets?
-            .remove(&item)
-            .and_then(|(_, _, value, _)| ApiKey::parse(&value)))
+            .remove(item)
+            .map(|(_, _, value, _)| Zeroizing::new(value)))
     }
 
-    /// `CreateItem` en la colección por omisión con `replace`. El `Err` de
-    /// afuera es del bus; el de adentro, el motivo ya armado para la persona.
-    async fn store(&self, url: &str, key: &ApiKey) -> zbus::Result<Result<(), Error>> {
-        // Se pregunta antes de escribir: con la colección bloqueada,
-        // `CreateItem` devolvería un diálogo de desbloqueo, y abrirlo es de
-        // quien usa el sistema, no de un servicio en segundo plano.
+    /// La llave de la memoria, con el mismo criterio de duplicados que la
+    /// clave del proveedor ([`has_usable_item`]).
+    async fn read_memory_key(&self) -> zbus::Result<MemoryKey> {
+        let (unlocked, locked) = self.search(&memory_search()).await?;
+        let item = match (unlocked.as_slice(), locked.len()) {
+            ([item], _) => item,
+            ([], 0) => return Ok(MemoryKey::Missing),
+            ([], 1) => return Ok(MemoryKey::Locked),
+            _ => {
+                tracing::warn!(
+                    "hay más de una llave de la memoria en el llavero; no se usa ninguna"
+                );
+                return Ok(MemoryKey::Duplicated);
+            }
+        };
+        let Some(value) = self.read_secret(item).await? else {
+            return Ok(MemoryKey::Missing);
+        };
+        let Ok(bytes) = <[u8; MEMORY_KEY_BYTES]>::try_from(value.as_slice()) else {
+            return Ok(MemoryKey::Invalid);
+        };
+        Ok(MemoryKey::Found(Zeroizing::new(bytes)))
+    }
+
+    /// `Locked` de la colección por omisión. Si no se puede leer como booleano,
+    /// se la da por bloqueada.
+    async fn collection_locked(&self) -> zbus::Result<bool> {
         let locked: OwnedValue = self
             .connection
             .call_method(
@@ -267,25 +417,78 @@ impl SecretService {
             .await?
             .body()
             .deserialize()?;
-        if bool::try_from(locked).unwrap_or(true) {
+        Ok(bool::try_from(locked).unwrap_or(true))
+    }
+
+    /// La clave del proveedor de esa dirección, con [`Self::store_secret`].
+    async fn store(&self, url: &str, key: &ApiKey) -> zbus::Result<Result<(), Error>> {
+        self.store_secret(
+            provider_attributes(url),
+            ITEM_LABEL,
+            key.expose().as_bytes(),
+            "text/plain",
+        )
+        .await
+    }
+
+    /// Borra cada ítem desbloqueado con esos atributos (`Item.Delete`). Los
+    /// bloqueados no se tocan: borrarlos pediría desbloquear. El `Err` de
+    /// afuera es del bus; el de adentro, que quedó alguno.
+    async fn delete(&self, attributes: &HashMap<&str, &str>) -> zbus::Result<Result<(), Error>> {
+        let (unlocked, locked) = self.search(attributes).await?;
+        let mut left = !locked.is_empty();
+        for item in &unlocked {
+            let deleted = self
+                .connection
+                .call_method(
+                    Some(SECRETS_NAME),
+                    item.as_str(),
+                    Some("org.freedesktop.Secret.Item"),
+                    "Delete",
+                    &(),
+                )
+                .await
+                .and_then(|reply| reply.body().deserialize::<OwnedObjectPath>());
+            match deleted {
+                Ok(prompt) if prompt.as_str() == "/" => {}
+                // Un prompt: se bloqueó entre la búsqueda y el borrado.
+                Ok(_) => left = true,
+                Err(zbus::Error::MethodError(name, _, _))
+                    if name.as_str() == "org.freedesktop.Secret.Error.IsLocked" =>
+                {
+                    left = true
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(if left { Err(locked_error()) } else { Ok(()) })
+    }
+
+    /// `CreateItem` en la colección por omisión con `replace`. El `Err` de
+    /// afuera es del bus; el de adentro, el motivo ya armado para la persona.
+    async fn store_secret(
+        &self,
+        attributes: HashMap<&str, &str>,
+        label: &str,
+        value: &[u8],
+        content_type: &str,
+    ) -> zbus::Result<Result<(), Error>> {
+        // Se pregunta antes de escribir: con la colección bloqueada,
+        // `CreateItem` devolvería un diálogo de desbloqueo, y abrirlo es de
+        // quien usa el sistema, no de un servicio en segundo plano.
+        if self.collection_locked().await? {
             return Ok(Err(locked_error()));
         }
 
-        let attributes = HashMap::from([("service", ITEM_SERVICE), ("url", url)]);
         let properties = HashMap::from([
-            ("org.freedesktop.Secret.Item.Label", Value::from(ITEM_LABEL)),
+            ("org.freedesktop.Secret.Item.Label", Value::from(label)),
             (
                 "org.freedesktop.Secret.Item.Attributes",
                 Value::from(attributes),
             ),
         ]);
         let session = self.open_session().await?;
-        let secret = (
-            &session,
-            Vec::<u8>::new(),
-            key.expose().as_bytes(),
-            "text/plain",
-        );
+        let secret = (&session, Vec::<u8>::new(), value, content_type);
         let created = self
             .connection
             .call_method(
@@ -408,6 +611,18 @@ mod tests {
     const ITEM: &str = "/org/freedesktop/secrets/collection/login/1";
     const ITEM_2: &str = "/org/freedesktop/secrets/collection/login/2";
     const SESSION: &str = "/org/freedesktop/secrets/session/s1";
+    /// Donde está el ítem de la llave de la memoria, si se creó.
+    const MEMORY_ITEM: &str = "/org/freedesktop/secrets/collection/login/memory";
+
+    /// Las llamadas que recibe el llavero de mentira, en orden, por nombre del
+    /// método D-Bus (`SearchItems`, `OpenSession`, `GetSecrets`, `Locked`,
+    /// `CreateItem`, `Delete`). Infraestructura para probar el orden.
+    type Calls = Arc<Mutex<Vec<&'static str>>>;
+
+    /// Si un `CreateItem` fue el de la llave de la memoria.
+    fn is_memory(created: &Created) -> bool {
+        created.attributes.get("purpose").map(String::as_str) == Some(MEMORY_PURPOSE)
+    }
 
     #[derive(Clone, Copy, PartialEq)]
     enum Item {
@@ -425,6 +640,12 @@ mod tests {
         secret: Vec<u8>,
         item: Item,
         sessions_opened: Arc<Mutex<Vec<String>>>,
+        /// Lo creado con `CreateItem`: la llave de la memoria se busca y se lee
+        /// de acá, como en un llavero de verdad (con `replace`, una sola).
+        created: Arc<Mutex<Vec<Created>>>,
+        /// Para saber si la llave de la memoria está en un llavero bloqueado.
+        collection: Collection,
+        calls: Calls,
     }
 
     #[interface(name = "org.freedesktop.Secret.Service")]
@@ -433,6 +654,23 @@ mod tests {
             &self,
             attributes: HashMap<String, String>,
         ) -> (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) {
+            self.calls.lock().push("SearchItems");
+            // La llave de la memoria: quien busca con un subconjunto de sus
+            // atributos la encuentra, si se creó y no se borró.
+            if attributes.get("purpose").map(String::as_str) == Some(MEMORY_PURPOSE) {
+                let found = self.created.lock().iter().any(|created| {
+                    is_memory(created)
+                        && attributes
+                            .iter()
+                            .all(|(key, value)| created.attributes.get(key) == Some(value))
+                });
+                let item = OwnedObjectPath::try_from(MEMORY_ITEM).unwrap();
+                return match (found, self.collection == Collection::Locked) {
+                    (false, _) => (vec![], vec![]),
+                    (true, false) => (vec![item], vec![]),
+                    (true, true) => (vec![], vec![item]),
+                };
+            }
             let coincide = attributes.len() == 2
                 && attributes.get("service").map(String::as_str) == Some(ITEM_SERVICE)
                 && attributes.get("url") == Some(&self.url);
@@ -457,6 +695,7 @@ mod tests {
             algorithm: String,
             _input: zbus::zvariant::Value<'_>,
         ) -> (OwnedValue, OwnedObjectPath) {
+            self.calls.lock().push("OpenSession");
             self.sessions_opened.lock().push(algorithm);
             (
                 OwnedValue::try_from(Value::from("")).unwrap(),
@@ -469,14 +708,23 @@ mod tests {
             items: Vec<ObjectPath<'_>>,
             session: ObjectPath<'_>,
         ) -> HashMap<OwnedObjectPath, Secret> {
+            self.calls.lock().push("GetSecrets");
             assert_eq!(session.as_str(), SESSION);
             items
                 .into_iter()
                 .map(|item| {
+                    let value = if item.as_str() == MEMORY_ITEM {
+                        let created = self.created.lock();
+                        let last = created.iter().rev().find(|created| is_memory(created));
+                        last.map(|created| created.value.clone())
+                            .unwrap_or_default()
+                    } else {
+                        self.secret.clone()
+                    };
                     let secret: Secret = (
                         OwnedObjectPath::try_from(SESSION).unwrap(),
                         vec![],
-                        self.secret.clone(),
+                        value,
                         "text/plain".into(),
                     );
                     (OwnedObjectPath::from(item), secret)
@@ -534,12 +782,14 @@ mod tests {
     struct FakeCollection {
         state: Collection,
         created: Arc<Mutex<Vec<Created>>>,
+        calls: Calls,
     }
 
     #[interface(name = "org.freedesktop.Secret.Collection")]
     impl FakeCollection {
         #[zbus(property)]
         fn locked(&self) -> bool {
+            self.calls.lock().push("Locked");
             self.state == Collection::Locked
         }
 
@@ -549,6 +799,7 @@ mod tests {
             secret: Secret,
             replace: bool,
         ) -> Result<(OwnedObjectPath, OwnedObjectPath), FakeError> {
+            self.calls.lock().push("CreateItem");
             let label = properties
                 .get("org.freedesktop.Secret.Item.Label")
                 .and_then(|value| String::try_from(value.try_clone().ok()?).ok())
@@ -579,8 +830,37 @@ mod tests {
         }
     }
 
+    /// El ítem de la llave de la memoria: `Delete` la saca de `created`, salvo
+    /// con la colección en `Prompts` (contesta un prompt) o `IsLocked`.
+    struct FakeItem {
+        state: Collection,
+        created: Arc<Mutex<Vec<Created>>>,
+        calls: Calls,
+    }
+
+    #[interface(name = "org.freedesktop.Secret.Item")]
+    impl FakeItem {
+        fn delete(&self) -> Result<OwnedObjectPath, FakeError> {
+            self.calls.lock().push("Delete");
+            let prompt = match self.state {
+                Collection::Prompts => "/org/freedesktop/secrets/prompt/p2",
+                Collection::IsLocked => return Err(FakeError::IsLocked("bloqueada".into())),
+                Collection::Fails => return Err(FakeError::Failed("falló".into())),
+                _ => {
+                    self.created.lock().retain(|created| !is_memory(created));
+                    "/"
+                }
+            };
+            Ok(OwnedObjectPath::try_from(prompt).unwrap())
+        }
+    }
+
     struct Setup {
         service: SecretService,
+        /// Las llamadas al llavero, en orden. Para las pruebas de la memoria,
+        /// que escribe qa.
+        #[allow(dead_code)]
+        calls: Calls,
         closed: Arc<Mutex<u32>>,
         sessions_opened: Arc<Mutex<Vec<String>>>,
         created: Arc<Mutex<Vec<Created>>>,
@@ -596,27 +876,39 @@ mod tests {
         let closed = Arc::new(Mutex::new(0));
         let sessions_opened = Arc::new(Mutex::new(Vec::new()));
         let created = Arc::new(Mutex::new(Vec::new()));
+        let calls = Calls::default();
         let fake = FakeSecrets {
             url: "https://api.ejemplo.com/v1/".into(),
             secret: secret.to_vec(),
             item,
             sessions_opened: sessions_opened.clone(),
+            created: created.clone(),
+            collection,
+            calls: calls.clone(),
         };
         let session = FakeSession(closed.clone());
+        let memory_item = FakeItem {
+            state: collection,
+            created: created.clone(),
+            calls: calls.clone(),
+        };
         let collection = FakeCollection {
             state: collection,
             created: created.clone(),
+            calls: calls.clone(),
         };
         let (server, client) = p2p_pair(|builder| {
             builder
                 .serve_at(SECRETS_PATH, fake)?
                 .serve_at(SESSION, session)?
-                .serve_at(DEFAULT_COLLECTION, collection)
+                .serve_at(DEFAULT_COLLECTION, collection)?
+                .serve_at(MEMORY_ITEM, memory_item)
         })
         .await
         .unwrap();
         Setup {
             service: SecretService { connection: client },
+            calls,
             closed,
             sessions_opened,
             created,
@@ -863,6 +1155,7 @@ mod tests {
                 conversations: Arc::default(),
                 remote_allowed: false,
                 secrets: Arc::new(setup.service),
+                memory: crate::test_support::memory_off(),
             };
             assert_eq!(
                 service
