@@ -906,4 +906,204 @@ mod tests {
         assert_eq!(result.unwrap(), id);
         assert_eq!(conversations.lock().count_for(":1.7"), 1);
     }
+
+    const CLAVE: &str = "sk-clave-que-no-debe-filtrarse";
+
+    fn service_with_keys() -> (AssistantService, Arc<FixedKey>) {
+        let keys = FixedKey::new(None);
+        let service = AssistantService {
+            secrets: keys.clone(),
+            ..service(FakeBackend::replying(""), false)
+        };
+        (service, keys)
+    }
+
+    fn stored(keys: &FixedKey) -> Vec<(String, String)> {
+        keys.stored
+            .lock()
+            .iter()
+            .map(|(url, key)| (url.clone(), key.expose().to_owned()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn guardar_la_clave_de_un_local_por_http_la_deja_en_el_llavero_con_la_direccion_normalizada(
+    ) {
+        let (service, keys) = service_with_keys();
+        service
+            .store_provider_key("http://127.0.0.1:8080/v1?x=1", &format!("  {CLAVE}\n"))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored(&keys),
+            [("http://127.0.0.1:8080/v1/".to_owned(), CLAVE.to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn guardar_la_clave_de_un_remoto_por_https_se_acepta() {
+        let (service, keys) = service_with_keys();
+        service
+            .store_provider_key("https://api.openai.com/v1", CLAVE)
+            .await
+            .unwrap();
+        assert_eq!(stored(&keys)[0].0, "https://api.openai.com/v1/");
+    }
+
+    #[tokio::test]
+    async fn la_clave_se_guarda_con_la_misma_direccion_que_despues_busca_el_backend() {
+        use crate::config::{select_backend, Settings};
+        for raw in [
+            "https://localhost:8443/v1",
+            "http://127.0.0.1:8080/v1/?a=b#c",
+        ] {
+            let (service, keys) = service_with_keys();
+            service.store_provider_key(raw, CLAVE).await.unwrap();
+            let selection = select_backend(&Settings {
+                backend: Some("openai".into()),
+                url: Some(raw.into()),
+                ..Settings::default()
+            })
+            .unwrap();
+            assert_eq!(stored(&keys)[0].0, selection.url.as_str(), "{raw}");
+        }
+    }
+
+    #[tokio::test]
+    async fn la_clave_de_un_remoto_por_http_se_rechaza_sin_guardar_ni_nombrar_la_clave() {
+        let (service, keys) = service_with_keys();
+        let error = service
+            .store_provider_key("http://api.ejemplo.com/v1?token=SECRETO", CLAVE)
+            .await
+            .unwrap_err();
+        let Error::InvalidArgs(text) = error else {
+            panic!("tenía que ser InvalidArgs");
+        };
+        assert!(text.contains("api.ejemplo.com"), "{text}");
+        assert!(text.contains("https"), "{text}");
+        assert!(!text.contains(CLAVE) && !text.contains("SECRETO"), "{text}");
+        assert!(stored(&keys).is_empty());
+    }
+
+    #[tokio::test]
+    async fn una_direccion_que_no_vale_se_rechaza_con_invalid_args_sin_la_clave() {
+        for raw in ["", "no es url", "ftp://127.0.0.1/", "http://u:p@127.0.0.1/"] {
+            let (service, keys) = service_with_keys();
+            let error = service.store_provider_key(raw, CLAVE).await.unwrap_err();
+            let Error::InvalidArgs(text) = error else {
+                panic!("{raw:?}: tenía que ser InvalidArgs");
+            };
+            assert!(!text.contains(CLAVE), "{raw:?}: {text}");
+            assert!(stored(&keys).is_empty(), "{raw:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn una_clave_vacia_larga_o_con_caracteres_de_control_se_rechaza_sin_repetirla() {
+        let larga = "k".repeat(4097);
+        let casos = [
+            "",
+            "   \n\t ",
+            larga.as_str(),
+            "sk-\r\nX-Otra: 1",
+            "sk-a\0b",
+        ];
+        for key in casos {
+            let (service, keys) = service_with_keys();
+            let error = service
+                .store_provider_key("https://api.openai.com/v1", key)
+                .await
+                .unwrap_err();
+            let Error::InvalidArgs(text) = error else {
+                panic!("{key:?}: tenía que ser InvalidArgs");
+            };
+            assert!(text.contains("clave"), "{text}");
+            if !key.trim().is_empty() {
+                assert!(!text.contains(key.trim()), "el mensaje repite la clave");
+            }
+            assert!(stored(&keys).is_empty(), "{key:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn una_clave_de_4096_bytes_justos_se_acepta() {
+        let (service, keys) = service_with_keys();
+        service
+            .store_provider_key("https://api.openai.com/v1", &"k".repeat(4096))
+            .await
+            .unwrap();
+        assert_eq!(stored(&keys).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn has_provider_key_for_consulta_con_la_direccion_normalizada_y_rechaza_la_ilegible() {
+        let (service, _keys) = service_with_keys();
+        assert!(!service
+            .has_provider_key_for("https://api.openai.com/v1")
+            .await
+            .unwrap());
+        service
+            .store_provider_key("https://api.openai.com/v1", CLAVE)
+            .await
+            .unwrap();
+        // Sin la barra final y con consulta: es la misma clave.
+        assert!(service
+            .has_provider_key_for("https://api.openai.com/v1?x=1")
+            .await
+            .unwrap());
+        assert!(!service
+            .has_provider_key_for("https://otro.ejemplo.com/v1")
+            .await
+            .unwrap());
+        assert!(matches!(
+            service.has_provider_key_for("no es url").await,
+            Err(Error::InvalidArgs(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn por_dbus_set_provider_key_guarda_y_has_provider_key_lo_ve() {
+        let (service, keys) = service_with_keys();
+        let (proxy, _server) = connected(service).await;
+
+        assert!(!proxy
+            .has_provider_key("https://api.openai.com/v1")
+            .await
+            .unwrap());
+        proxy
+            .set_provider_key("https://api.openai.com/v1", CLAVE)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored(&keys),
+            [("https://api.openai.com/v1/".to_owned(), CLAVE.to_owned())]
+        );
+        assert!(proxy
+            .has_provider_key("https://api.openai.com/v1")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn por_dbus_una_clave_o_direccion_invalida_llega_como_invalid_args_sin_la_clave() {
+        let (service, keys) = service_with_keys();
+        let (proxy, _server) = connected(service).await;
+
+        for (url, key) in [
+            ("https://api.openai.com/v1", "   "),
+            ("http://api.ejemplo.com/v1", CLAVE),
+            ("no es url", CLAVE),
+        ] {
+            match proxy.set_provider_key(url, key).await {
+                Err(Error::InvalidArgs(text)) => assert!(!text.contains(CLAVE), "{text}"),
+                otro => panic!("{url:?}: se esperaba InvalidArgs, vino {otro:?}"),
+            }
+        }
+        assert!(stored(&keys).is_empty());
+        assert!(matches!(
+            proxy.has_provider_key("no es url").await,
+            Err(Error::InvalidArgs(_))
+        ));
+    }
 }

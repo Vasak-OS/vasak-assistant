@@ -559,4 +559,71 @@ mod tests {
         std::env::remove_var("VASAK_CONFIG_PATH");
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn normalize_url_acepta_http_y_https_y_deja_la_barra_final_sin_consulta_ni_fragmento() {
+        let casos = [
+            ("http://127.0.0.1:8080/v1", "http://127.0.0.1:8080/v1/"),
+            ("https://api.openai.com/v1/", "https://api.openai.com/v1/"),
+            ("https://api.openai.com", "https://api.openai.com/"),
+            (
+                "  https://api.openai.com/v1  ",
+                "https://api.openai.com/v1/",
+            ),
+            (
+                "https://api.openai.com/v1?k=1#x",
+                "https://api.openai.com/v1/",
+            ),
+            ("http://[::1]:11434", "http://[::1]:11434/"),
+        ];
+        for (raw, expected) in casos {
+            assert_eq!(normalize_url(raw).unwrap().as_str(), expected, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn normalize_url_rechaza_lo_que_no_sirve_de_direccion_base() {
+        let casos = [
+            ("esto no es una url", "inválida"),
+            ("", "inválida"),
+            ("ftp://127.0.0.1/", "http o https"),
+            ("file:///etc/passwd", "http o https"),
+            ("http://usuario@127.0.0.1", "usuario ni contraseña"),
+            ("https://:clave@api.openai.com/v1", "usuario ni contraseña"),
+            ("http://", "inválida"),
+        ];
+        for (raw, motivo) in casos {
+            let error = normalize_url(raw).expect_err(raw);
+            assert!(error.contains(motivo), "{raw:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn el_error_de_normalize_url_no_repite_la_contrasena_de_la_direccion() {
+        let error = normalize_url("https://usuario:SECRETO-123@api.openai.com/v1").unwrap_err();
+        assert!(!error.contains("SECRETO-123"), "{error}");
+        assert!(!error.contains("usuario:"), "{error}");
+    }
+
+    #[test]
+    fn select_backend_y_normalize_url_dan_la_misma_direccion() {
+        for raw in [
+            "http://127.0.0.1:8080/v1",
+            "https://localhost:8443/v1?x=1#y",
+        ] {
+            let selection = select_backend(&settings("openai", raw, "", false)).unwrap();
+            assert_eq!(selection.url, normalize_url(raw).unwrap(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn la_seccion_assistant_con_el_nombre_del_asistente_no_hace_rechazar_la_configuracion() {
+        let settings = settings_from_json(
+            r#"{"assistant":{"name":"Lince","backend":"openai","url":"http://127.0.0.1:8080/v1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.backend.as_deref(), Some("openai"));
+        assert_eq!(settings.url.as_deref(), Some("http://127.0.0.1:8080/v1"));
+        assert!(select_backend(&settings).is_ok());
+    }
 }

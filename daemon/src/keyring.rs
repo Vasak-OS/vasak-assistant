@@ -632,4 +632,123 @@ mod tests {
         // Ni siquiera se abre sesión para leer una de las dos.
         assert!(setup.sessions_opened.lock().is_empty());
     }
+
+    const CLAVE: &str = "sk-clave-que-no-debe-filtrarse";
+
+    fn key() -> ApiKey {
+        ApiKey::parse(CLAVE.as_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn guardar_crea_el_item_con_etiqueta_atributos_y_reemplazo() {
+        let setup = secret_service(Item::Unlocked, b"").await;
+
+        setup.service.store(URL, &key()).await.unwrap().unwrap();
+
+        let created = setup.created.lock();
+        assert_eq!(created.len(), 1);
+        let item = &created[0];
+        assert_eq!(item.label, ITEM_LABEL);
+        assert_eq!(
+            item.attributes,
+            HashMap::from([
+                ("service".to_owned(), ITEM_SERVICE.to_owned()),
+                ("url".to_owned(), URL.to_owned()),
+            ])
+        );
+        assert_eq!(item.value, CLAVE.as_bytes());
+        assert_eq!(item.content_type, "text/plain");
+        assert_eq!(item.session, SESSION);
+        assert!(item.replace);
+        assert_eq!(*setup.sessions_opened.lock(), ["plain"]);
+    }
+
+    #[tokio::test]
+    async fn guardar_cierra_la_sesion_una_sola_vez() {
+        let setup = secret_service(Item::Unlocked, b"").await;
+        setup.service.store_key(URL, &key()).await.unwrap();
+        assert_eq!(*setup.closed.lock(), 1);
+    }
+
+    #[tokio::test]
+    async fn lo_que_se_guarda_se_encuentra_con_los_mismos_atributos_que_usa_la_lectura() {
+        let setup = secret_service(Item::Unlocked, CLAVE.as_bytes()).await;
+        setup.service.store_key(URL, &key()).await.unwrap();
+        let attributes = setup.created.lock()[0].attributes.clone();
+        // La lectura busca exactamente `service` y `url`, y esa búsqueda acierta.
+        assert_eq!(attributes.len(), 2);
+        assert_eq!(attributes["url"], URL);
+        assert_eq!(setup.service.api_key(URL).await.unwrap().expose(), CLAVE);
+    }
+
+    #[tokio::test]
+    async fn con_la_coleccion_bloqueada_no_se_crea_nada_y_el_error_dice_que_hacer() {
+        let setup = secret_service_with(Item::Unlocked, b"", Collection::Locked).await;
+
+        let Err(Error::Unavailable(text)) = setup.service.store_key(URL, &key()).await else {
+            panic!("tenía que ser Unavailable");
+        };
+
+        assert!(text.contains("bloqueado"), "{text}");
+        assert!(!text.contains(CLAVE));
+        assert!(setup.created.lock().is_empty());
+        assert!(setup.sessions_opened.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn si_el_llavero_responde_con_un_prompt_es_unavailable_y_la_sesion_se_cierra() {
+        let setup = secret_service_with(Item::Unlocked, b"", Collection::Prompts).await;
+
+        let Err(Error::Unavailable(text)) = setup.service.store_key(URL, &key()).await else {
+            panic!("tenía que ser Unavailable");
+        };
+
+        assert!(text.contains("bloqueado"), "{text}");
+        assert!(!text.contains(CLAVE));
+        assert_eq!(*setup.closed.lock(), 1);
+    }
+
+    #[tokio::test]
+    async fn sin_llavero_guardar_es_unavailable_y_el_texto_no_lleva_la_clave() {
+        let (_server, client) =
+            p2p_pair(|builder| builder.serve_at(SESSION, FakeSession(Arc::default())))
+                .await
+                .unwrap();
+        let service = SecretService { connection: client };
+
+        let Err(Error::Unavailable(text)) = service.store_key(URL, &key()).await else {
+            panic!("tenía que ser Unavailable");
+        };
+
+        assert!(text.contains("llavero"), "{text}");
+        assert!(!text.contains(CLAVE), "{text}");
+    }
+
+    #[tokio::test]
+    async fn has_key_dice_si_hay_un_item_para_la_direccion_aunque_este_bloqueado() {
+        for item in [Item::Unlocked, Item::Locked] {
+            let setup = secret_service(item, b"x").await;
+            assert!(setup.service.has_key(URL).await.unwrap());
+            assert!(!setup
+                .service
+                .has_key("https://otro.ejemplo.com/v1/")
+                .await
+                .unwrap());
+            // Preguntar si hay clave no la lee: no abre sesión.
+            assert!(setup.sessions_opened.lock().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn sin_llavero_has_key_es_unavailable() {
+        let (_server, client) =
+            p2p_pair(|builder| builder.serve_at(SESSION, FakeSession(Arc::default())))
+                .await
+                .unwrap();
+        let service = SecretService { connection: client };
+        assert!(matches!(
+            service.has_key(URL).await,
+            Err(Error::Unavailable(_))
+        ));
+    }
 }
