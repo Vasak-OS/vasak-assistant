@@ -242,7 +242,8 @@ pub trait Assistant {
 
     /// Si hay una clave guardada en el llavero para `url` (normalizada igual
     /// que en [`Self::set_provider_key`]), aunque el llavero esté bloqueado.
-    /// Nunca devuelve la clave. `InvalidArgs` si la dirección no se puede usar,
+    /// Si hay más de una para la misma dirección da `false`: el servicio no usa
+    /// ninguna hasta que quede una sola. Nunca devuelve la clave. `InvalidArgs` si la dirección no se puede usar,
     /// `Unavailable` si el llavero no responde.
     fn has_provider_key(&self, url: &str) -> Result<bool, Error>;
 }

@@ -78,7 +78,7 @@ crea el ítem.
 | Método | Qué hace |
 |---|---|
 | `SetProviderKey(s url, s key) → ()` | Guarda la clave de esa dirección en la colección por omisión del llavero, reemplazando la anterior. La dirección se normaliza como la de `vasak.conf` (con `/` final); un host remoto tiene que ser `https`. La clave se recorta y va de 1 a 4096 bytes sin caracteres de control. `InvalidArgs` si algo no vale; `Unavailable` si el llavero está bloqueado (no abre ningún diálogo) o no responde. La clave nunca vuelve en un error ni va al registro. |
-| `HasProviderKey(s url) → b` | Si hay una clave guardada para esa dirección (aunque el llavero esté bloqueado). Nunca devuelve la clave. |
+| `HasProviderKey(s url) → b` | Si hay una clave guardada para esa dirección (aunque el llavero esté bloqueado). Con más de una para la misma dirección da `false`, porque el servicio no usa ninguna. Nunca devuelve la clave. |
 
 La clave queda atada a esa dirección: si la configuración cambia de servidor, la
 clave de antes no viaja al nuevo.

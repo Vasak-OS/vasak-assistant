@@ -98,7 +98,10 @@ pub trait SecretSource: Send + Sync {
     /// o no responde. El error nunca lleva la clave.
     fn store_key<'a>(&'a self, url: &'a str, key: &'a ApiKey) -> BoxFuture<'a, Result<(), Error>>;
 
-    /// Si hay algún ítem para esa dirección, bloqueado o no.
+    /// Si hay una clave para esa dirección con el mismo criterio que
+    /// [`Self::api_key`]: un solo ítem desbloqueado, o ninguno desbloqueado y
+    /// alguno bloqueado (está, pero hay que desbloquear el llavero). Con más de
+    /// un ítem desbloqueado la lectura no usa ninguno, así que acá da `false`.
     fn has_key<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<bool, Error>>;
 }
 
@@ -139,7 +142,7 @@ impl SecretSource for SecretService {
             let (unlocked, locked) = self.search(url).await.map_err(|error| {
                 Error::Unavailable(format!("No se pudo consultar el llavero: {error}"))
             })?;
-            Ok(!unlocked.is_empty() || !locked.is_empty())
+            Ok(has_usable_item(&unlocked, &locked))
         })
     }
 }
@@ -200,6 +203,7 @@ impl SecretService {
         // Más de un ítem con los mismos atributos: cualquiera de la sesión puede
         // crear uno, así que otro proceso pudo haber plantado su clave al lado de
         // la verdadera. No se adivina cuál es cuál: no se usa ninguna.
+        // El mismo criterio que `has_usable_item`, que usa `has_key`.
         if unlocked.len() > 1 {
             tracing::warn!(
                 "hay {} claves en el llavero para la misma dirección; no se usa ninguna hasta que quede una sola",
@@ -292,7 +296,16 @@ impl SecretService {
                     .deserialize::<(OwnedObjectPath, OwnedObjectPath)>()
             });
         self.close_session(&session).await;
-        let (_, prompt) = created?;
+        // vasak-keyring contesta `IsLocked` en vez de un prompt cuando la
+        // colección se bloqueó entre la consulta y la escritura.
+        let (_, prompt) = match created {
+            Err(zbus::Error::MethodError(name, _, _))
+                if name.as_str() == "org.freedesktop.Secret.Error.IsLocked" =>
+            {
+                return Ok(Err(locked_error()));
+            }
+            created => created?,
+        };
         // Un prompt quiere decir que hace falta desbloquear (la colección se
         // bloqueó entre la consulta y la escritura). No se llama a `Prompt`.
         // shortcut: el objeto prompt queda sin `Dismiss`; el llavero lo descarta
@@ -301,6 +314,17 @@ impl SecretService {
             return Ok(Err(locked_error()));
         }
         Ok(Ok(()))
+    }
+}
+
+/// El criterio de qué ítems sirven, el mismo para leer la clave y para decir
+/// si hay una: más de uno desbloqueado no sirve (otro proceso pudo plantar el
+/// suyo al lado del verdadero y no se adivina cuál es cuál).
+fn has_usable_item(unlocked: &[OwnedObjectPath], locked: &[OwnedObjectPath]) -> bool {
+    match unlocked.len() {
+        0 => !locked.is_empty(),
+        1 => true,
+        _ => false,
     }
 }
 
