@@ -440,3 +440,20 @@ impl Drop for PrivateBus {
         let _ = self.child.wait();
     }
 }
+
+impl PrivateBus {
+    /// Para las pruebas que necesitan un bus: `None` (y la prueba se salta)
+    /// sólo fuera del CI. En el CI, un `dbus-daemon` ausente es un fallo y no
+    /// un salto en verde.
+    pub fn start_or_skip() -> Option<Self> {
+        let bus = Self::start();
+        if bus.is_none() {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "en el CI tiene que haber dbus-daemon: la prueba del bus privado no puede saltarse"
+            );
+            eprintln!("sin dbus-daemon: se salta la prueba del bus privado");
+        }
+        bus
+    }
+}

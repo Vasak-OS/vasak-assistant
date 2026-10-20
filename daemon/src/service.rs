@@ -271,7 +271,8 @@ mod tests {
     use crate::backend::RejectedBackend;
     use crate::test_support::{model_info, p2p_pair, FakeBackend};
     use vasak_assistant_protocol::{
-        AssistantProxy, Role, DOMAIN_MAIL, DOMAIN_MEMORY, MAX_CONVERSATIONS_PER_OWNER, SERVICE_PATH,
+        AssistantProxy, Role, DOMAIN_MAIL, DOMAIN_MEMORY, MAX_CONVERSATIONS,
+        MAX_CONVERSATIONS_PER_OWNER, SERVICE_PATH,
     };
     use zbus::{connection, Connection, DBusError};
 
@@ -736,7 +737,7 @@ mod tests {
         AssistantProxy<'static>,
         AssistantProxy<'static>,
     )> {
-        let bus = crate::test_support::PrivateBus::start()?;
+        let bus = crate::test_support::PrivateBus::start_or_skip()?;
         let server = connection::Builder::address(bus.address.as_str())
             .unwrap()
             .serve_at(SERVICE_PATH, service)
@@ -762,7 +763,6 @@ mod tests {
         let Some((_bus, _server, a, b)) =
             two_clients(service(FakeBackend::replying("respuesta"), false)).await
         else {
-            eprintln!("sin dbus-daemon: se salta la prueba del bus privado");
             return;
         };
         let id = a.new_conversation().await.unwrap();
@@ -795,7 +795,6 @@ mod tests {
         let Some((_bus, _server, a, b)) =
             two_clients(service(FakeBackend::replying("x"), false)).await
         else {
-            eprintln!("sin dbus-daemon: se salta la prueba del bus privado");
             return;
         };
         for _ in 0..MAX_CONVERSATIONS_PER_OWNER {
@@ -806,5 +805,60 @@ mod tests {
             Err(Error::LimitExceeded(_))
         ));
         assert!(b.new_conversation().await.is_ok());
+    }
+
+    // ── Conversación huérfana: el dueño se fue antes del create ──────────────
+
+    fn settle(
+        conversations: &Mutex<Conversations>,
+        still_connected: zbus::Result<bool>,
+    ) -> (String, Result<String, Error>) {
+        let id = conversations.lock().create(":1.7").unwrap();
+        let result = settle_new_conversation(conversations, ":1.7", id.clone(), still_connected);
+        (id, result)
+    }
+
+    #[test]
+    fn si_el_dueno_sigue_conectado_la_conversacion_se_conserva_y_se_devuelve_el_id() {
+        let conversations = Mutex::new(Conversations::default());
+        let (id, result) = settle(&conversations, Ok(true));
+        assert_eq!(result.unwrap(), id);
+        assert_eq!(conversations.lock().count_for(":1.7"), 1);
+    }
+
+    #[test]
+    fn si_el_dueno_ya_se_fue_se_liberan_sus_conversaciones_y_se_contesta_not_found() {
+        let conversations = Mutex::new(Conversations::default());
+        let ajena = conversations.lock().create(":1.8").unwrap();
+        conversations.lock().create(":1.7").unwrap();
+
+        let (_, result) = settle(&conversations, Ok(false));
+
+        assert!(matches!(result, Err(Error::NotFound(_))));
+        let conversations = conversations.lock();
+        assert_eq!(conversations.count_for(":1.7"), 0);
+        // La de otro dueño no se toca.
+        assert!(conversations.history(":1.8", &ajena).is_ok());
+    }
+
+    #[test]
+    fn repetido_muchas_veces_el_dueno_que_se_va_no_agota_las_plazas() {
+        let conversations = Mutex::new(Conversations::default());
+        for i in 0..MAX_CONVERSATIONS * 3 {
+            let owner = format!(":1.{}", 100 + i);
+            let id = conversations.lock().create(&owner).unwrap();
+            let result = settle_new_conversation(&conversations, &owner, id, Ok(false));
+            assert!(matches!(result, Err(Error::NotFound(_))));
+        }
+        assert_eq!(conversations.lock().len(), 0);
+        assert!(conversations.lock().create(":1.1").is_ok());
+    }
+
+    #[test]
+    fn si_no_se_pudo_preguntar_al_bus_se_conserva_la_conversacion_y_se_devuelve_el_id() {
+        let conversations = Mutex::new(Conversations::default());
+        let (id, result) = settle(&conversations, Err(zbus::Error::Failure("sin bus".into())));
+        assert_eq!(result.unwrap(), id);
+        assert_eq!(conversations.lock().count_for(":1.7"), 1);
     }
 }
