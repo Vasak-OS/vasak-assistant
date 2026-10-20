@@ -1377,7 +1377,7 @@ mod memory_tests {
     #[tokio::test]
     async fn un_recuerdo_con_un_secreto_o_un_dato_de_la_persona_no_se_guarda() {
         const EXTRACTION: &str = r#"{"items":[
-            {"kind":"preference","text":"Usa la clave sk-abcdefgh12345678"},
+            {"kind":"preference","text":"Usa la clave sk-abcdefghijklmnop"},
             {"kind":"habit","text":"Su correo es ana@ejemplo.com"},
             {"kind":"habit","text":"Guarda todo en /home/ana/docs"},
             {"kind":"habit","text":"Nació el 12/03/1990"},
@@ -1391,7 +1391,7 @@ mod memory_tests {
         world.until_remembered("Madruga siempre").await;
 
         let notes = world.service.memory.recall("zzz", true).await.unwrap();
-        for forbidden in ["sk-", "ana@", "/home", "1990", "4111"] {
+        for forbidden in ["sk-", "clave", "ana@", "/home", "1990", "4111"] {
             assert!(!notes.contains(forbidden), "{forbidden}: {notes}");
         }
         world.service.memory.close().await;

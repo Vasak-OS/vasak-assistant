@@ -530,7 +530,7 @@ mod tests {
     fn un_secreto_o_un_dato_de_la_persona_en_un_recuerdo_lo_descarta_y_deja_los_demas() {
         let extraction = parse(
             r#"[
-              {"kind":"preference","text":"Usa la clave sk-abcdefgh12345678"},
+              {"kind":"preference","text":"Usa la clave sk-abcdefghijklmnop"},
               {"kind":"habit","text":"Su correo es ana@ejemplo.com"},
               {"kind":"habit","text":"Guarda todo en /home/ana/docs"},
               {"kind":"habit","text":"Nació el 12/03/1990"},
