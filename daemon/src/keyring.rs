@@ -100,8 +100,8 @@ pub trait SecretSource: Send + Sync {
 
     /// Si hay una clave para esa dirección con el mismo criterio que
     /// [`Self::api_key`]: un solo ítem desbloqueado, o ninguno desbloqueado y
-    /// alguno bloqueado (está, pero hay que desbloquear el llavero). Con más de
-    /// un ítem desbloqueado la lectura no usa ninguno, así que acá da `false`.
+    /// uno solo bloqueado (está, pero hay que desbloquear el llavero). Con más
+    /// de uno la lectura no usa ninguno, así que acá da `false`.
     fn has_key<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<bool, Error>>;
 }
 
@@ -212,7 +212,13 @@ impl SecretService {
             return Ok(None);
         }
         let Some(item) = unlocked.into_iter().next() else {
-            if !locked.is_empty() {
+            if locked.len() > 1 {
+                // Desbloquear no alcanzaría: con más de una tampoco se usaría.
+                tracing::warn!(
+                    "hay {} claves en el llavero para la misma dirección; no se usa ninguna hasta que quede una sola",
+                    locked.len()
+                );
+            } else if !locked.is_empty() {
                 // Desbloquearlo pediría un diálogo; eso es de quien usa el
                 // sistema, no de un servicio en segundo plano.
                 tracing::info!("la clave del proveedor está en un llavero bloqueado");
@@ -319,10 +325,12 @@ impl SecretService {
 
 /// El criterio de qué ítems sirven, el mismo para leer la clave y para decir
 /// si hay una: más de uno desbloqueado no sirve (otro proceso pudo plantar el
-/// suyo al lado del verdadero y no se adivina cuál es cuál).
+/// suyo al lado del verdadero y no se adivina cuál es cuál). Sin ninguno
+/// desbloqueado, tiene que haber exactamente uno bloqueado: con más, al
+/// desbloquear la lectura tampoco usaría ninguno.
 fn has_usable_item(unlocked: &[OwnedObjectPath], locked: &[OwnedObjectPath]) -> bool {
     match unlocked.len() {
-        0 => !locked.is_empty(),
+        0 => locked.len() == 1,
         1 => true,
         _ => false,
     }
