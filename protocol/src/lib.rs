@@ -281,6 +281,8 @@ pub trait Assistant {
     ///   ningún diálogo de desbloqueo: el motivo dice qué hacer.
     ///
     /// La clave nunca vuelve en un error ni va al registro.
+    ///
+    /// `AccessDenied` si quien llama es una aplicación confinada (AppArmor).
     fn set_provider_key(&self, url: &str, key: &str) -> Result<(), Error>;
 
     /// Si hay una clave guardada en el llavero para `url` (normalizada igual
@@ -288,6 +290,7 @@ pub trait Assistant {
     /// Si hay más de una para la misma dirección da `false`: el servicio no usa
     /// ninguna hasta que quede una sola. Nunca devuelve la clave. `InvalidArgs` si la dirección no se puede usar,
     /// `Unavailable` si el llavero no responde.
+    /// `AccessDenied` si quien llama es una aplicación confinada (AppArmor).
     fn has_provider_key(&self, url: &str) -> Result<bool, Error>;
 
     /// Cómo está la memoria. Nunca falla (salvo el bus): cualquier problema
@@ -305,12 +308,15 @@ pub trait Assistant {
     ///   encendida y abierta, no hace nada.
     /// - Apagar **no borra nada**: deja de usarla y de escribirla; los archivos
     ///   y la llave quedan.
+    ///
+    /// `AccessDenied` si quien llama es una aplicación confinada (AppArmor).
     fn set_memory_enabled(&self, enabled: bool) -> Result<(), Error>;
 
     /// Borra la memoria: primero la llave del llavero y después los archivos.
     /// Si estaba encendida, la recrea vacía con una llave nueva. `Unavailable`
     /// si el llavero está bloqueado (entonces no se toca nada) o no responde.
     /// Es la salida cuando la llave falta o no abre la base.
+    /// `AccessDenied` si quien llama es una aplicación confinada (AppArmor).
     fn clear_memory(&self) -> Result<(), Error>;
 }
 
