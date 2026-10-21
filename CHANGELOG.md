@@ -35,8 +35,20 @@ proveedor en el esquema protegido del llavero.
 - **`daemon/keyring`** — busca y guarda por un mapa de atributos y suma el
   borrado de ítems. La clave del proveedor y la llave de la memoria se buscan y
   se crean con el mismo mapa, con `xdg:schema=ar.net.vasak.os.Assistant`
-  (protegido por vasak-keyring#55) y `purpose`. Una clave del proveedor de una
-  versión anterior, sin esquema, se migra al leerla si es la única.
+  (protegido por vasak-keyring#55) y `purpose`. No hay migración: un ítem sin
+  el esquema no se cuenta ni se usa.
+- **`daemon/service`** — puerta de AppArmor (#7): un llamador confinado recibe
+  `AccessDenied` en `SetMemoryEnabled`, `ClearMemory`, `SetProviderKey` y
+  `HasProviderKey`, y chatea sin memoria. `protocol` suma
+  `Error::AccessDenied`.
+- **`daemon/memory`, endurecimiento** — no se abre una base sin cifrar ni con
+  restos de una migración de Grafeo; las notas se filtran contra inyección
+  (NFKC, caracteres de formato, marcadores de rol, comillas, credenciales) y
+  van escapadas entre delimitadores con nonce; la ventana de extracción
+  descarta mensajes con secretos o datos y el mensaje de la persona tiene
+  prioridad en el presupuesto; una época descarta lo extraído si la memoria
+  se encendió, apagó o borró en el medio, y no se aprende de lo anterior al
+  último encendido.
 - El binario se compila con `lto = "fat"` y `codegen-units = 1`.
 - **`packaging`** — la unidad tiene `StateDirectory=vasak-assistant` (modo
   0700), `UMask=0077` y `MemoryMax=512M`.

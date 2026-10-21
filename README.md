@@ -74,18 +74,17 @@ llavero, le pasa la clave al servicio, que es quien crea el ítem.
 El esquema protegido es la defensa: `vasak-keyring` deja leer, crear y
 reemplazar esos ítems sólo a `/usr/bin/vasak-assistant` (vasak-keyring#55), y
 el servicio busca con el mismo esquema, así que un ítem común plantado por otro
-programa no se usa. Por eso, con esa restricción activa, `secret-tool` ya no
-puede guardar la clave. Antes de eso, el equivalente a mano es:
+programa no se usa. Por eso `secret-tool` no puede guardar la clave: se guarda
+desde Configuración. No hay migración: un ítem sin el esquema, aunque tenga los
+mismos `service` y `url`, no se cuenta ni se usa.
 
-```bash
-secret-tool store --label='Lince' service ar.net.vasak.os.Assistant url https://api.openai.com/v1/ purpose provider xdg:schema ar.net.vasak.os.Assistant
-```
-
-Una clave guardada por una versión anterior (sin `purpose` ni `xdg:schema`) se
-pasa sola al ítem protegido la primera vez que se la lee, si es la única para
-esa dirección; con más de una no se usa ninguna (el registro lo dice) y hay que
-volver a guardarla desde Configuración. Con el llavero bloqueado no se migra ni
-se abre ningún diálogo.
+**Aplicaciones confinadas.** La memoria y las claves son de la persona, no de
+cada aplicación. Si quien llama está confinado por AppArmor (el bus informa su
+`LinuxSecurityLabel` y no es `unconfined`), `SetProviderKey`, `HasProviderKey`,
+`SetMemoryEnabled` y `ClearMemory` contestan
+`ar.net.vasak.os.Assistant.Error.AccessDenied`, y su `Chat` va sin memoria: no
+se le pasan notas ni se aprende de lo que dice. `MemoryStatus` y
+`Capabilities` siguen abiertos. Sin AppArmor no hay etiqueta y se deja pasar.
 
 | Método | Qué hace |
 |---|---|
@@ -105,6 +104,11 @@ systemd, `$STATE_DIRECTORY`). No va en el almacén de cuentas.
 - **Viene apagada.** Existe sólo desde que la persona la enciende; no hay nada
   que tocar en `vasak.conf`. Encendida o no lo dice el archivo `enabled` al lado
   de `memory/`.
+- **Sólo cifrada.** Antes de abrir la base se comprueba su cabecera: tiene
+  que ser una base de Grafeo 0.6 marcada como cifrada, y no puede haber restos
+  de una migración de Grafeo (`lince.grafeo.pre-0.6`, `lince.grafeo.migrating`).
+  Una base sin cifrar o de otra versión no se abre ni se migra: queda no
+  disponible, y la salida es `ClearMemory`.
 - **Cifrada.** El archivo y su registro de escritura (WAL) van con AES-256-GCM,
   con una llave de 32 bytes que genera el servicio la primera vez que se
   enciende y guarda en el llavero (atributos `service=ar.net.vasak.os.Assistant`,
@@ -128,6 +132,13 @@ systemd, `$STATE_DIRECTORY`). No va en el almacén de cuentas.
 - **Cómo lo usa.** Antes de cada mensaje, las notas que vienen al caso (hasta 4
   KiB) van al modelo como contexto de ese turno, marcadas como datos y no como
   instrucciones. Nunca quedan en el historial ni en `History`.
+- **Las notas son datos.** Cada nota se filtra al guardarla (sin caracteres de
+  formato ni de uso privado, sin marcadores de rol o de instrucciones, sin
+  comillas ni palabras de credenciales) y al usarla va escapada como texto JSON
+  entre delimitadores `<notas-…>` con un valor nuevo en cada pedido.
+- **Sólo desde que se encendió.** No se aprende de lo dicho antes de encender
+  la memoria ni de antes de borrarla, y lo que se estaba extrayendo cuando se
+  apagó o se borró se descarta.
 - **Sólo lo suyo.** No guarda correo, calendario, contactos, archivos, cuentas
   ni claves: eso se lee de su servicio en el momento y no se persiste.
 - **Con un proveedor remoto**, la memoria no se lee ni se escribe salvo que la
