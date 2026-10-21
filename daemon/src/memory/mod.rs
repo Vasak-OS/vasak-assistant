@@ -356,17 +356,7 @@ impl Memory {
             Err(_) => return Err(REASON_NO_KEYRING),
         };
         let path = dir.join(DB_FILE);
-        let opened = blocking(move || {
-            // Grafeo crearía una base nueva donde no hay archivo: al abrir, eso
-            // no se hace nunca.
-            if !path.is_file() {
-                return Err(format!("falta {}", path.display()));
-            }
-            let db = GrafeoDB::with_config(config(&path, &key)).map_err(text)?;
-            schema::ensure_indexes(&db).map_err(text)?;
-            Ok(db)
-        })
-        .await;
+        let opened = blocking(move || open_existing(&path, &key)).await;
         match opened {
             Ok(opened) => {
                 *db = Some(Arc::new(opened));
@@ -471,6 +461,52 @@ fn config(path: &Path, key: &[u8; MEMORY_KEY_BYTES]) -> Config {
     Config::persistent(path)
         .with_encryption(EncryptionConfig::new(Arc::new(KeyChain::new(*key))))
         .with_memory_limit(MEMORY_LIMIT)
+}
+
+/// Abre una base que ya existe. Nunca crea nada: Grafeo crearía una base
+/// nueva donde no hay archivo, y migraría y adoptaría una base 0.5.x sin
+/// cifrar. Antes de abrir se exige la cabecera de una base 0.6 cifrada
+/// ([`is_encrypted_header`]) y que no haya restos de una migración de Grafeo.
+fn open_existing(path: &Path, key: &[u8; MEMORY_KEY_BYTES]) -> Result<GrafeoDB, String> {
+    for leftover in ["pre-0.6", "migrating"] {
+        let leftover = path.with_extension(format!("grafeo.{leftover}"));
+        if std::fs::symlink_metadata(&leftover).is_ok() {
+            return Err(format!(
+                "hay restos de una migración: {}",
+                leftover.display()
+            ));
+        }
+    }
+    let mut header = [0u8; HEADER_PREFIX_BYTES];
+    std::fs::File::open(path)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header))
+        .map_err(|error| format!("no se pudo leer {}: {error}", path.display()))?;
+    if !is_encrypted_header(&header) {
+        return Err(format!("{} no es una base 0.6 cifrada", path.display()));
+    }
+    let db = GrafeoDB::with_config(config(path, key)).map_err(text)?;
+    schema::ensure_indexes(&db).map_err(text)?;
+    Ok(db)
+}
+
+/// Cuántos bytes de la cabecera de `.grafeo` hacen falta para decidir.
+pub const HEADER_PREFIX_BYTES: usize = 16;
+
+/// Si esos bytes son el principio de la cabecera de un archivo de Grafeo 0.6
+/// cifrado. El formato (`grafeo-storage` 0.6.0-beta.1, `file/v3/header.rs`),
+/// en little-endian: la marca `GRAF` en el byte 0, la versión del formato
+/// `u32` (3) en el 4, el tamaño de página en el 8 y las banderas `u32` en el
+/// 12, donde el bit 0 dice que las secciones están cifradas.
+pub fn is_encrypted_header(bytes: &[u8]) -> bool {
+    let u32_at = |at: usize| {
+        bytes
+            .get(at..at + 4)
+            .and_then(|b| <[u8; 4]>::try_from(b).ok())
+            .map(u32::from_le_bytes)
+    };
+    bytes.get(0..4) == Some(b"GRAF".as_slice())
+        && u32_at(4) == Some(3)
+        && u32_at(12).is_some_and(|flags| flags & 1 == 1)
 }
 
 /// Crea la base en `memory.tmp/`, la cierra, la renombra a `memory/` y la
