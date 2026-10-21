@@ -52,8 +52,11 @@ static BASE64: LazyLock<Regex> = LazyLock::new(|| regex(r"[A-Za-z0-9+/_-]{24,}={
 /// Candidatos a número de tarjeta: 13 a 19 dígitos con espacios o guiones.
 static CARD: LazyLock<Regex> = LazyLock::new(|| regex(r"\b\d(?:[ -]?\d){12,18}\b"));
 
-/// Si el texto tiene algo que parece un secreto.
+/// Si el texto tiene algo que parece un secreto. Se mira en NFKC, así los
+/// dígitos y letras de ancho completo cuentan como los comunes (también para
+/// Luhn).
 pub fn contains_secret(text: &str) -> bool {
+    let text = &nfkc(text);
     SECRET.is_match(text)
         || BASE64.find_iter(text).any(|found| {
             let found = found.as_str();
@@ -117,10 +120,96 @@ static PHONE: LazyLock<Regex> = LazyLock::new(|| regex(r"\+?\d[\d\s().-]{6,}\d")
 
 /// Si el texto tiene datos de la persona que la memoria no guarda.
 pub fn is_user_data(text: &str) -> bool {
+    let text = &nfkc(text);
     USER_DATA.is_match(text)
         || PHONE
             .find_iter(text)
             .any(|found| found.as_str().bytes().filter(u8::is_ascii_digit).count() >= 8)
+}
+
+/// El texto en NFKC: compatibilidad (ancho completo, ligaduras, formas
+/// estilizadas) llevada a la forma común.
+pub fn nfkc(text: &str) -> String {
+    text.nfkc().collect()
+}
+
+/// Caracteres que no tienen nada que hacer en una nota y sirven para esconder
+/// o reordenar texto: las categorías Unicode Cf (formato, incluidos los de
+/// dirección), Zl y Zp (separadores de línea y de párrafo), Co (uso privado) y
+/// los de control.
+pub fn has_forbidden_chars(text: &str) -> bool {
+    text.chars()
+        .any(|c| c.is_control() || is_format_or_private(c))
+}
+
+fn is_format_or_private(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        // Cf
+        0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x0890..=0x0891 | 0x08E2
+            | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F
+            | 0xFEFF | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F
+            // Zl y Zp
+            | 0x2028 | 0x2029
+            // Co
+            | 0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD
+    )
+}
+
+/// Marcadores de rol o de instrucciones, para que una nota no se lea como un
+/// mensaje del sistema o del asistente. Se buscan en minúsculas y sin tildes.
+const INJECTION_MARKERS: &[&str] = &[
+    "ignor",
+    "instrucci",
+    "sistema",
+    "system",
+    "prompt",
+    "regla",
+    "asistente:",
+    "assistant",
+    "user:",
+    "<|",
+    "[inst]",
+    "```",
+    "###",
+    "</",
+    "notas",
+];
+
+/// Si el texto trae marcadores de rol o de instrucciones.
+pub fn has_injection_markers(text: &str) -> bool {
+    let folded = normalize_terms(text);
+    INJECTION_MARKERS
+        .iter()
+        .any(|marker| folded.contains(marker))
+}
+
+/// Palabras que hablan de credenciales o de cuentas: una nota que las nombra
+/// se descarta aunque no traiga el valor.
+const CREDENTIAL_WORDS: &[&str] = &[
+    "contrasena",
+    "contrasenas",
+    "clave",
+    "claves",
+    "password",
+    "passwords",
+    "pin",
+    "pines",
+    "codigo",
+    "codigos",
+    "token",
+    "tokens",
+    "cvv",
+    "cbu",
+    "cvu",
+];
+
+/// Si el texto nombra una credencial o una cuenta (palabra entera).
+pub fn mentions_credentials(text: &str) -> bool {
+    normalize_terms(text)
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| CREDENTIAL_WORDS.contains(&word))
 }
 
 /// Los términos con los que se indexa y se busca: descompuesto (NFD), sin

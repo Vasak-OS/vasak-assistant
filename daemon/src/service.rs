@@ -1454,7 +1454,7 @@ mod memory_tests {
         assert_eq!(first.role, Role::System);
         assert!(first
             .content
-            .contains("Conversación anterior: Hablaron de plantas"));
+            .contains(r#"Conversación anterior: "Hablaron de plantas"#));
     }
 
     #[tokio::test]

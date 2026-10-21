@@ -11,7 +11,10 @@ use serde::Deserialize;
 use serde_json::json;
 use vasak_assistant_protocol::{Message, Role};
 
-use super::filter::{contains_secret, is_user_data, normalize_terms};
+use super::filter::{
+    contains_secret, has_forbidden_chars, has_injection_markers, is_user_data,
+    mentions_credentials, nfkc, normalize_terms,
+};
 use super::schema::{MemoryKind, MAX_ABOUT, MAX_PHRASE_BYTES};
 
 /// Cuántos recuerdos se aceptan de una extracción.
@@ -85,39 +88,94 @@ pub fn worth_learning(user: &str, reply: &str, turn_index: usize) -> Option<Gate
     (gate.items || gate.summary).then_some(gate)
 }
 
-/// Los mensajes del pedido de extracción. `exchange` son los mensajes de la
-/// conversación (sin el bloque de la memoria); entra lo más reciente que quepa
-/// en [`EXTRACTION_INPUT_BYTES`]. Con `gate.summary` falso, sólo el último
-/// intercambio.
+/// Un mensaje de la persona más largo que esto, en la ventana, impide el
+/// resumen (es un pegado, no una charla).
+pub const MAX_SUMMARY_USER_BYTES: usize = 1024;
+/// Lo mismo con las líneas: con esta cantidad o más, no se resume.
+pub const MAX_SUMMARY_USER_LINES: usize = 5;
+
+/// La ventana de la extracción: los mensajes de `exchange` sin el bloque de la
+/// memoria (`system`) y sin los que tengan un secreto o datos de la persona,
+/// con la puerta ajustada. Si un mensaje de la persona dio positivo, o alguno
+/// pasa de [`MAX_SUMMARY_USER_BYTES`] o tiene [`MAX_SUMMARY_USER_LINES`] líneas
+/// o más, no se resume; si se descartó el último mensaje de la persona, no se
+/// extraen recuerdos. `None` si no queda nada que pedir.
+pub fn extraction_window(exchange: &[Message], gate: Gate) -> Option<(Vec<Message>, Gate)> {
+    let last_user = exchange.iter().rposition(|m| m.role == Role::User);
+    let mut summary = gate.summary;
+    let mut last_user_kept = false;
+    let mut window = Vec::new();
+    for (index, message) in exchange.iter().enumerate() {
+        if message.role == Role::System {
+            continue;
+        }
+        let tainted = contains_secret(&message.content) || is_user_data(&message.content);
+        if message.role == Role::User
+            && (tainted
+                || message.content.len() > MAX_SUMMARY_USER_BYTES
+                || message.content.lines().count() >= MAX_SUMMARY_USER_LINES)
+        {
+            summary = false;
+        }
+        if tainted {
+            continue;
+        }
+        last_user_kept |= Some(index) == last_user;
+        window.push(message.clone());
+    }
+    let gate = Gate {
+        items: gate.items && last_user_kept,
+        summary,
+    };
+    (gate.items || gate.summary).then_some((window, gate))
+}
+
+/// Los mensajes del pedido de extracción, sobre la ventana de
+/// [`extraction_window`]. Sin resumen va sólo el último intercambio; con
+/// resumen, lo más reciente que quepa. El presupuesto de
+/// [`EXTRACTION_INPUT_BYTES`] se reparte en orden: primero el último mensaje
+/// de la persona (es el que trae la señal), después la respuesta y al final el
+/// resto de la conversación, de lo más nuevo a lo más viejo.
 pub fn extraction_request(exchange: &[Message], gate: Gate) -> Vec<Message> {
-    let wanted = if gate.summary { exchange.len() } else { 2 };
-    let mut picked: Vec<serde_json::Value> = Vec::new();
+    let (window, gate) = extraction_window(exchange, gate).unwrap_or((
+        Vec::new(),
+        Gate {
+            items: false,
+            summary: false,
+        },
+    ));
+    let last_user = window.iter().rposition(|m| m.role == Role::User);
+    let reply = last_user
+        .map(|index| index + 1)
+        .filter(|&index| index < window.len());
+    let mut order: Vec<usize> = last_user.into_iter().chain(reply).collect();
+    if gate.summary {
+        let rest: Vec<usize> = (0..window.len())
+            .rev()
+            .filter(|index| !order.contains(index))
+            .collect();
+        order.extend(rest);
+    }
+
+    let mut chosen: Vec<(usize, serde_json::Value)> = Vec::new();
     let mut used = 2; // los corchetes
-    for message in exchange
-        .iter()
-        .rev()
-        .filter(|message| message.role != Role::System)
-        .take(wanted)
-    {
+    for index in order {
+        let separator = usize::from(!chosen.is_empty());
+        let budget = EXTRACTION_INPUT_BYTES.saturating_sub(used + separator);
+        let message = &window[index];
         let who = if message.role == Role::User {
             "persona"
         } else {
             "asistente"
         };
-        let budget = EXTRACTION_INPUT_BYTES.saturating_sub(used + 32);
-        if budget < 16 {
-            break;
+        if let Some((item, length)) = fit(who, &message.content, budget) {
+            used += length + separator;
+            chosen.push((index, item));
         }
-        let item = json!({ who: truncate(&message.content, budget) });
-        used += item.to_string().len() + 1;
-        picked.push(item);
     }
-    picked.reverse();
-    let mut user = serde_json::Value::Array(picked).to_string();
-    // Los escapes de JSON pueden pasar el presupuesto por poco.
-    while user.len() > EXTRACTION_INPUT_BYTES {
-        user = truncate(&user, EXTRACTION_INPUT_BYTES).to_owned();
-    }
+    chosen.sort_by_key(|(index, _)| *index);
+    let user =
+        serde_json::Value::Array(chosen.into_iter().map(|(_, item)| item).collect()).to_string();
     vec![
         Message {
             role: Role::System,
@@ -128,6 +186,27 @@ pub fn extraction_request(exchange: &[Message], gate: Gate) -> Vec<Message> {
             content: user,
         },
     ]
+}
+
+/// `{who: content}` recortado para que su JSON (con los escapes) no pase de
+/// `budget` bytes. `None` si no entra nada útil.
+fn fit(who: &str, content: &str, budget: usize) -> Option<(serde_json::Value, usize)> {
+    const MIN_USEFUL: usize = 16;
+    if budget < MIN_USEFUL {
+        return None;
+    }
+    let mut take = budget;
+    loop {
+        let item = json!({ who: truncate(content, take) });
+        let length = item.to_string().len();
+        if length <= budget {
+            return Some((item, length));
+        }
+        take = take.checked_sub((length - budget).max(1))?;
+        if take == 0 {
+            return None;
+        }
+    }
 }
 
 fn system_prompt(gate: Gate) -> String {
@@ -233,13 +312,21 @@ fn validate_item(raw: RawItem) -> Option<Item> {
     })
 }
 
-/// Recortado a `max` bytes en un límite de carácter, sin caracteres de
-/// control, y que no tenga secretos ni datos de la persona. `None` si queda
-/// vacío o no pasa.
+/// Lo que puede entrar en una nota: en NFKC, sin las comillas `«»"“”` ni la
+/// comilla invertida, recortado a `max` bytes en un límite de carácter, y que
+/// no tenga caracteres de formato, de control o de uso privado, marcadores de
+/// rol o de instrucciones, palabras de credenciales, secretos ni datos de la
+/// persona. `None` si queda vacío o no pasa.
 fn clean(text: &str, max: usize) -> Option<String> {
+    let text: String = nfkc(text)
+        .chars()
+        .filter(|c| !matches!(c, '«' | '»' | '"' | '“' | '”' | '`'))
+        .collect();
     let text = truncate(text.trim(), max).trim();
     let valid = !text.is_empty()
-        && !text.chars().any(char::is_control)
+        && !has_forbidden_chars(text)
+        && !has_injection_markers(text)
+        && !mentions_credentials(text)
         && !contains_secret(text)
         && !is_user_data(text);
     valid.then(|| text.to_owned())
@@ -368,11 +455,9 @@ mod tests {
         assert!(json[1].get("asistente").is_some());
     }
 
-    // Falla hoy: la respuesta larga del asistente (hasta 32 KiB) se come todo
-    // el presupuesto de 4 KiB y el mensaje de la persona, que es el que trae la
-    // señal, queda afuera del pedido. Se quita el `ignore` al arreglarlo.
+    // Una respuesta larga del asistente (hasta 32 KiB) se comía el presupuesto
+    // de 4 KiB y dejaba afuera el mensaje de la persona.
     #[test]
-    #[ignore = "bug: una respuesta de más de 4 KiB deja afuera el mensaje de la persona"]
     fn una_respuesta_larga_del_asistente_no_deja_afuera_lo_que_dijo_la_persona() {
         let exchange = vec![
             message(Role::User, "prefiero respuestas cortas"),
