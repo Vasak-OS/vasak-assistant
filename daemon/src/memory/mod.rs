@@ -50,11 +50,13 @@
 //!   borrarla. La base se abre la primera vez que alguien la necesita, así un
 //!   llavero que se desbloquea después alcanza.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt::Display;
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use grafeo::{Config, EncryptionConfig, GrafeoDB, KeyChain};
@@ -126,7 +128,17 @@ pub struct Memory {
     /// Una sola extracción a la vez, con `try_acquire`: si hay una en curso,
     /// el turno no se aprende. Propio, aparte de los permisos del chat.
     learning: Semaphore,
+    /// La época: sube con cada `set_enabled` y cada `clear`, bajo el candado.
+    /// Una extracción lanzada en una época no se guarda en otra.
+    epoch: AtomicU64,
+    /// Por conversación, desde qué mensaje se puede aprender en la época
+    /// actual: lo dicho antes de encender (o de borrar) no se aprende.
+    windows: parking_lot::Mutex<HashMap<String, (u64, usize)>>,
 }
+
+/// Cuántas conversaciones se recuerdan en `windows` antes de olvidar las de
+/// épocas viejas (y, si no alcanza, todas: olvidar sólo achica la ventana).
+const MAX_TRACKED_CONVERSATIONS: usize = 256;
 
 impl Memory {
     pub fn new(dir: Option<PathBuf>, secrets: Arc<dyn SecretSource>) -> Self {
@@ -136,6 +148,8 @@ impl Memory {
             db: Mutex::new(None),
             remote_blocked: false,
             learning: Semaphore::new(1),
+            epoch: AtomicU64::new(0),
+            windows: parking_lot::Mutex::default(),
         }
     }
 
@@ -230,6 +244,12 @@ impl Memory {
         conversation_id: &str,
         conversation: Vec<Message>,
     ) {
+        let epoch = self.epoch.load(Ordering::SeqCst);
+        let Some(current) = conversation.iter().rposition(|m| m.role == Role::User) else {
+            return;
+        };
+        let start = self.window_start(conversation_id, epoch, current);
+        let conversation = conversation[start..].to_vec();
         let user_turns = conversation
             .iter()
             .filter(|message| message.role == Role::User)
@@ -265,7 +285,7 @@ impl Memory {
             if extraction.items.is_empty() && extraction.summary.is_none() {
                 return;
             }
-            if let Err(reason) = memory.store(extraction, &conversation_id).await {
+            if let Err(reason) = memory.store_at(extraction, &conversation_id, epoch).await {
                 tracing::info!("no se guardaron los recuerdos: {reason}");
             }
         });
@@ -274,11 +294,56 @@ impl Memory {
     /// Guarda lo extraído, bajo el candado y volviendo a comprobar que la
     /// memoria siga encendida y permitida.
     pub async fn store(&self, extraction: Extraction, conversation_id: &str) -> Result<(), String> {
+        let epoch = self.epoch.load(Ordering::SeqCst);
+        self.store_at(extraction, conversation_id, epoch).await
+    }
+
+    /// [`Self::store`] de una extracción lanzada en la época `epoch`: si desde
+    /// entonces se encendió, se apagó o se borró la memoria, se descarta.
+    pub async fn store_at(
+        &self,
+        extraction: Extraction,
+        conversation_id: &str,
+        epoch: u64,
+    ) -> Result<(), String> {
         let dir = self.dir.as_ref().ok_or(REASON_NO_PLACE)?;
         let mut guard = self.db.lock().await;
+        if self.epoch.load(Ordering::SeqCst) != epoch {
+            return Err("la memoria cambió mientras se extraían los recuerdos".into());
+        }
         let db = self.usable(dir, &mut guard).await?;
         let (dir, conversation_id) = (dir.clone(), conversation_id.to_owned());
         blocking(move || write(&db, &dir, &extraction, &conversation_id).map_err(text)).await
+    }
+
+    /// La época actual (sube con cada encender, apagar y borrar). Para las
+    /// pruebas de `store_at`.
+    #[cfg(test)]
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// Desde qué mensaje de la conversación se puede aprender en `epoch`. La
+    /// primera vez que se ve la conversación en una época, es el turno actual
+    /// (`current`): lo anterior se dijo con la memoria apagada o antes de
+    /// borrarla.
+    fn window_start(&self, conversation_id: &str, epoch: u64, current: usize) -> usize {
+        let mut windows = self.windows.lock();
+        if windows.len() >= MAX_TRACKED_CONVERSATIONS {
+            windows.retain(|_, (seen, _)| *seen == epoch);
+            if windows.len() >= MAX_TRACKED_CONVERSATIONS {
+                windows.clear();
+            }
+        }
+        let entry = windows
+            .entry(conversation_id.to_owned())
+            .or_insert((epoch, current));
+        if entry.0 != epoch {
+            *entry = (epoch, current);
+        }
+        // El historial recorta lo más viejo: el índice guardado nunca pasa el
+        // turno actual.
+        entry.1.min(current)
     }
 
     /// Cierra la base si está abierta (vuelca el WAL al archivo). Se vuelve a
@@ -298,6 +363,7 @@ impl Memory {
             };
         };
         let mut db = self.db.lock().await;
+        self.epoch.fetch_add(1, Ordering::SeqCst);
         if !enabled {
             // Apagar no borra nada: deja de usarla y de escribirla.
             close(db.take()).await;
@@ -320,6 +386,7 @@ impl Memory {
             return Ok(());
         };
         let mut db = self.db.lock().await;
+        self.epoch.fetch_add(1, Ordering::SeqCst);
         if self.secrets.is_locked().await? {
             return Err(locked());
         }
