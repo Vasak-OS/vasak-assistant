@@ -382,6 +382,56 @@ impl SecretSource for FixedKey {
     }
 }
 
+// ── Etiqueta de AppArmor de mentira ───────────────────────────────────────────
+
+/// Una etiqueta de seguridad fija para quien llame, en lugar de preguntarle al
+/// bus: `FixedLabel::of(b"vasak-appimage (enforce)\0")` es un llamador
+/// confinado, `FixedLabel::none()` uno sin AppArmor, y `FixedLabel::failing()`
+/// un bus que no contesta (se trata como confinado). Anota cuántas veces se
+/// preguntó.
+// Infraestructura para las pruebas de la puerta de AppArmor, que escribe qa.
+#[allow(dead_code)]
+pub struct FixedLabel {
+    pub label: Result<Option<Vec<u8>>, ()>,
+    pub asked: Mutex<usize>,
+}
+
+#[allow(dead_code)]
+impl FixedLabel {
+    pub fn of(label: &[u8]) -> Arc<Self> {
+        Arc::new(Self {
+            label: Ok(Some(label.to_vec())),
+            asked: Mutex::default(),
+        })
+    }
+
+    pub fn none() -> Arc<Self> {
+        Arc::new(Self {
+            label: Ok(None),
+            asked: Mutex::default(),
+        })
+    }
+
+    pub fn failing() -> Arc<Self> {
+        Arc::new(Self {
+            label: Err(()),
+            asked: Mutex::default(),
+        })
+    }
+}
+
+impl crate::service::CallerLabels for FixedLabel {
+    fn label<'a>(
+        &'a self,
+        _connection: &'a Connection,
+        _sender: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, ()>> {
+        *self.asked.lock() += 1;
+        let label = self.label.clone();
+        Box::pin(async move { label })
+    }
+}
+
 // ── Memoria de prueba ─────────────────────────────────────────────────────────
 
 /// Una memoria sin carpeta de estado: apagada y sin poder encenderse. La de

@@ -293,6 +293,8 @@ impl Memory {
 
     /// Guarda lo extraído, bajo el candado y volviendo a comprobar que la
     /// memoria siga encendida y permitida.
+    // Sin llamador en el servicio (aprende por `store_at`); lo usan las pruebas.
+    #[cfg(test)]
     pub async fn store(&self, extraction: Extraction, conversation_id: &str) -> Result<(), String> {
         let epoch = self.epoch.load(Ordering::SeqCst);
         self.store_at(extraction, conversation_id, epoch).await
@@ -319,6 +321,7 @@ impl Memory {
     /// La época actual (sube con cada encender, apagar y borrar). Para las
     /// pruebas de `store_at`.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::SeqCst)
     }

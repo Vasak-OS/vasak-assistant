@@ -1286,6 +1286,7 @@ mod tests {
                 remote_allowed: false,
                 secrets: Arc::new(setup.service),
                 memory: crate::test_support::memory_off(),
+                labels: std::sync::Arc::new(crate::service::BusLabels),
             };
             assert_eq!(
                 service

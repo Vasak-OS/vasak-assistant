@@ -125,6 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         remote_allowed: settings.allow_remote,
         secrets,
         memory,
+        labels: Arc::new(service::BusLabels),
     };
 
     let connection = connection::Builder::session()?

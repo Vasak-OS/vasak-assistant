@@ -209,6 +209,9 @@ pub enum Error {
     LimitExceeded(String),
     /// La conversación ya está esperando una respuesta.
     Busy(String),
+    /// Quien llama no puede hacer eso: una aplicación confinada (AppArmor) no
+    /// enciende, apaga ni borra la memoria, ni guarda o consulta claves.
+    AccessDenied(String),
 }
 
 // ── El proxy, para quien esté en zbus 5 ───────────────────────────────────────

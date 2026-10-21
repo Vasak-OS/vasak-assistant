@@ -6,6 +6,17 @@
 //! igual, en el proxy del crate `vasak-assistant-protocol`.
 //!
 //! El contenido de las conversaciones nunca va al registro.
+//!
+//! # Aplicaciones confinadas
+//!
+//! La memoria y las claves son de la persona, no de cada aplicación. Un
+//! llamador confinado por AppArmor (su `LinuxSecurityLabel`, que da el bus con
+//! `GetConnectionCredentials`, existe y no es `unconfined`) no puede
+//! encender, apagar ni borrar la memoria ni guardar o consultar claves
+//! (`AccessDenied`), y su `Chat` va sin memoria: no se le pasan notas ni se
+//! aprende de lo que dice. `MemoryStatus` y `Capabilities` siguen abiertos.
+//! Sin etiqueta (no hay AppArmor) se deja pasar. No se mira
+//! `/proc/<pid>/exe`: la unidad corre con un namespace de usuario y da EACCES.
 
 use std::sync::Arc;
 
@@ -19,7 +30,7 @@ use vasak_assistant_protocol::{
     DOMAIN_REMOTE_BACKENDS,
 };
 
-use crate::backend::{BackendError, ModelBackend};
+use crate::backend::{BackendError, BoxFuture, ModelBackend};
 use crate::config::{is_local, normalize_url};
 use crate::conversations::Conversations;
 use crate::keyring::{ApiKey, SecretSource};
@@ -34,6 +45,67 @@ pub struct AssistantService {
     pub secrets: Arc<dyn SecretSource>,
     /// La memoria del asistente (apagada hasta que la persona la enciende).
     pub memory: Arc<Memory>,
+    /// De dónde sale la etiqueta de seguridad de quien llama.
+    pub labels: Arc<dyn CallerLabels>,
+}
+
+/// La etiqueta de seguridad de quien llama. Un rasgo para que las pruebas
+/// pongan una de mentira (`test_support::FixedLabel`).
+pub trait CallerLabels: Send + Sync {
+    /// `Ok(None)` sin etiqueta (no hay AppArmor, o es una conexión punto a
+    /// punto, sin remitente). `Err` si el bus no contestó: se trata como
+    /// confinado.
+    fn label<'a>(
+        &'a self,
+        connection: &'a Connection,
+        sender: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, ()>>;
+}
+
+/// La del bus: `org.freedesktop.DBus.GetConnectionCredentials(remitente)`,
+/// campo `LinuxSecurityLabel`.
+pub struct BusLabels;
+
+impl CallerLabels for BusLabels {
+    fn label<'a>(
+        &'a self,
+        connection: &'a Connection,
+        sender: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, ()>> {
+        Box::pin(async move {
+            let Some(sender) = sender else {
+                return Ok(None);
+            };
+            let name = zbus::names::UniqueName::try_from(sender).map_err(drop)?;
+            let bus = zbus::fdo::DBusProxy::new(connection).await.map_err(drop)?;
+            let credentials = bus
+                .get_connection_credentials(BusName::Unique(name))
+                .await
+                .map_err(|error| {
+                    tracing::warn!("no se pudieron leer las credenciales de {sender}: {error}");
+                })?;
+            Ok(credentials.into_linux_security_label())
+        })
+    }
+}
+
+/// Si la etiqueta de AppArmor dice que el llamador está confinado: existe, no
+/// está vacía y no es `unconfined`. Llega como bytes terminados en NUL, por
+/// ejemplo `vasak-appimage (enforce)`. Sin etiqueta, no está confinado.
+pub fn is_confined(label: Option<&[u8]>) -> bool {
+    let Some(label) = label else {
+        return false;
+    };
+    let label = label.strip_suffix(&[0]).unwrap_or(label);
+    let text = String::from_utf8_lossy(label);
+    let text = text.trim();
+    !text.is_empty() && text != "unconfined"
+}
+
+fn access_denied() -> Error {
+    Error::AccessDenied(
+        "Una aplicación confinada no puede cambiar la memoria ni las claves del asistente.".into(),
+    )
 }
 
 #[interface(name = "ar.net.vasak.os.Assistant")]
@@ -97,14 +169,18 @@ impl AssistantService {
         self.history_of(owner(&header), conversation_id)
     }
 
-    /// Manda un mensaje y devuelve la respuesta del modelo.
+    /// Manda un mensaje y devuelve la respuesta del modelo. Un llamador
+    /// confinado chatea sin memoria.
     async fn chat(
         &self,
         #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
         conversation_id: &str,
         content: &str,
     ) -> Result<String, Error> {
-        self.chat_as(owner(&header), conversation_id, content).await
+        let use_memory = !self.confined(connection, &header).await;
+        self.chat_with(owner(&header), conversation_id, content, use_memory)
+            .await
     }
 
     /// Cierra una conversación de quien llama y olvida sus mensajes.
@@ -117,12 +193,27 @@ impl AssistantService {
     }
 
     /// Guarda en el llavero la clave del proveedor de esa dirección.
-    async fn set_provider_key(&self, url: &str, key: &str) -> Result<(), Error> {
+    /// `AccessDenied` para un llamador confinado.
+    async fn set_provider_key(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        url: &str,
+        key: &str,
+    ) -> Result<(), Error> {
+        self.deny_confined(connection, &header).await?;
         self.store_provider_key(url, key).await
     }
 
-    /// Si hay una clave guardada para esa dirección.
-    async fn has_provider_key(&self, url: &str) -> Result<bool, Error> {
+    /// Si hay una clave guardada para esa dirección. `AccessDenied` para un
+    /// llamador confinado.
+    async fn has_provider_key(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        url: &str,
+    ) -> Result<bool, Error> {
+        self.deny_confined(connection, &header).await?;
         self.has_provider_key_for(url).await
     }
 
@@ -131,14 +222,52 @@ impl AssistantService {
         self.memory.status().await
     }
 
-    /// Enciende (crea vacía) o apaga (borra) la memoria.
-    async fn set_memory_enabled(&self, enabled: bool) -> Result<(), Error> {
+    /// Enciende o apaga la memoria. Encender reabre la base que haya (o la
+    /// crea vacía con una llave nueva); apagar deja de usarla y de escribirla,
+    /// sin borrar nada: borrar es sólo `ClearMemory`. `AccessDenied` para un
+    /// llamador confinado.
+    async fn set_memory_enabled(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        self.deny_confined(connection, &header).await?;
         self.memory.set_enabled(enabled).await
     }
 
-    /// Vacía la memoria si está encendida.
-    async fn clear_memory(&self) -> Result<(), Error> {
+    /// Borra la memoria (la llave y los archivos) y, si estaba encendida, la
+    /// recrea vacía. `AccessDenied` para un llamador confinado.
+    async fn clear_memory(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> Result<(), Error> {
+        self.deny_confined(connection, &header).await?;
         self.memory.clear().await
+    }
+}
+
+/// El pegamento con el bus para la puerta de AppArmor.
+impl AssistantService {
+    /// Si quien manda el pedido está confinado. Si el bus no contesta, sí.
+    async fn confined(&self, connection: &Connection, header: &Header<'_>) -> bool {
+        let sender = header.sender().map(|sender| sender.as_str());
+        match self.labels.label(connection, sender).await {
+            Ok(label) => is_confined(label.as_deref()),
+            Err(()) => true,
+        }
+    }
+
+    async fn deny_confined(
+        &self,
+        connection: &Connection,
+        header: &Header<'_>,
+    ) -> Result<(), Error> {
+        if self.confined(connection, header).await {
+            return Err(access_denied());
+        }
+        Ok(())
     }
 }
 
@@ -175,11 +304,26 @@ impl AssistantService {
         self.conversations.lock().history(owner, conversation_id)
     }
 
+    /// El chat con memoria. Lo usan las pruebas; el bus pasa por
+    /// [`Self::chat_with`].
+    #[cfg(test)]
     pub async fn chat_as(
         &self,
         owner: &str,
         conversation_id: &str,
         content: &str,
+    ) -> Result<String, Error> {
+        self.chat_with(owner, conversation_id, content, true).await
+    }
+
+    /// El chat, con o sin memoria (un llamador confinado va sin: ni notas ni
+    /// aprendizaje).
+    pub async fn chat_with(
+        &self,
+        owner: &str,
+        conversation_id: &str,
+        content: &str,
+        use_memory: bool,
     ) -> Result<String, Error> {
         let mut context = self
             .conversations
@@ -196,7 +340,11 @@ impl AssistantService {
         let first_turn = context.iter().filter(|m| m.role == Role::User).count() == 1;
         // Las notas de la memoria van sólo en el contexto de este turno: no al
         // historial ni a `History`.
-        let notes = self.memory.recall(content, first_turn).await;
+        let notes = if use_memory {
+            self.memory.recall(content, first_turn).await
+        } else {
+            None
+        };
         let with_notes = notes.map(|notes| {
             let mut with_notes = Vec::with_capacity(context.len() + 1);
             with_notes.push(Message {
@@ -216,8 +364,10 @@ impl AssistantService {
             role: Role::Assistant,
             content: reply.clone(),
         });
-        self.memory
-            .learn_after(self.backend.clone(), conversation_id, context);
+        if use_memory {
+            self.memory
+                .learn_after(self.backend.clone(), conversation_id, context);
+        }
         Ok(reply)
     }
 
@@ -374,6 +524,7 @@ mod tests {
             remote_allowed,
             secrets: FixedKey::new(None),
             memory: memory_off(),
+            labels: std::sync::Arc::new(crate::service::BusLabels),
         }
     }
 
@@ -507,6 +658,7 @@ mod tests {
             remote_allowed: false,
             secrets: FixedKey::new(None),
             memory: memory_off(),
+            labels: std::sync::Arc::new(crate::service::BusLabels),
         };
         let id = service.open(OWNER).unwrap();
 
@@ -548,6 +700,7 @@ mod tests {
             remote_allowed: false,
             secrets: FixedKey::new(None),
             memory: memory_off(),
+            labels: std::sync::Arc::new(crate::service::BusLabels),
         };
         let id = service.open(OWNER).unwrap();
         service.chat_as(OWNER, &id, "primero").await.unwrap_err();
@@ -617,6 +770,7 @@ mod tests {
             remote_allowed: false,
             secrets: FixedKey::new(None),
             memory: memory_off(),
+            labels: std::sync::Arc::new(crate::service::BusLabels),
         };
         let id = service.open(OWNER).unwrap();
         assert!(matches!(
@@ -790,6 +944,7 @@ mod tests {
             remote_allowed: false,
             secrets: FixedKey::new(None),
             memory: memory_off(),
+            labels: std::sync::Arc::new(crate::service::BusLabels),
         };
         let id = service.open(":1.1").unwrap();
         service.chat_as(":1.1", &id, "secreto").await.unwrap();
@@ -967,6 +1122,7 @@ mod tests {
         let keys = FixedKey::new(None);
         let service = AssistantService {
             secrets: keys.clone(),
+            labels: std::sync::Arc::new(crate::service::BusLabels),
             ..service(FakeBackend::replying(""), false)
         };
         (service, keys)
@@ -1206,6 +1362,7 @@ mod memory_tests {
                 remote_allowed: false,
                 secrets: keys.clone(),
                 memory,
+                labels: std::sync::Arc::new(crate::service::BusLabels),
             };
             Self {
                 tmp,
@@ -1350,6 +1507,7 @@ mod memory_tests {
             remote_allowed: true,
             secrets: world.keys.clone(),
             memory: Arc::new(remote),
+            labels: std::sync::Arc::new(crate::service::BusLabels),
         };
         let id = service.open(OWNER).unwrap();
 
