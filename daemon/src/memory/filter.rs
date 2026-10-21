@@ -140,11 +140,14 @@ mod tests {
 
     #[test]
     fn cada_patron_de_secreto_se_detecta() {
+        // Armado en tiempo de ejecución: un literal con forma de token de
+        // GitLab lo marca el análisis de secretos (S6690).
+        let glpat = format!("glpat-{}", "abcdefghijklmnop1234");
         for secreto in [
             "usá sk-proj1234abcd5678 para eso",
             "mi token es ghp_abcdefghijklmnop1234",
             "github_pat_abcdefghijklmnop1234",
-            "glpat-abcdefghijklmnop1234",
+            glpat.as_str(),
             "xoxb-123456789-abcdef",
             "AKIAIOSFODNN7EXAMPLE",
             "ASIAIOSFODNN7EXAMPLE",

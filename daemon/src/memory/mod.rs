@@ -53,7 +53,7 @@
 use std::ffi::OsString;
 use std::fmt::Display;
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -428,19 +428,15 @@ fn flag(dir: &Path) -> PathBuf {
 }
 
 async fn write_flag(dir: &Path) -> Result<(), Error> {
-    let path = flag(dir);
-    blocking(move || {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-            .map(drop)
-            .map_err(text)
-    })
-    .await
-    .map_err(|error| Error::Unavailable(format!("No se pudo encender la memoria: {error}")))
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(flag(dir))
+        .await
+        .map(drop)
+        .map_err(|error| Error::Unavailable(format!("No se pudo encender la memoria: {error}")))
 }
 
 async fn remove_flag(dir: &Path) -> Result<(), Error> {
