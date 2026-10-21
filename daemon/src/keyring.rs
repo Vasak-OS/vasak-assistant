@@ -29,17 +29,14 @@
 //! búsqueda, y con la llave de la memoria eso quiere decir cifrar con una
 //! llave que conoce quien la plantó.
 //!
-//! **Migración**: una clave de proveedor guardada por una versión anterior
-//! (`{service, url}`, sin `xdg:schema`) se pasa al ítem protegido la primera
-//! vez que se la lee, si es la única y no hay una nueva: se copia y se borra la
-//! vieja. Con más de una vieja no se usa ninguna (queda en el registro). Con el
-//! llavero bloqueado no se migra ni se abre ningún diálogo. La llave de la
-//! memoria no se migra: siempre se creó con el esquema.
+//! Un ítem sin el esquema, aunque tenga los mismos `service` y `url`, no se
+//! cuenta ni se usa: no hay migración desde antes del esquema (la 0.2.0 nunca
+//! se empaquetó).
 //!
-//! La sesión es `plain`: el secreto viaja sin cifrar por el bus de sesión. No es
-//! más débil que el modelo de acceso de arriba —quien puede espiar el bus de la
-//! sesión también puede pedir el ítem—, y la sesión cifrada (Diffie-Hellman)
-//! traería una pila de cripto para nada.
+//! La sesión es `plain`: el secreto viaja sin cifrar por el bus de sesión hasta
+//! este proceso. Con el esquema protegido, el riesgo que queda es quien pueda
+//! espiar el bus de la sesión; la sesión cifrada (Diffie-Hellman) traería una
+//! pila de cripto para eso, y no se usa.
 //!
 //! La clave nunca se escribe en el registro: [`ApiKey`] no se puede imprimir.
 //!
@@ -54,8 +51,10 @@
 //!
 //! La genera sólo el servicio, la primera vez que se enciende la memoria, y la
 //! borra sólo al borrar la memoria (`ClearMemory`); nunca sola al arrancar.
-//! Tiene el mismo modelo de acceso que la clave del proveedor (cualquier
-//! proceso de la sesión con el llavero abierto la puede leer) y el mismo criterio de duplicados: con más de una no se usa ninguna.
+//! Tiene el mismo modelo de acceso que la clave del proveedor —el esquema
+//! protegido: sólo `/usr/bin/vasak-assistant` la lee o la escribe
+//! (vasak-keyring#55)— y el mismo criterio de duplicados: con más de una no se
+//! usa ninguna.
 
 use std::collections::HashMap;
 
@@ -229,11 +228,6 @@ impl SecretSource for SecretService {
                 .search(&provider_attributes(url))
                 .await
                 .map_err(unreachable)?;
-            if unlocked.is_empty() && locked.is_empty() {
-                // Una vieja sin esquema cuenta: se migra al leerla.
-                let (unlocked, locked) = self.legacy_items(url).await.map_err(unreachable)?;
-                return Ok(has_usable_item(&unlocked, &locked));
-            }
             Ok(has_usable_item(&unlocked, &locked))
         })
     }
@@ -286,13 +280,6 @@ fn provider_attributes(url: &str) -> HashMap<&str, &str> {
         ("purpose", PROVIDER_PURPOSE),
         ("xdg:schema", ITEM_SERVICE),
     ])
-}
-
-/// Los atributos de una clave de proveedor de antes del esquema protegido.
-/// Buscar con ellos también encuentra las nuevas: [`SecretService::legacy_items`]
-/// se queda con las que no tienen `xdg:schema`.
-fn legacy_provider_attributes(url: &str) -> HashMap<&str, &str> {
-    HashMap::from([("service", ITEM_SERVICE), ("url", url)])
 }
 
 fn unreachable(error: zbus::Error) -> Error {
@@ -360,9 +347,6 @@ impl SecretService {
             );
             return Ok(None);
         }
-        if unlocked.is_empty() && locked.is_empty() {
-            return self.migrate(url).await;
-        }
         let Some(item) = unlocked.into_iter().next() else {
             if locked.len() > 1 {
                 // Desbloquear no alcanzaría: con más de una tampoco se usaría.
@@ -380,95 +364,6 @@ impl SecretService {
 
         let value = self.read_secret(&item).await?;
         Ok(value.and_then(|value| ApiKey::parse(&value)))
-    }
-
-    /// Las claves viejas de esa dirección: las que tienen `{service, url}` y no
-    /// `xdg:schema`. (desbloqueadas, bloqueadas)
-    async fn legacy_items(
-        &self,
-        url: &str,
-    ) -> zbus::Result<(Vec<OwnedObjectPath>, Vec<OwnedObjectPath>)> {
-        let (unlocked, locked) = self.search(&legacy_provider_attributes(url)).await?;
-        let mut legacy = (Vec::new(), Vec::new());
-        for (items, out) in [(unlocked, &mut legacy.0), (locked, &mut legacy.1)] {
-            for item in items {
-                if !self
-                    .item_attributes(&item)
-                    .await?
-                    .contains_key("xdg:schema")
-                {
-                    out.push(item);
-                }
-            }
-        }
-        Ok(legacy)
-    }
-
-    async fn item_attributes(
-        &self,
-        item: &OwnedObjectPath,
-    ) -> zbus::Result<HashMap<String, String>> {
-        let value: OwnedValue = self
-            .connection
-            .call_method(
-                Some(SECRETS_NAME),
-                item.as_str(),
-                Some("org.freedesktop.DBus.Properties"),
-                "Get",
-                &("org.freedesktop.Secret.Item", "Attributes"),
-            )
-            .await?
-            .body()
-            .deserialize()?;
-        Ok(HashMap::try_from(value)?)
-    }
-
-    /// Pasa la clave vieja (sin esquema) al ítem protegido, si hay exactamente
-    /// una desbloqueada. La devuelve aunque la copia falle: ya se usaba así.
-    async fn migrate(&self, url: &str) -> zbus::Result<Option<ApiKey>> {
-        let (unlocked, locked) = self.legacy_items(url).await?;
-        let item = match (unlocked.as_slice(), locked.len()) {
-            ([], 0) => return Ok(None),
-            ([item], 0) => item,
-            ([], 1) => {
-                tracing::info!(
-                    "hay una clave del proveedor de una versión anterior en un llavero bloqueado: se pasará al desbloquearlo"
-                );
-                return Ok(None);
-            }
-            _ => {
-                tracing::warn!(
-                    "hay {} claves del proveedor de una versión anterior para la misma dirección; no se usa ninguna: guardá la clave de nuevo desde Configuración",
-                    unlocked.len() + locked.len()
-                );
-                return Ok(None);
-            }
-        };
-        let Some(key) = self
-            .read_secret(item)
-            .await?
-            .and_then(|value| ApiKey::parse(&value))
-        else {
-            return Ok(None);
-        };
-        match self.store(url, &key).await {
-            Ok(Ok(())) => match self.delete_item(item).await {
-                Ok(true) => tracing::info!("la clave del proveedor pasó al ítem protegido"),
-                Ok(false) => tracing::warn!(
-                    "la clave vieja del proveedor no se pudo borrar (llavero bloqueado)"
-                ),
-                Err(error) => {
-                    tracing::warn!("la clave vieja del proveedor no se pudo borrar: {error}")
-                }
-            },
-            Ok(Err(error)) => tracing::info!(
-                "la clave del proveedor no se pudo pasar al ítem protegido: {error:?}"
-            ),
-            Err(error) => {
-                tracing::warn!("la clave del proveedor no se pudo pasar al ítem protegido: {error}")
-            }
-        }
-        Ok(Some(key))
     }
 
     /// El secreto de un ítem, por una sesión `plain` que se cierra pase lo que

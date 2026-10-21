@@ -286,12 +286,6 @@ pub struct FixedKey {
     /// carpeta todavía en disco.
     pub calls: Mutex<Vec<String>>,
     pub watch: Mutex<Option<PathBuf>>,
-    /// Claves de proveedor guardadas por una versión anterior, sin el esquema
-    /// protegido (`{service, url}`), con los mismos atributos que la nueva.
-    /// Con la misma regla que `SecretService`: sin clave fija, si hay
-    /// exactamente una para la dirección, `api_key` la migra a `stored` y la
-    /// saca de acá; con más de una no se usa ninguna.
-    pub unprotected: Mutex<Vec<(String, ApiKey)>>,
 }
 
 impl FixedKey {
@@ -306,7 +300,6 @@ impl FixedKey {
             duplicated: Mutex::default(),
             calls: Mutex::default(),
             watch: Mutex::default(),
-            unprotected: Mutex::default(),
         })
     }
 
@@ -334,16 +327,7 @@ impl FixedKey {
 impl SecretSource for FixedKey {
     fn api_key<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Option<ApiKey>> {
         self.asked.lock().push(url.to_owned());
-        let key = self.key.clone().or_else(|| {
-            let mut unprotected = self.unprotected.lock();
-            let matching: Vec<usize> = (0..unprotected.len())
-                .filter(|&i| unprotected[i].0 == url)
-                .collect();
-            let [only] = matching[..] else { return None };
-            let (url, key) = unprotected.remove(only);
-            self.stored.lock().push((url, key.clone()));
-            Some(key)
-        });
+        let key = self.key.clone();
         Box::pin(async move { key })
     }
 
@@ -354,15 +338,7 @@ impl SecretSource for FixedKey {
 
     /// Hay clave si la fija existe o si se guardó una para esa dirección.
     fn has_key<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<bool, Error>> {
-        let has = self.key.is_some()
-            || self.stored.lock().iter().any(|(u, _)| u == url)
-            || self
-                .unprotected
-                .lock()
-                .iter()
-                .filter(|(u, _)| u == url)
-                .count()
-                == 1;
+        let has = self.key.is_some() || self.stored.lock().iter().any(|(u, _)| u == url);
         Box::pin(async move { Ok(has) })
     }
 
