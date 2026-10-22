@@ -208,8 +208,11 @@ pub fn select_backend(settings: &Settings) -> Result<Selection, Rejection> {
 }
 
 /// Un modelo de Ollama con sufijo `:cloud` o `-cloud` corre en ollama.com
-/// aunque se le hable al Ollama local: su conversación sale de la máquina.
+/// aunque se le hable al Ollama local: su conversación sale de la máquina. Sin
+/// distinguir mayúsculas: el gate decide si la conversación sale de la caja, no
+/// se apoya en que Ollama normalice los nombres.
 pub fn is_ollama_cloud_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
     model.ends_with(":cloud") || model.ends_with("-cloud")
 }
 
@@ -345,6 +348,9 @@ mod tests {
     fn is_ollama_cloud_model_reconoce_los_dos_sufijos() {
         assert!(is_ollama_cloud_model("gpt-oss:120b-cloud"));
         assert!(is_ollama_cloud_model("qwen3:cloud"));
+        // Las mayúsculas no lo salvan del gate.
+        assert!(is_ollama_cloud_model("Qwen3:Cloud"));
+        assert!(is_ollama_cloud_model("GPT-OSS:120B-CLOUD"));
         assert!(!is_ollama_cloud_model("llama3.2"));
         assert!(!is_ollama_cloud_model("qwen2.5:7b"));
         // Sin el separador no es el sufijo.
