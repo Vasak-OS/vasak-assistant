@@ -2,6 +2,17 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-assistant 0.2.1
+
+Un modelo «cloud» de Ollama se trata como remoto (#14).
+
+- **`daemon`** — un modelo de Ollama con sufijo `:cloud` o `-cloud` corre en
+  ollama.com aunque se le hable al Ollama local, así que la conversación sale de
+  la máquina. Ahora cuenta como remoto y necesita `allow_remote`; no se le exige
+  https ni al loopback, que el salto a la nube lo cifra Ollama. Vale también para
+  el modelo elegido por omisión cuando resulta ser uno `cloud`: sin
+  `allow_remote` no se usa, y el estado lo muestra como remoto.
+
 ## vasak-assistant 0.2.0
 
 La clave del proveedor se guarda por el servicio, para la pantalla «Asistente»
