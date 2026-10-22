@@ -93,7 +93,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or("(el primero que ofrezca)")
             );
             let backend: Arc<dyn ModelBackend> = match selection.kind {
-                BackendKind::Ollama => Arc::new(OllamaBackend::new(client, selection)),
+                BackendKind::Ollama => {
+                    Arc::new(OllamaBackend::new(client, selection, settings.allow_remote))
+                }
                 BackendKind::OpenAi => {
                     Arc::new(OpenAiBackend::new(client, selection, secrets.clone()))
                 }

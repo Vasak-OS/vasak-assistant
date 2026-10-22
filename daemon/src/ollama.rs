@@ -15,11 +15,18 @@ use crate::http::{self, CHAT_TIMEOUT, LIST_TIMEOUT};
 pub struct OllamaBackend {
     client: Client,
     selection: Selection,
+    /// Si la configuración permite que la conversación salga de la máquina: lo
+    /// decide el modelo por omisión, que puede resultar ser uno `cloud`.
+    allow_remote: bool,
 }
 
 impl OllamaBackend {
-    pub fn new(client: Client, selection: Selection) -> Self {
-        Self { client, selection }
+    pub fn new(client: Client, selection: Selection, allow_remote: bool) -> Self {
+        Self {
+            client,
+            selection,
+            allow_remote,
+        }
     }
 
     fn base(&self) -> &Url {
@@ -45,7 +52,16 @@ impl OllamaBackend {
 
     async fn resolve_model(&self) -> Result<String, BackendError> {
         let installed = self.installed_models().await?;
-        pick_model(self.selection.model.as_deref(), &installed)
+        let model = pick_model(self.selection.model.as_deref(), &installed)?;
+        // El modelo por omisión puede ser uno `cloud`: sale de la máquina, así
+        // que sin `allow_remote` no se usa. El configurado ya se filtró al
+        // elegir el backend (`select_backend`).
+        if !self.allow_remote && crate::config::is_ollama_cloud_model(&model) {
+            return Err(BackendError::Unavailable(format!(
+                "El modelo «{model}» de Ollama corre en la nube: la conversación saldría de la máquina. Para usarlo hay que permitirlo con «allow_remote»."
+            )));
+        }
+        Ok(model)
     }
 
     async fn send_chat(&self, messages: &[Message]) -> Result<String, BackendError> {
@@ -88,10 +104,13 @@ impl ModelBackend for OllamaBackend {
 
     fn active_model(&self) -> BoxFuture<'_, Result<ModelInfo, BackendError>> {
         Box::pin(async move {
-            Ok(ModelInfo {
-                name: self.resolve_model().await?,
-                ..self.info()
-            })
+            let name = self.resolve_model().await?;
+            // Un modelo por omisión que resultó `cloud` no es local aunque la
+            // dirección sea el loopback: que el estado lo diga.
+            let mut info = self.info();
+            info.local = info.local && !crate::config::is_ollama_cloud_model(&name);
+            info.name = name;
+            Ok(info)
         })
     }
 
@@ -182,7 +201,11 @@ mod tests {
     const CHAT: &str = r#"{"message":{"role":"assistant","content":"Hola, soy Lince."}}"#;
 
     fn backend(server: &FakeServer, model: Option<&str>) -> OllamaBackend {
-        OllamaBackend::new(client(), local_selection("ollama", &server.url(""), model))
+        OllamaBackend::new(
+            client(),
+            local_selection("ollama", &server.url(""), model),
+            false,
+        )
     }
 
     fn user(text: &str) -> Message {
@@ -200,6 +223,57 @@ mod tests {
             _ => Reply::status(404),
         })
         .await
+    }
+
+    /// Un Ollama cuyo único modelo —el que se toma por omisión— es `cloud`.
+    const CLOUD_TAGS: &str = r#"{"models":[{"name":"gpt-oss:120b-cloud"}]}"#;
+
+    async fn ollama_cloud() -> FakeServer {
+        FakeServer::start(|pedido| match pedido.path.as_str() {
+            "/api/tags" => Reply::json(CLOUD_TAGS),
+            "/api/chat" => Reply::json(CHAT),
+            _ => Reply::status(404),
+        })
+        .await
+    }
+
+    fn cloud_backend(server: &FakeServer, allow_remote: bool) -> OllamaBackend {
+        OllamaBackend::new(
+            client(),
+            local_selection("ollama", &server.url(""), None),
+            allow_remote,
+        )
+    }
+
+    /// #14: el modelo por omisión que resulta ser uno `cloud` no se usa sin
+    /// `allow_remote` —ni para el estado ni para el chat—: saldría de la máquina.
+    #[tokio::test]
+    async fn un_modelo_por_omision_cloud_sin_allow_remote_no_se_usa() {
+        let server = ollama_cloud().await;
+        let backend = cloud_backend(&server, false);
+        match backend.active_model().await {
+            Err(BackendError::Unavailable(text)) => {
+                assert!(
+                    text.contains("nube") && text.contains("allow_remote"),
+                    "{text}"
+                );
+            }
+            other => panic!("se esperaba Unavailable, dio {other:?}"),
+        }
+        match backend.chat(&[user("hola")]).await {
+            Err(BackendError::Unavailable(_)) => {}
+            other => panic!("el chat tenía que rechazarse, dio {other:?}"),
+        }
+    }
+
+    /// Con `allow_remote`, el mismo modelo por omisión `cloud` se usa, y el
+    /// estado lo muestra como remoto aunque la dirección sea el loopback.
+    #[tokio::test]
+    async fn un_modelo_por_omision_cloud_con_allow_remote_se_usa_y_se_muestra_remoto() {
+        let server = ollama_cloud().await;
+        let active = cloud_backend(&server, true).active_model().await.unwrap();
+        assert_eq!(active.name, "gpt-oss:120b-cloud");
+        assert!(!active.local, "un modelo cloud no es local");
     }
 
     #[test]
@@ -398,7 +472,7 @@ mod tests {
     #[tokio::test]
     async fn sin_ollama_corriendo_da_no_disponible_con_la_direccion() {
         let url = closed_port_url();
-        let backend = OllamaBackend::new(client(), local_selection("ollama", &url, None));
+        let backend = OllamaBackend::new(client(), local_selection("ollama", &url, None), false);
         match backend.active_model().await {
             Err(BackendError::Unavailable(text)) => assert!(text.contains("no responde")),
             other => panic!("se esperaba Unavailable, dio {other:?}"),
