@@ -1374,6 +1374,21 @@ mod guard_tests {
         }
     }
 
+    /// Cada archivo bajo `path`, con su ruta y su contenido, en orden.
+    fn files_under(path: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(files_under(&path));
+            } else {
+                found.push((path.clone(), std::fs::read(&path).unwrap()));
+            }
+        }
+        found.sort();
+        found
+    }
+
     async fn enabled() -> (TempDir, Arc<FixedKey>, Arc<Memory>) {
         let tmp = TempDir::new();
         let keys = FixedKey::new(None);
@@ -1446,6 +1461,31 @@ mod guard_tests {
             assert!(!status.available, "{content:?}");
             assert_eq!(status.reason, REASON_NOT_OPENED, "{content:?}");
             assert_eq!(std::fs::read(&path).unwrap(), content);
+        }
+    }
+
+    #[tokio::test]
+    async fn una_cabecera_de_una_version_vieja_o_sin_cifrar_no_se_abre_y_no_se_migra() {
+        for (name, version, flags) in [
+            ("0.5 sin cifrar", 2, 0),
+            ("0.6 sin cifrar", 3, 0),
+            ("0.5 con la bandera", 2, 1),
+        ] {
+            let (tmp, keys, memory) = enabled().await;
+            memory.close().await;
+            let path = tmp.memory_dir().join(DB_FILE);
+            let mut content = header(b"GRAF", version, flags);
+            content.resize(16 * 1024, 0);
+            std::fs::write(&path, &content).unwrap();
+            let before = files_under(&tmp.memory_dir());
+
+            let status = restarted(&tmp, &keys).status().await;
+
+            assert!(!status.available, "{name}");
+            assert_eq!(status.reason, REASON_NOT_OPENED, "{name}");
+            assert_eq!(std::fs::read(&path).unwrap(), content, "{name}");
+            // Grafeo no llegó a migrar nada: ningún archivo nuevo ni cambiado.
+            assert_eq!(files_under(&tmp.memory_dir()), before, "{name}");
         }
     }
 
