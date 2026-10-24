@@ -161,31 +161,64 @@ pub fn select_backend(settings: &Settings) -> Result<Selection, Rejection> {
     };
     let url = normalize_url(raw_url).map_err(reject_unparsed)?;
 
+    // Un modelo `:cloud`/`-cloud` de Ollama corre en ollama.com aunque se le
+    // hable al Ollama local: su conversación (y, fase 4, la memoria) sale de la
+    // máquina. Cuenta como remoto para el permiso, pero no para el transporte —
+    // el salto al loopback sigue siendo http y el cifrado hacia la nube lo pone
+    // Ollama—, así que no se le exige https ni modelo explícito.
+    let transport_local = is_local(&url);
+    let cloud = kind == BackendKind::Ollama && model.as_deref().is_some_and(is_ollama_cloud_model);
     let selection = Selection {
         kind,
-        local: is_local(&url),
+        local: transport_local && !cloud,
         url,
         model,
     };
     if selection.local {
         return Ok(selection);
     }
-    let host = selection.url.host_str().unwrap_or_default().to_owned();
-    let reason = if !settings.allow_remote {
-        format!(
-            "«{host}» es un proveedor remoto: la conversación saldría de la máquina. Para usarlo hay que permitirlo con «allow_remote»."
-        )
-    } else if selection.url.scheme() != "https" {
-        format!("«{host}» es un proveedor remoto y sólo se le habla por https.")
-    } else if selection.model.is_none() {
-        format!("Con un proveedor remoto («{host}») hay que elegir el modelo.")
-    } else {
-        return Ok(selection);
-    };
-    Err(Rejection {
-        info: selection.info(),
-        reason,
-    })
+    if !settings.allow_remote {
+        let reason = if cloud {
+            format!(
+                "El modelo «{}» de Ollama corre en la nube: la conversación saldría de la máquina. Para usarlo hay que permitirlo con «allow_remote».",
+                selection.model.as_deref().unwrap_or_default()
+            )
+        } else {
+            let host = selection.url.host_str().unwrap_or_default();
+            format!(
+                "«{host}» es un proveedor remoto: la conversación saldría de la máquina. Para usarlo hay que permitirlo con «allow_remote»."
+            )
+        };
+        return Err(Rejection {
+            info: selection.info(),
+            reason,
+        });
+    }
+    // Exigencias de transporte: sólo para un host remoto de verdad.
+    if !transport_local {
+        let host = selection.url.host_str().unwrap_or_default().to_owned();
+        let reason = if selection.url.scheme() != "https" {
+            format!("«{host}» es un proveedor remoto y sólo se le habla por https.")
+        } else if selection.model.is_none() {
+            format!("Con un proveedor remoto («{host}») hay que elegir el modelo.")
+        } else {
+            return Ok(selection);
+        };
+        return Err(Rejection {
+            info: selection.info(),
+            reason,
+        });
+    }
+    Ok(selection)
+}
+
+/// Un modelo de Ollama con sufijo `:cloud` o `-cloud` corre en ollama.com
+/// aunque se le hable al Ollama local: su conversación sale de la máquina. Sin
+/// distinguir mayúsculas: el gate decide si la conversación sale de la caja, no
+/// se apoya en que Ollama normalice los nombres.
+pub fn is_ollama_cloud_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.ends_with(":cloud") || model.ends_with("-cloud")
 }
 
 /// La dirección base de un backend, normalizada: `http` o `https`, con host,
@@ -315,6 +348,60 @@ mod tests {
     fn el_modelo_se_recorta() {
         let selection = select_backend(&settings("", "", "  llama3.2  ", false)).unwrap();
         assert_eq!(selection.model.as_deref(), Some("llama3.2"));
+    }
+
+    #[test]
+    fn is_ollama_cloud_model_reconoce_los_dos_sufijos() {
+        assert!(is_ollama_cloud_model("gpt-oss:120b-cloud"));
+        assert!(is_ollama_cloud_model("qwen3:cloud"));
+        // Las mayúsculas no lo salvan del gate.
+        assert!(is_ollama_cloud_model("Qwen3:Cloud"));
+        assert!(is_ollama_cloud_model("GPT-OSS:120B-CLOUD"));
+        assert!(!is_ollama_cloud_model("llama3.2"));
+        assert!(!is_ollama_cloud_model("qwen2.5:7b"));
+        // Sin el separador no es el sufijo.
+        assert!(!is_ollama_cloud_model("micloud"));
+    }
+
+    /// #14: un modelo `cloud` de Ollama corre en la nube aunque se hable al
+    /// Ollama local; sin `allow_remote` la conversación no puede salir de la
+    /// máquina.
+    #[test]
+    fn un_modelo_cloud_de_ollama_sin_allow_remote_se_rechaza() {
+        let rejection = rejected(&settings("ollama", "", "qwen3:cloud", false));
+        assert!(rejection.reason.contains("nube"), "{}", rejection.reason);
+        assert!(rejection.reason.contains("allow_remote"));
+        assert!(!rejection.info.local, "un modelo cloud no es local");
+    }
+
+    /// Con `allow_remote` el modelo `cloud` se acepta, y por http al loopback:
+    /// el salto a la nube lo cifra Ollama, no hay que exigirle https al
+    /// localhost ni repetir el modelo (ya es explícito).
+    #[test]
+    fn un_modelo_cloud_de_ollama_con_allow_remote_se_acepta_por_http_local() {
+        let selection = select_backend(&settings("ollama", "", "qwen3:cloud", true)).unwrap();
+        assert!(!selection.local, "un modelo cloud no es local");
+        assert_eq!(selection.url.scheme(), "http");
+        assert_eq!(selection.model.as_deref(), Some("qwen3:cloud"));
+    }
+
+    #[test]
+    fn un_modelo_local_de_ollama_no_es_cloud() {
+        let selection = select_backend(&settings("ollama", "", "llama3.2", false)).unwrap();
+        assert!(selection.local);
+    }
+
+    /// El sufijo `cloud` es cosa de Ollama: en otro backend local no cambia nada.
+    #[test]
+    fn el_sufijo_cloud_solo_cuenta_en_ollama() {
+        let selection = select_backend(&settings(
+            "openai",
+            "http://localhost:8080/v1",
+            "algo-cloud",
+            false,
+        ))
+        .unwrap();
+        assert!(selection.local);
     }
 
     #[test]
