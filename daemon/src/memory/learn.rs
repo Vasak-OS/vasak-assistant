@@ -976,3 +976,79 @@ mod hardening_tests {
         assert_eq!(extraction.summary, None);
     }
 }
+
+/// El recorte va después de los filtros.
+#[cfg(test)]
+mod truncation_tests {
+    use super::*;
+
+    fn parse_one(kind: &str, text: &str) -> Vec<String> {
+        let json = serde_json::json!({"items": [{"kind": kind, "text": text}], "summary": null});
+        parse_extraction(&json.to_string())
+            .items
+            .into_iter()
+            .map(|item| item.text)
+            .collect()
+    }
+
+    /// Relleno de `bytes` bytes sin nada que filtrar.
+    fn padding(bytes: usize) -> String {
+        "uno ".repeat(bytes / 4)
+    }
+
+    #[test]
+    fn un_secreto_que_el_recorte_dejaria_partido_no_se_guarda() {
+        let max = MemoryKind::Preference.max_text();
+        assert_eq!(max, 280);
+        // `sk-` + 16: cortado en el límite quedan 5 caracteres detrás del
+        // prefijo y el patrón (8 o más) ya no coincidiría.
+        let key = "sk-abcdefghijklmnop";
+        // Un hexadecimal de 32 cortado deja 8.
+        let hex = "abcdefabcdefabcdefabcdefabcdefab";
+        // Un token de GitHub armado en ejecución (el análisis de secretos).
+        let github = format!("ghp_{}", "abcdefghijklmnop1234");
+        for secret in [key, hex, github.as_str()] {
+            let text = format!("{}{secret}", padding(max - 8));
+            assert!(text.len() > max);
+            // El pedazo que quedaría, sin el filtro, no se reconoce solo.
+            let cut = truncate(&text, max);
+            assert!(
+                !super::contains_secret(cut),
+                "el recorte ya no parece secreto: {cut}"
+            );
+
+            assert!(parse_one("preference", &text).is_empty(), "{secret}");
+        }
+    }
+
+    #[test]
+    fn un_dato_de_la_persona_cortado_por_el_limite_tampoco_se_guarda() {
+        let max = MemoryKind::Habit.max_text();
+        // El correo queda cortado antes de la arroba.
+        let text = format!("{}ana@ejemplo.com", padding(max - 3));
+        assert!(!super::is_user_data(truncate(&text, max)));
+
+        assert!(parse_one("habit", &text).is_empty());
+    }
+
+    #[test]
+    fn un_texto_largo_y_limpio_se_recorta_y_se_guarda() {
+        let max = MemoryKind::Preference.max_text();
+        let kept = parse_one("preference", &padding(400));
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].len() <= max);
+        assert!(kept[0].len() >= max - 4);
+        // Y el recorte no parte un carácter.
+        let kept = parse_one("preference", &"ñ".repeat(400));
+        assert!(kept[0].len() <= max && kept[0].chars().all(|c| c == 'ñ'));
+    }
+
+    #[test]
+    fn un_secreto_entero_dentro_del_limite_sigue_descartandose() {
+        assert!(parse_one(
+            "preference",
+            &format!("{}sk-abcdefghijklmnop", padding(100))
+        )
+        .is_empty());
+    }
+}

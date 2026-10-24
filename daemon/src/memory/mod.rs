@@ -1743,3 +1743,178 @@ mod guard_tests {
         assert_eq!(memory.window_start("c0", 0, 9), 9);
     }
 }
+
+/// Los arreglos de la revisión: idempotencia de encender y poda una sola vez.
+#[cfg(test)]
+mod review_tests {
+    use super::learn::Item;
+    use super::*;
+    use crate::test_support::{FakeBackend, FixedKey, TempDir};
+
+    async fn enabled() -> (TempDir, Arc<Memory>) {
+        let tmp = TempDir::new();
+        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), FixedKey::new(None)));
+        memory.set_enabled(true).await.unwrap();
+        (tmp, memory)
+    }
+
+    fn preference(text: &str) -> Extraction {
+        Extraction {
+            items: vec![Item {
+                kind: MemoryKind::Preference,
+                text: text.into(),
+                phrase: None,
+                topics: Vec::new(),
+            }],
+            summary: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn encender_dos_veces_no_sube_la_epoca_ni_descarta_una_extraccion_en_curso() {
+        let (_tmp, memory) = enabled().await;
+        let (backend, gate) = FakeBackend::gated(
+            r#"{"items":[{"kind":"preference","text":"Prefiere el mate amargo"}],"summary":null}"#,
+        );
+        let backend = Arc::new(backend);
+        let conversation = vec![
+            Message {
+                role: Role::User,
+                content: "prefiero el mate amargo".into(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: "Anotado.".into(),
+            },
+        ];
+        let epoch = memory.epoch();
+
+        memory.learn_after(backend.clone(), "c1", conversation);
+        backend.entered.notified().await;
+        memory.set_enabled(true).await.unwrap();
+        memory.set_enabled(true).await.unwrap();
+        assert_eq!(memory.epoch(), epoch);
+        gate.notify_one();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while memory.recall("mate", true).await.is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "se descartó la extracción"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(memory.epoch(), epoch);
+    }
+
+    #[tokio::test]
+    async fn encender_dos_veces_conserva_la_ventana_de_la_conversacion() {
+        let (_tmp, memory) = enabled().await;
+        assert_eq!(memory.window_start("c", memory.epoch(), 4), 4);
+
+        memory.set_enabled(true).await.unwrap();
+
+        assert_eq!(memory.window_start("c", memory.epoch(), 9), 4);
+    }
+
+    #[tokio::test]
+    async fn encender_una_memoria_apagada_o_con_la_base_cerrada_si_cuenta() {
+        let (tmp, memory) = enabled().await;
+        let epoch = memory.epoch();
+        memory.close().await;
+
+        // Encendida pero cerrada: se reabre (y es un cambio de estado).
+        memory.set_enabled(true).await.unwrap();
+        assert!(memory.status().await.available);
+
+        memory.set_enabled(false).await.unwrap();
+        memory.set_enabled(true).await.unwrap();
+        assert_eq!(memory.epoch(), epoch + 3);
+        assert!(tmp.path().join("enabled").is_file());
+    }
+
+    async fn preferences(memory: &Memory) -> usize {
+        let db = memory.database().await.unwrap();
+        blocking(move || Ok(schema::entries(&db, MemoryKind::Preference).len()))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn con_el_directorio_pasado_del_limite_se_poda_una_sola_vez_y_no_se_borra_todo() {
+        let (tmp, memory) = enabled().await;
+        for n in 0..10 {
+            memory
+                .store(preference(&format!("Prefiere la cosa número {n}")), "c")
+                .await
+                .unwrap();
+        }
+        std::fs::write(
+            tmp.memory_dir().join("relleno"),
+            vec![0u8; MAX_MEMORY_DISK_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        for n in 0..6 {
+            memory
+                .store(preference(&format!("Prefiere lo nuevo {n}")), "c")
+                .await
+                .unwrap();
+        }
+
+        // Una poda del 10 % (uno de diez) y nada más; lo nuevo no se escribió.
+        assert_eq!(preferences(&memory).await, 9);
+        assert_eq!(
+            memory
+                .recall("nuevo", false)
+                .await
+                .unwrap()
+                .matches("Prefiere lo nuevo")
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn al_volver_al_limite_se_escribe_y_un_episodio_nuevo_vuelve_a_podar_una_vez() {
+        let (tmp, memory) = enabled().await;
+        for n in 0..10 {
+            memory
+                .store(preference(&format!("Prefiere la cosa número {n}")), "c")
+                .await
+                .unwrap();
+        }
+        let filler = tmp.memory_dir().join("relleno");
+        let fill =
+            || std::fs::write(&filler, vec![0u8; MAX_MEMORY_DISK_BYTES as usize + 1]).unwrap();
+        fill();
+        memory
+            .store(preference("Prefiere lo primero"), "c")
+            .await
+            .unwrap();
+        memory
+            .store(preference("Prefiere lo segundo"), "c")
+            .await
+            .unwrap();
+        assert_eq!(preferences(&memory).await, 9);
+
+        // Dentro del límite otra vez: se escribe y el estado se limpia.
+        std::fs::remove_file(&filler).unwrap();
+        memory
+            .store(preference("Prefiere lo tercero"), "c")
+            .await
+            .unwrap();
+        assert_eq!(preferences(&memory).await, 10);
+
+        // Otro episodio: una poda más, y de nuevo sólo una.
+        fill();
+        memory
+            .store(preference("Prefiere lo cuarto"), "c")
+            .await
+            .unwrap();
+        memory
+            .store(preference("Prefiere lo quinto"), "c")
+            .await
+            .unwrap();
+        assert_eq!(preferences(&memory).await, 9);
+    }
+}

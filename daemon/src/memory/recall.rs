@@ -511,3 +511,37 @@ mod injection_tests {
         assert!(render_with(&[], "ffffffff").is_none());
     }
 }
+
+/// Cada alias se recupera por su frase.
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+    use crate::memory::schema::{ensure_indexes, upsert, NewMemory};
+
+    #[test]
+    fn un_mensaje_con_cada_frase_recupera_su_alias_y_no_el_otro() {
+        let db = GrafeoDB::new_in_memory();
+        ensure_indexes(&db).unwrap();
+        for phrase in ["el bicho", "la bestia"] {
+            upsert(
+                &db,
+                &NewMemory {
+                    kind: MemoryKind::Alias,
+                    text: "Es su gato",
+                    phrase: Some(phrase),
+                    conversation: None,
+                },
+                1_800_000_000,
+            )
+            .unwrap();
+        }
+
+        let bicho = build(&db, "¿cómo está el bicho hoy?", false, 1_800_000_000).unwrap();
+        assert!(bicho.contains(r#"Cuando dice "el bicho": "Es su gato""#));
+        assert!(!bicho.contains("la bestia"));
+
+        let bestia = build(&db, "la bestia está dormida", false, 1_800_000_000).unwrap();
+        assert!(bestia.contains(r#"Cuando dice "la bestia": "Es su gato""#));
+        assert!(!bestia.contains("el bicho"));
+    }
+}

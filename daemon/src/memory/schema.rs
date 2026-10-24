@@ -790,3 +790,80 @@ mod tests {
         assert_eq!(conversation.as_deref(), Some("c-1"));
     }
 }
+
+/// La clave de un alias incluye su frase.
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+
+    const NOW: i64 = 1_800_000_000;
+
+    fn alias(db: &GrafeoDB, phrase: &str, text: &str) -> NodeId {
+        upsert(
+            db,
+            &NewMemory {
+                kind: MemoryKind::Alias,
+                text,
+                phrase: Some(phrase),
+                conversation: None,
+            },
+            NOW,
+        )
+        .unwrap()
+    }
+
+    fn db() -> GrafeoDB {
+        let db = GrafeoDB::new_in_memory();
+        ensure_indexes(&db).unwrap();
+        db
+    }
+
+    #[test]
+    fn dos_alias_con_el_mismo_texto_y_distinta_frase_son_dos_recuerdos() {
+        let db = db();
+
+        let first = alias(&db, "el bicho", "Es su gato");
+        let second = alias(&db, "la bestia", "Es su gato");
+
+        assert_ne!(first, second);
+        let mut phrases: Vec<_> = entries(&db, MemoryKind::Alias)
+            .into_iter()
+            .filter_map(|e| e.phrase)
+            .collect();
+        phrases.sort();
+        assert_eq!(phrases, ["el bicho", "la bestia"]);
+    }
+
+    #[test]
+    fn el_mismo_alias_dos_veces_se_refuerza_y_no_se_duplica() {
+        let db = db();
+
+        let first = alias(&db, "el bicho", "Es su gato");
+        let again = alias(&db, "El  Bicho", "es su gato");
+
+        assert_eq!(first, again);
+        assert_eq!(entries(&db, MemoryKind::Alias).len(), 1);
+    }
+
+    #[test]
+    fn la_frase_no_se_confunde_con_el_texto_en_la_clave() {
+        let db = db();
+        // «a b» + «c» no es lo mismo que «a» + «b c».
+        let first = alias(&db, "a b", "c");
+        let second = alias(&db, "a", "b c");
+        assert_ne!(first, second);
+        // Y un alias no choca con una preferencia del mismo texto.
+        upsert(
+            &db,
+            &NewMemory {
+                kind: MemoryKind::Preference,
+                text: "c",
+                phrase: None,
+                conversation: None,
+            },
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(entries(&db, MemoryKind::Alias).len(), 2);
+    }
+}
