@@ -179,7 +179,8 @@ const INJECTION_MARKERS: &[&str] = &[
 
 /// Si el texto trae marcadores de rol o de instrucciones.
 pub fn has_injection_markers(text: &str) -> bool {
-    let folded = normalize_terms(text);
+    // `user :` cuenta como `user:` (normalize_terms ya colapsó los espacios).
+    let folded = normalize_terms(text).replace(" :", ":");
     INJECTION_MARKERS
         .iter()
         .any(|marker| folded.contains(marker))

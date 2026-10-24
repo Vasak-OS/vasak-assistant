@@ -263,6 +263,11 @@ impl Memory {
         let Some(gate) = learn::worth_learning(&user.content, &reply.content, user_turns) else {
             return;
         };
+        // Sin ventana (todo dio positivo en los filtros) no hay nada que
+        // pedirle al modelo.
+        let Some((conversation, gate)) = learn::extraction_window(&conversation, gate) else {
+            return;
+        };
         let memory = self.clone();
         let conversation_id = conversation_id.to_owned();
         tokio::spawn(async move {
@@ -318,10 +323,9 @@ impl Memory {
         blocking(move || write(&db, &dir, &extraction, &conversation_id).map_err(text)).await
     }
 
-    /// La época actual (sube con cada encender, apagar y borrar). Para las
-    /// pruebas de `store_at`.
+    /// La época actual (sube con cada encender, apagar y borrar). Sólo la
+    /// usan las pruebas de `store_at`.
     #[cfg(test)]
-    #[allow(dead_code)]
     pub fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::SeqCst)
     }
@@ -351,8 +355,8 @@ impl Memory {
 
     /// Cierra la base si está abierta (vuelca el WAL al archivo). Se vuelve a
     /// abrir sola la próxima vez que se la necesite.
-    // Sin llamador en el servicio todavía: apagar y borrar cierran por dentro.
-    #[allow(dead_code)]
+    // Sólo lo usan las pruebas: apagar y borrar cierran por dentro.
+    #[cfg(test)]
     pub async fn close(&self) {
         close(self.db.lock().await.take()).await;
     }
