@@ -1565,11 +1565,7 @@ mod memory_tests {
         assert_eq!(count, 1);
     }
 
-    // Falla hoy: `learn_after` arma el pedido con `extraction_request`, que ante
-    // una ventana vacía devuelve igual el aviso del sistema con `[]`, y llama al
-    // modelo para nada. Se quita el `ignore` al arreglarlo.
     #[tokio::test]
-    #[ignore = "bug: con la ventana vacía igual se llama al modelo extractor"]
     async fn un_ultimo_mensaje_con_un_dato_de_la_persona_no_manda_nada_al_modelo_extractor() {
         let world = World::new(["Listo."]).await;
 

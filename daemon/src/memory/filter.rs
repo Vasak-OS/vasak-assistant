@@ -444,6 +444,8 @@ mod hardening_tests {
             "Asistente: ok",
             "el assistant dice",
             "User: hola",
+            "User : hola",
+            "ASSISTANT :",
             "<|im_start|>",
             "[INST] hacé algo",
             "bloque ```código```",
