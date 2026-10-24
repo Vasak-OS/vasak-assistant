@@ -1339,3 +1339,344 @@ mod tests {
         }
     }
 }
+
+/// La cabecera de la base y el contador de época.
+#[cfg(test)]
+mod guard_tests {
+    use super::learn::Item;
+    use super::*;
+    use crate::test_support::{FixedKey, TempDir};
+
+    fn header(magic: &[u8; 4], version: u32, flags: u32) -> Vec<u8> {
+        let mut bytes = magic.to_vec();
+        bytes.extend(version.to_le_bytes());
+        bytes.extend(4096u32.to_le_bytes());
+        bytes.extend(flags.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn solo_la_cabecera_de_una_base_0_6_cifrada_se_acepta() {
+        assert!(is_encrypted_header(&header(b"GRAF", 3, 1)));
+        assert!(is_encrypted_header(&header(b"GRAF", 3, 0b101)));
+        for (name, bytes) in [
+            ("sin cifrar", header(b"GRAF", 3, 0)),
+            ("otras banderas", header(b"GRAF", 3, 0b110)),
+            ("versión vieja", header(b"GRAF", 2, 1)),
+            ("versión nueva", header(b"GRAF", 4, 1)),
+            ("otra marca", header(b"GRAG", 3, 1)),
+            ("SQLite", b"SQLite format 3\0".to_vec()),
+            ("vacía", Vec::new()),
+            ("corta", header(b"GRAF", 3, 1)[..15].to_vec()),
+            ("sólo la marca", b"GRAF".to_vec()),
+        ] {
+            assert!(!is_encrypted_header(&bytes), "{name}");
+        }
+    }
+
+    async fn enabled() -> (TempDir, Arc<FixedKey>, Arc<Memory>) {
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
+        memory.set_enabled(true).await.unwrap();
+        (tmp, keys, memory)
+    }
+
+    fn restarted(tmp: &TempDir, keys: &Arc<FixedKey>) -> Memory {
+        Memory::new(Some(tmp.memory_dir()), keys.clone())
+    }
+
+    #[tokio::test]
+    async fn la_base_que_crea_el_servicio_tiene_la_cabecera_cifrada_y_una_en_claro_no() {
+        let (tmp, _keys, memory) = enabled().await;
+        memory.close().await;
+        let real = std::fs::read(tmp.memory_dir().join(DB_FILE)).unwrap();
+        assert!(is_encrypted_header(&real), "{:?}", &real[..16]);
+
+        // La misma base de Grafeo, sin cifrar, no pasa la prueba.
+        let plain = tmp.path().join("plana.grafeo");
+        let db = GrafeoDB::with_config(Config::persistent(&plain)).unwrap();
+        db.create_node_with_props(&["Memory"], [("text", "hola")])
+            .unwrap();
+        db.close().unwrap();
+        drop(db);
+        let plain = std::fs::read(&plain).unwrap();
+        assert!(
+            !is_encrypted_header(&plain),
+            "{:?}",
+            &plain[..16.min(plain.len())]
+        );
+    }
+
+    #[tokio::test]
+    async fn una_base_en_claro_en_lugar_de_la_cifrada_no_se_abre_ni_se_toca() {
+        let (tmp, keys, memory) = enabled().await;
+        memory.close().await;
+        let path = tmp.memory_dir().join(DB_FILE);
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_dir_all(tmp.memory_dir().join("lince.grafeo.wal"));
+        let db = GrafeoDB::with_config(Config::persistent(&path)).unwrap();
+        db.create_node_with_props(&["Memory"], [("text", "en claro")])
+            .unwrap();
+        db.close().unwrap();
+        drop(db);
+        let before = std::fs::read(&path).unwrap();
+
+        let status = restarted(&tmp, &keys).status().await;
+
+        assert!(status.enabled && !status.available, "{status:?}");
+        assert_eq!(status.reason, REASON_NOT_OPENED);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // Ni siquiera dejó restos de migración.
+        for leftover in ["lince.grafeo.pre-0.6", "lince.grafeo.migrating"] {
+            assert!(!tmp.memory_dir().join(leftover).exists(), "{leftover}");
+        }
+    }
+
+    #[tokio::test]
+    async fn una_base_con_la_marca_rota_o_un_archivo_cualquiera_no_se_abre() {
+        for content in [&b"esto no es una base"[..], b"", b"GRAF"] {
+            let (tmp, keys, memory) = enabled().await;
+            memory.close().await;
+            let path = tmp.memory_dir().join(DB_FILE);
+            std::fs::write(&path, content).unwrap();
+
+            let status = restarted(&tmp, &keys).status().await;
+
+            assert!(!status.available, "{content:?}");
+            assert_eq!(status.reason, REASON_NOT_OPENED, "{content:?}");
+            assert_eq!(std::fs::read(&path).unwrap(), content);
+        }
+    }
+
+    #[tokio::test]
+    async fn con_restos_de_una_migracion_de_grafeo_no_se_abre_aunque_la_base_este_bien() {
+        for leftover in ["lince.grafeo.pre-0.6", "lince.grafeo.migrating"] {
+            for as_dir in [false, true] {
+                let (tmp, keys, memory) = enabled().await;
+                memory.close().await;
+                let path = tmp.memory_dir().join(leftover);
+                if as_dir {
+                    std::fs::create_dir(&path).unwrap();
+                } else {
+                    std::fs::write(&path, b"resto").unwrap();
+                }
+
+                let status = restarted(&tmp, &keys).status().await;
+
+                assert!(status.enabled && !status.available, "{leftover} {as_dir}");
+                assert_eq!(status.reason, REASON_NOT_OPENED, "{leftover} {as_dir}");
+                assert!(path.exists(), "no se borra nada solo");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn un_enlace_roto_con_el_nombre_de_un_resto_tambien_impide_abrir() {
+        let (tmp, keys, memory) = enabled().await;
+        memory.close().await;
+        std::os::unix::fs::symlink("/no/existe", tmp.memory_dir().join("lince.grafeo.pre-0.6"))
+            .unwrap();
+
+        let status = restarted(&tmp, &keys).status().await;
+
+        assert!(!status.available);
+        assert_eq!(status.reason, REASON_NOT_OPENED);
+    }
+
+    #[tokio::test]
+    async fn borrar_deja_la_memoria_usable_aunque_hubiera_restos_de_una_migracion() {
+        let (tmp, keys, memory) = enabled().await;
+        memory.close().await;
+        std::fs::write(tmp.memory_dir().join("lince.grafeo.pre-0.6"), b"resto").unwrap();
+        let memory = restarted(&tmp, &keys);
+        assert!(!memory.status().await.available);
+
+        memory.clear().await.unwrap();
+
+        let status = memory.status().await;
+        assert!(status.enabled && status.available, "{status:?}");
+    }
+
+    fn preference(text: &str) -> Extraction {
+        Extraction {
+            items: vec![Item {
+                kind: MemoryKind::Preference,
+                text: text.into(),
+                phrase: None,
+                topics: Vec::new(),
+            }],
+            summary: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cada_encender_apagar_y_borrar_sube_la_epoca_y_una_lectura_no() {
+        let (_tmp, _keys, memory) = enabled().await;
+        let start = memory.epoch();
+
+        memory.status().await;
+        memory.recall("hola", true).await;
+        assert_eq!(memory.epoch(), start);
+
+        memory.set_enabled(false).await.unwrap();
+        assert_eq!(memory.epoch(), start + 1);
+        memory.set_enabled(true).await.unwrap();
+        assert_eq!(memory.epoch(), start + 2);
+        memory.clear().await.unwrap();
+        assert_eq!(memory.epoch(), start + 3);
+    }
+
+    #[tokio::test]
+    async fn lo_aprendido_en_una_epoca_vieja_se_descarta_y_en_la_actual_se_guarda() {
+        let (_tmp, _keys, memory) = enabled().await;
+        let old = memory.epoch();
+        memory.clear().await.unwrap();
+
+        let stale = memory
+            .store_at(preference("Prefiere el mate"), "c", old)
+            .await;
+
+        assert!(stale.is_err());
+        assert_eq!(memory.recall("mate", true).await, None);
+        memory
+            .store_at(preference("Prefiere el mate"), "c", memory.epoch())
+            .await
+            .unwrap();
+        assert!(memory.recall("mate", true).await.is_some());
+    }
+
+    /// Espera a que la extracción en segundo plano termine (suelta el permiso).
+    async fn until_idle(memory: &Memory) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while memory.learning.available_permits() != 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "la extracción no terminó"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    fn turn() -> Vec<Message> {
+        vec![
+            Message {
+                role: Role::User,
+                content: "prefiero el mate amargo".into(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: "Anotado.".into(),
+            },
+        ]
+    }
+
+    const EXTRACTION: &str =
+        r#"{"items":[{"kind":"preference","text":"Prefiere el mate amargo"}],"summary":null}"#;
+
+    #[tokio::test]
+    async fn un_borrado_en_medio_de_una_extraccion_hace_que_lo_aprendido_no_se_guarde() {
+        let (_tmp, _keys, memory) = enabled().await;
+        let (backend, gate) = crate::test_support::FakeBackend::gated(EXTRACTION);
+        let backend = Arc::new(backend);
+
+        memory.learn_after(backend.clone(), "c1", turn());
+        backend.entered.notified().await;
+        memory.clear().await.unwrap();
+        gate.notify_one();
+        until_idle(&memory).await;
+
+        // La memoria quedó encendida y vacía: lo del modelo llegó tarde.
+        assert!(memory.status().await.available);
+        assert_eq!(memory.recall("mate", true).await, None);
+    }
+
+    #[tokio::test]
+    async fn apagar_y_volver_a_encender_en_medio_de_una_extraccion_tambien_la_descarta() {
+        let (_tmp, _keys, memory) = enabled().await;
+        let (backend, gate) = crate::test_support::FakeBackend::gated(EXTRACTION);
+        let backend = Arc::new(backend);
+
+        memory.learn_after(backend.clone(), "c1", turn());
+        backend.entered.notified().await;
+        memory.set_enabled(false).await.unwrap();
+        memory.set_enabled(true).await.unwrap();
+        gate.notify_one();
+        until_idle(&memory).await;
+
+        assert_eq!(memory.recall("mate", true).await, None);
+    }
+
+    #[tokio::test]
+    async fn sin_cambios_en_medio_la_misma_extraccion_si_se_guarda() {
+        let (_tmp, _keys, memory) = enabled().await;
+        let (backend, gate) = crate::test_support::FakeBackend::gated(EXTRACTION);
+        let backend = Arc::new(backend);
+
+        memory.learn_after(backend.clone(), "c1", turn());
+        backend.entered.notified().await;
+        gate.notify_one();
+        until_idle(&memory).await;
+
+        assert!(memory
+            .recall("mate", true)
+            .await
+            .unwrap()
+            .contains("mate amargo"));
+    }
+
+    #[tokio::test]
+    async fn lo_dicho_antes_de_encender_no_se_aprende_ni_se_manda_al_modelo() {
+        let (_tmp, _keys, memory) = enabled().await;
+        let backend = crate::test_support::ScriptedBackend::new([EXTRACTION]);
+        let mut conversation = vec![
+            Message {
+                role: Role::User,
+                content: "mi perro se llama Rex y es muy bueno".into(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: "Qué lindo.".into(),
+            },
+        ];
+        conversation.extend(turn());
+
+        // Es la primera vez que la memoria ve esta conversación: la ventana
+        // arranca en el turno actual.
+        memory.learn_after(backend.clone(), "c1", conversation);
+        backend.wait_for_calls(1).await;
+
+        let request = backend.seen.lock()[0][1].content.clone();
+        assert!(request.contains("prefiero el mate amargo"));
+        assert!(!request.contains("Rex"), "{request}");
+    }
+
+    #[test]
+    fn la_ventana_arranca_donde_se_vio_la_conversacion_y_se_reinicia_con_la_epoca() {
+        let memory = Memory::new(None, FixedKey::new(None));
+
+        assert_eq!(memory.window_start("c", 0, 4), 4);
+        // Los turnos siguientes de la misma época conservan el arranque.
+        assert_eq!(memory.window_start("c", 0, 6), 4);
+        assert_eq!(memory.window_start("c", 0, 10), 4);
+        // El historial recortó lo más viejo: nunca pasa del turno actual.
+        assert_eq!(memory.window_start("c", 0, 2), 2);
+        // Otra época: arranca de nuevo.
+        assert_eq!(memory.window_start("c", 1, 8), 8);
+        // Otra conversación, otra ventana.
+        assert_eq!(memory.window_start("otra", 1, 0), 0);
+    }
+
+    #[test]
+    fn la_cuenta_de_ventanas_tiene_tope_y_olvidar_solo_achica_la_ventana() {
+        let memory = Memory::new(None, FixedKey::new(None));
+
+        for n in 0..(MAX_TRACKED_CONVERSATIONS * 3) {
+            memory.window_start(&format!("c{n}"), 0, 5);
+        }
+
+        assert!(memory.windows.lock().len() <= MAX_TRACKED_CONVERSATIONS);
+        // Una conversación olvidada vuelve a arrancar en el turno actual.
+        assert_eq!(memory.window_start("c0", 0, 9), 9);
+    }
+}

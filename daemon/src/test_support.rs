@@ -389,14 +389,11 @@ impl SecretSource for FixedKey {
 /// confinado, `FixedLabel::none()` uno sin AppArmor, y `FixedLabel::failing()`
 /// un bus que no contesta (se trata como confinado). Anota cuántas veces se
 /// preguntó.
-// Infraestructura para las pruebas de la puerta de AppArmor, que escribe qa.
-#[allow(dead_code)]
 pub struct FixedLabel {
     pub label: Result<Option<Vec<u8>>, ()>,
     pub asked: Mutex<usize>,
 }
 
-#[allow(dead_code)]
 impl FixedLabel {
     pub fn of(label: &[u8]) -> Arc<Self> {
         Arc::new(Self {

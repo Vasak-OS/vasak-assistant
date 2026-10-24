@@ -431,6 +431,7 @@ mod tests {
             (Error::NotFound(String::new()), "NotFound"),
             (Error::LimitExceeded(String::new()), "LimitExceeded"),
             (Error::Busy(String::new()), "Busy"),
+            (Error::AccessDenied(String::new()), "AccessDenied"),
         ];
         for (error, name) in casos {
             assert_eq!(error.name().as_str(), format!("{prefix}.{name}"));

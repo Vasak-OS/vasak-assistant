@@ -1565,6 +1565,23 @@ mod memory_tests {
         assert_eq!(count, 1);
     }
 
+    // Falla hoy: `learn_after` arma el pedido con `extraction_request`, que ante
+    // una ventana vacía devuelve igual el aviso del sistema con `[]`, y llama al
+    // modelo para nada. Se quita el `ignore` al arreglarlo.
+    #[tokio::test]
+    #[ignore = "bug: con la ventana vacía igual se llama al modelo extractor"]
+    async fn un_ultimo_mensaje_con_un_dato_de_la_persona_no_manda_nada_al_modelo_extractor() {
+        let world = World::new(["Listo."]).await;
+
+        world
+            .say("escribime a ana@ejemplo.com, prefiero el mate")
+            .await;
+        World::settle().await;
+
+        // La ventana quedó vacía: no hay nada que pedirle al modelo.
+        assert_eq!(world.backend.seen.lock().len(), 1, "sólo el chat");
+    }
+
     #[tokio::test]
     async fn un_turno_con_un_secreto_no_dispara_la_extraccion() {
         let world = World::new(["Listo."]).await;
@@ -1654,5 +1671,308 @@ mod memory_tests {
         proxy.clear_memory().await.unwrap();
         assert_eq!(proxy.memory_status().await.unwrap().bytes, 0);
         drop(server);
+    }
+}
+
+/// La puerta de AppArmor: la decisión pura y de punta a punta por el bus, con
+/// una etiqueta de mentira.
+#[cfg(test)]
+mod gate_tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::memory::learn::{Extraction, Item};
+    use crate::memory::schema::MemoryKind;
+    use crate::test_support::{p2p_pair, FixedKey, FixedLabel, ScriptedBackend, TempDir};
+    use vasak_assistant_protocol::{AssistantProxy, DOMAIN_MEMORY, SERVICE_PATH};
+
+    const CONFINED: &[u8] = b"vasak-appimage (enforce)\0";
+
+    #[test]
+    fn solo_una_etiqueta_que_existe_y_no_es_unconfined_confina() {
+        for (label, confined) in [
+            (None, false),
+            (Some(&b""[..]), false),
+            (Some(&b"\0"[..]), false),
+            (Some(&b"   \0"[..]), false),
+            (Some(&b"unconfined"[..]), false),
+            (Some(&b"unconfined\0"[..]), false),
+            (Some(&b" unconfined \0"[..]), false),
+            (Some(CONFINED), true),
+            (Some(&b"vasak-appimage (enforce)"[..]), true),
+            (Some(&b"docker-default (enforce)\0"[..]), true),
+            (Some(&b"/usr/bin/firefox (complain)\0"[..]), true),
+            (Some(&b"unconfined (enforce)\0"[..]), true),
+            (Some(&b"Unconfined\0"[..]), true),
+            // No es UTF-8: no se adivina, se la trata como una etiqueta cualquiera.
+            (Some(&[0xff, 0xfe, 0x00][..]), true),
+        ] {
+            assert_eq!(is_confined(label), confined, "{label:?}");
+        }
+    }
+
+    #[test]
+    fn el_mensaje_de_acceso_denegado_es_un_access_denied_y_no_nombra_secretos() {
+        let Error::AccessDenied(text) = access_denied() else {
+            panic!("tenía que ser AccessDenied");
+        };
+        assert!(text.contains("confinada"));
+    }
+
+    struct Gate {
+        tmp: TempDir,
+        keys: Arc<FixedKey>,
+        backend: Arc<ScriptedBackend>,
+        label: Arc<FixedLabel>,
+        memory: Arc<Memory>,
+        proxy: AssistantProxy<'static>,
+        _server: zbus::Connection,
+    }
+
+    async fn gate(label: Arc<FixedLabel>, replies: impl IntoIterator<Item = &'static str>) -> Gate {
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        let backend = ScriptedBackend::new(replies);
+        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
+        let service = AssistantService {
+            backend: backend.clone(),
+            conversations: Arc::default(),
+            remote_allowed: false,
+            secrets: keys.clone(),
+            memory: memory.clone(),
+            labels: label.clone(),
+        };
+        let (server, client) = p2p_pair(|builder| builder.serve_at(SERVICE_PATH, service))
+            .await
+            .unwrap();
+        let proxy = AssistantProxy::builder(&client)
+            .path(SERVICE_PATH)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        Gate {
+            tmp,
+            keys,
+            backend,
+            label,
+            memory,
+            proxy,
+            _server: server,
+        }
+    }
+
+    fn denied<T: std::fmt::Debug>(result: Result<T, Error>) {
+        assert!(
+            matches!(result, Err(Error::AccessDenied(_))),
+            "se esperaba AccessDenied: {result:?}"
+        );
+    }
+
+    fn labels() -> Vec<(&'static str, Arc<FixedLabel>)> {
+        vec![
+            ("confinado", FixedLabel::of(CONFINED)),
+            ("el bus no contesta", FixedLabel::failing()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn un_llamador_confinado_no_enciende_la_memoria_y_no_se_crea_nada() {
+        for (name, label) in labels() {
+            let gate = gate(label, []).await;
+
+            denied(gate.proxy.set_memory_enabled(true).await);
+
+            assert!(!gate.tmp.memory_dir().exists(), "{name}");
+            assert!(gate.keys.memory_key.lock().is_none(), "{name}");
+            assert!(gate.keys.calls.lock().is_empty(), "{name}");
+            assert!(!gate.memory.status().await.enabled, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn un_llamador_confinado_no_apaga_ni_borra_una_memoria_encendida() {
+        for (name, label) in labels() {
+            let gate = gate(label, []).await;
+            gate.memory.set_enabled(true).await.unwrap();
+            let key = gate.keys.memory_key.lock().clone();
+            let calls = gate.keys.calls.lock().len();
+
+            denied(gate.proxy.set_memory_enabled(false).await);
+            denied(gate.proxy.clear_memory().await);
+
+            let status = gate.memory.status().await;
+            assert!(status.enabled && status.available, "{name}");
+            assert_eq!(*gate.keys.memory_key.lock(), key, "{name}");
+            assert!(
+                !gate.keys.calls.lock()[calls..]
+                    .iter()
+                    .any(|call| call.starts_with("delete_memory_key")),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn un_llamador_confinado_no_guarda_ni_consulta_claves_del_proveedor() {
+        for (name, label) in labels() {
+            let gate = gate(label, []).await;
+
+            denied(
+                gate.proxy
+                    .set_provider_key("https://api.openai.com/v1", "sk-del-confinado")
+                    .await,
+            );
+            denied(
+                gate.proxy
+                    .has_provider_key("https://api.openai.com/v1")
+                    .await,
+            );
+
+            assert!(gate.keys.stored.lock().is_empty(), "{name}");
+            assert!(gate.keys.asked.lock().is_empty(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sin_etiqueta_o_unconfined_los_cuatro_metodos_funcionan() {
+        for (name, label) in [
+            ("sin AppArmor", FixedLabel::none()),
+            ("unconfined", FixedLabel::of(b"unconfined\0")),
+        ] {
+            let gate = gate(label, []).await;
+
+            gate.proxy.set_memory_enabled(true).await.unwrap();
+            assert!(gate.memory.status().await.available, "{name}");
+            gate.proxy
+                .set_provider_key("https://api.openai.com/v1", "sk-propia")
+                .await
+                .unwrap();
+            assert!(gate
+                .proxy
+                .has_provider_key("https://api.openai.com/v1")
+                .await
+                .unwrap());
+            gate.proxy.clear_memory().await.unwrap();
+            gate.proxy.set_memory_enabled(false).await.unwrap();
+            assert!(!gate.memory.status().await.enabled, "{name}");
+            assert!(*gate.label.asked.lock() >= 5, "se pregunta en cada pedido");
+        }
+    }
+
+    #[tokio::test]
+    async fn el_estado_las_capacidades_y_las_conversaciones_siguen_abiertos_a_un_confinado() {
+        let gate = gate(FixedLabel::of(CONFINED), []).await;
+        gate.memory.set_enabled(true).await.unwrap();
+
+        let status = gate.proxy.memory_status().await.unwrap();
+        assert!(status.enabled && status.available);
+        let capabilities = gate.proxy.capabilities().await.unwrap();
+        assert!(
+            capabilities
+                .iter()
+                .find(|c| c.domain == DOMAIN_MEMORY)
+                .unwrap()
+                .available
+        );
+        let id = gate.proxy.new_conversation().await.unwrap();
+        gate.proxy.conversations().await.unwrap();
+        gate.proxy.status().await.unwrap();
+        gate.proxy.history(&id).await.unwrap();
+        gate.proxy.delete_conversation(&id).await.unwrap();
+    }
+
+    fn remembered() -> Extraction {
+        Extraction {
+            items: vec![Item {
+                kind: MemoryKind::Preference,
+                text: "Prefiere respuestas cortas".into(),
+                phrase: None,
+                topics: Vec::new(),
+            }],
+            summary: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn el_chat_de_un_confinado_funciona_pero_sin_notas_y_sin_aprender() {
+        for (name, label) in labels() {
+            let gate = gate(label, ["Hola.", "No debería pedirse"]).await;
+            gate.memory.set_enabled(true).await.unwrap();
+            gate.memory.store(remembered(), "c0").await.unwrap();
+            let id = gate.proxy.new_conversation().await.unwrap();
+
+            let reply = gate
+                .proxy
+                .chat(&id, "prefiero respuestas cortas, ¿qué tal?")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            assert_eq!(reply, "Hola.", "{name}");
+            let seen = gate.backend.seen.lock().clone();
+            assert_eq!(seen.len(), 1, "{name}: ni una extracción");
+            assert!(seen[0].iter().all(|m| m.role != Role::System), "{name}");
+            assert!(
+                seen[0]
+                    .iter()
+                    .all(|m| !m.content.contains("Prefiere respuestas cortas")),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn el_chat_de_un_llamador_sin_confinar_si_recibe_las_notas() {
+        for (name, label) in [
+            ("sin AppArmor", FixedLabel::none()),
+            ("unconfined", FixedLabel::of(b"unconfined\0")),
+        ] {
+            let gate = gate(label, ["Hola."]).await;
+            gate.memory.set_enabled(true).await.unwrap();
+            gate.memory.store(remembered(), "c0").await.unwrap();
+            let id = gate.proxy.new_conversation().await.unwrap();
+
+            gate.proxy.chat(&id, "hola, ¿qué tal?").await.unwrap();
+
+            let seen = gate.backend.seen.lock().clone();
+            assert_eq!(seen[0][0].role, Role::System, "{name}");
+            assert!(
+                seen[0][0].content.contains("Prefiere respuestas cortas"),
+                "{name}"
+            );
+        }
+    }
+}
+
+/// La etiqueta que da el bus de verdad, contra un `dbus-daemon` privado.
+#[cfg(test)]
+mod bus_label_tests {
+    use super::*;
+    use crate::test_support::PrivateBus;
+
+    #[tokio::test]
+    async fn sin_remitente_no_hay_etiqueta_y_con_un_nombre_invalido_el_bus_falla() {
+        let (_server, client) = crate::test_support::p2p_pair(Ok).await.unwrap();
+
+        assert_eq!(BusLabels.label(&client, None).await, Ok(None));
+        assert_eq!(
+            BusLabels.label(&client, Some("no es un nombre")).await,
+            Err(())
+        );
+    }
+
+    #[tokio::test]
+    async fn por_un_bus_real_se_pregunta_por_el_remitente_y_uno_inexistente_es_un_error() {
+        let Some(bus) = PrivateBus::start_or_skip() else {
+            return;
+        };
+        let (me, other) = (bus.connect().await, bus.connect().await);
+        let sender = other.unique_name().unwrap().to_string();
+
+        // Con o sin AppArmor en la máquina que corre la prueba, el bus contesta.
+        let label = BusLabels.label(&me, Some(&sender)).await;
+        assert!(label.is_ok(), "{label:?}");
+        assert_eq!(BusLabels.label(&me, Some(":1.99999")).await, Err(()));
     }
 }
