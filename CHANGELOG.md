@@ -41,6 +41,9 @@ proveedor en el esquema protegido del llavero.
   `AccessDenied` en `SetMemoryEnabled`, `ClearMemory`, `SetProviderKey` y
   `HasProviderKey`, y chatea sin memoria. `protocol` suma
   `Error::AccessDenied`.
+  Una etiqueta vacía cuenta como confinada. Límite: la puerta mira sólo a
+  quien llama, y el perfil `vasak-appimage` todavía deja lanzar un proceso sin
+  confinar que la pasa (se cierra en Vasak-OS/vasak-desktop-settings#13).
 - **`daemon/memory`, endurecimiento** — no se abre una base sin cifrar ni con
   restos de una migración de Grafeo; las notas se filtran contra inyección
   (NFKC, caracteres de formato, marcadores de rol, comillas, credenciales) y

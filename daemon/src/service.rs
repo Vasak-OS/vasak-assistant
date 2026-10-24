@@ -15,7 +15,7 @@
 //! encender, apagar ni borrar la memoria ni guardar o consultar claves
 //! (`AccessDenied`), y su `Chat` va sin memoria: no se le pasan notas ni se
 //! aprende de lo que dice. `MemoryStatus` y `Capabilities` siguen abiertos.
-//! Sin etiqueta (no hay AppArmor) se deja pasar. No se mira
+//! Sin etiqueta (no hay AppArmor) se deja pasar; una vacía, no. No se mira
 //! `/proc/<pid>/exe`: la unidad corre con un namespace de usuario y da EACCES.
 
 use std::sync::Arc;
@@ -89,17 +89,16 @@ impl CallerLabels for BusLabels {
     }
 }
 
-/// Si la etiqueta de AppArmor dice que el llamador está confinado: existe, no
-/// está vacía y no es `unconfined`. Llega como bytes terminados en NUL, por
-/// ejemplo `vasak-appimage (enforce)`. Sin etiqueta, no está confinado.
+/// Si la etiqueta de AppArmor dice que el llamador está confinado: existe y
+/// no es exactamente `unconfined`. Llega como bytes terminados en NUL, por
+/// ejemplo `vasak-appimage (enforce)`. Sin etiqueta (`None`), no está
+/// confinado; una etiqueta vacía o que no se entiende, sí: falla cerrado.
 pub fn is_confined(label: Option<&[u8]>) -> bool {
     let Some(label) = label else {
         return false;
     };
     let label = label.strip_suffix(&[0]).unwrap_or(label);
-    let text = String::from_utf8_lossy(label);
-    let text = text.trim();
-    !text.is_empty() && text != "unconfined"
+    String::from_utf8_lossy(label).trim() != "unconfined"
 }
 
 fn access_denied() -> Error {
@@ -1688,9 +1687,10 @@ mod gate_tests {
     fn solo_una_etiqueta_que_existe_y_no_es_unconfined_confina() {
         for (label, confined) in [
             (None, false),
-            (Some(&b""[..]), false),
-            (Some(&b"\0"[..]), false),
-            (Some(&b"   \0"[..]), false),
+            // Una etiqueta vacía falla cerrado.
+            (Some(&b""[..]), true),
+            (Some(&b"\0"[..]), true),
+            (Some(&b"   \0"[..]), true),
             (Some(&b"unconfined"[..]), false),
             (Some(&b"unconfined\0"[..]), false),
             (Some(&b" unconfined \0"[..]), false),

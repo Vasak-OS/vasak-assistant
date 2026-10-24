@@ -84,7 +84,21 @@ cada aplicación. Si quien llama está confinado por AppArmor (el bus informa su
 `SetMemoryEnabled` y `ClearMemory` contestan
 `ar.net.vasak.os.Assistant.Error.AccessDenied`, y su `Chat` va sin memoria: no
 se le pasan notas ni se aprende de lo que dice. `MemoryStatus` y
-`Capabilities` siguen abiertos. Sin AppArmor no hay etiqueta y se deja pasar.
+`Capabilities` siguen abiertos. Sin AppArmor no hay etiqueta y se deja pasar;
+una etiqueta vacía cuenta como confinada.
+
+Cuenta como confinado todo lo que tenga perfil, aunque esté en modo complain
+(por ejemplo `busctl` y `qdbus`) o sea un perfil `(unconfined)` con nombre
+(Flatpak, Firefox): `Chat` va sin memoria y los métodos de control dan
+`AccessDenied`. Sólo pasa la etiqueta `unconfined` a secas. Configuración, el
+chat y la CLI propia del asistente no tienen perfil.
+
+**El límite.** La puerta mira a quien hace el llamado, y nada más. El perfil
+`vasak-appimage` permite `dbus,`, `file,` y `change_profile,`: con eso, un
+AppImage hostil puede lanzar un proceso sin confinar —con
+`systemd-run --user`, con `change_profile` o escribiendo unidades o archivos
+de arranque— y ese proceso pasa la puerta. Cerrarlo es trabajo del perfil, en
+Vasak-OS/vasak-desktop-settings#13.
 
 | Método | Qué hace |
 |---|---|
@@ -170,6 +184,11 @@ busctl --user call $d $p $d Status
 id=$(busctl --user call $d $p $d NewConversation | cut -d'"' -f2)
 busctl --user call $d $p $d Chat ss "$id" "Hola, ¿quién sos?"
 ```
+
+Con AppArmor, `busctl` tiene perfil (en modo complain), así que cuenta como
+confinado: el `Chat` de arriba va **sin memoria** y `SetMemoryEnabled`,
+`ClearMemory`, `SetProviderKey` y `HasProviderKey` le contestan
+`AccessDenied`. Para la memoria y las claves, Configuración.
 
 Instalado, lo arranca systemd como servicio de usuario
 (`packaging/vasak-assistant.service`, parte de `graphical-session.target`) o
