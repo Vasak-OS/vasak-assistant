@@ -7,7 +7,7 @@ resolver = "2"
 members = ["protocol", "daemon"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 authors = ["Vasak Group", "Joaquin (Pato) Decima"]
 license = "GPL-3.0-or-later"
@@ -20,3 +20,10 @@ serde = { version = "1", features = ["derive"] }
 # reqwest y `tokio::time` entran en pánico con «there is no reactor running».
 zbus = { version = "5", features = ["tokio"] }
 tokio = { version = "1", features = ["full"] }
+
+# El demonio y el motor de grafos de la memoria, optimizados del todo: el
+# paquete se compila una vez y corre todo el día.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

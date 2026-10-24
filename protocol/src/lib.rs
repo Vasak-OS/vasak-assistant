@@ -13,6 +13,28 @@
 //! [`Assistant::capabilities`] las lista como **no disponibles**, nunca como un
 //! error ni como un método que falla (decisión de producto,
 //! vasak-accounts#24). Lo que falta se ve que falta.
+//!
+//! # La memoria
+//!
+//! El asistente puede tener una memoria propia: una base de grafos cifrada en
+//! la carpeta de estado del servicio, con la llave en el llavero de la sesión.
+//! **Viene apagada**: existe sólo desde que la persona la enciende
+//! ([`Assistant::set_memory_enabled`]). Apagarla no borra nada: deja de usarla
+//! y encenderla de nuevo la reabre. Borrar es sólo [`Assistant::clear_memory`].
+//! [`Assistant::memory_status`] dice si está encendida, si se puede usar y
+//! cuánto ocupa.
+//!
+//! Qué guarda: lo que la persona dice de sí misma —preferencias, cómo quiere
+//! que le hablen, hábitos, temas, correcciones, nombres que usa— y resúmenes
+//! breves de conversaciones. Lo aprende solo después de responder, y lo usa
+//! como notas en el contexto del modelo, nunca en el historial. **No guarda
+//! datos sensibles que no son suyos** (correo, calendario, contactos,
+//! archivos, cuentas, claves): esos se leen de su servicio en el momento. Con
+//! un proveedor remoto, la memoria no se lee ni se escribe salvo que la
+//! persona lo permita (`share_memory_with_remote` en `vasak.conf`); si no,
+//! `MemoryStatus` y `Capabilities` dicen «La memoria no se comparte con un
+//! proveedor remoto». No hay métodos para leer o editar recuerdos sueltos:
+//! sólo encender, apagar y borrar.
 
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::Type;
@@ -147,6 +169,22 @@ pub struct Capability {
     pub reason: String,
 }
 
+/// Cómo está la memoria del asistente. Firma `(bbst)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct MemoryStatus {
+    /// Si la persona la encendió, se pueda abrir o no.
+    pub enabled: bool,
+    /// Si está encendida y abierta, lista para usarse.
+    pub available: bool,
+    /// Por qué no está disponible, en palabras para mostrarle a la persona
+    /// («La memoria está apagada», «El llavero está bloqueado», …). Vacío si
+    /// está disponible.
+    pub reason: String,
+    /// Cuánto ocupa en disco, en bytes, encendida o apagada. Se mide sin
+    /// abrirla; 0 si no hay base.
+    pub bytes: u64,
+}
+
 // ── Los errores ───────────────────────────────────────────────────────────────
 
 /// Los errores que devuelve el servicio, con nombre propio en el bus
@@ -171,6 +209,9 @@ pub enum Error {
     LimitExceeded(String),
     /// La conversación ya está esperando una respuesta.
     Busy(String),
+    /// Quien llama no puede hacer eso: una aplicación confinada (AppArmor) no
+    /// enciende, apaga ni borra la memoria, ni guarda o consulta claves.
+    AccessDenied(String),
 }
 
 // ── El proxy, para quien esté en zbus 5 ───────────────────────────────────────
@@ -199,7 +240,9 @@ pub trait Assistant {
 
     /// Las capacidades sobre cada dominio de [`DOMAINS`]. En esta fase las de
     /// datos del usuario vienen como no disponibles; `remote_backends` dice si
-    /// la configuración permite un proveedor remoto.
+    /// la configuración permite un proveedor remoto, y `memory` está
+    /// disponible si la memoria está encendida y abierta (si no, el motivo es
+    /// el de [`Self::memory_status`], o «La memoria está apagada»).
     fn capabilities(&self) -> Result<Vec<Capability>, Error>;
 
     /// Los modelos instalados en el backend. `Unavailable` si no responde.
@@ -238,6 +281,8 @@ pub trait Assistant {
     ///   ningún diálogo de desbloqueo: el motivo dice qué hacer.
     ///
     /// La clave nunca vuelve en un error ni va al registro.
+    ///
+    /// `AccessDenied` si quien llama es una aplicación confinada (AppArmor).
     fn set_provider_key(&self, url: &str, key: &str) -> Result<(), Error>;
 
     /// Si hay una clave guardada en el llavero para `url` (normalizada igual
@@ -245,7 +290,34 @@ pub trait Assistant {
     /// Si hay más de una para la misma dirección da `false`: el servicio no usa
     /// ninguna hasta que quede una sola. Nunca devuelve la clave. `InvalidArgs` si la dirección no se puede usar,
     /// `Unavailable` si el llavero no responde.
+    /// `AccessDenied` si quien llama es una aplicación confinada (AppArmor).
     fn has_provider_key(&self, url: &str) -> Result<bool, Error>;
+
+    /// Cómo está la memoria. Nunca falla (salvo el bus): cualquier problema
+    /// llega como `available: false` con el motivo (también el de un
+    /// proveedor remoto sin permiso). `bytes` se mide sin abrir la base.
+    fn memory_status(&self) -> Result<MemoryStatus, Error>;
+
+    /// Enciende o apaga la memoria.
+    ///
+    /// - Encender reabre la base que haya, con la llave que está en el
+    ///   llavero; si no hay, genera una llave nueva, la guarda en el llavero y
+    ///   crea la base vacía y cifrada. `Unavailable` si el llavero está
+    ///   bloqueado o no responde (nunca se abre un diálogo), si la llave falta
+    ///   o no abre la base existente, o si no se pudo crear. Si ya estaba
+    ///   encendida y abierta, no hace nada.
+    /// - Apagar **no borra nada**: deja de usarla y de escribirla; los archivos
+    ///   y la llave quedan.
+    ///
+    /// `AccessDenied` si quien llama es una aplicación confinada (AppArmor).
+    fn set_memory_enabled(&self, enabled: bool) -> Result<(), Error>;
+
+    /// Borra la memoria: primero la llave del llavero y después los archivos.
+    /// Si estaba encendida, la recrea vacía con una llave nueva. `Unavailable`
+    /// si el llavero está bloqueado (entonces no se toca nada) o no responde.
+    /// Es la salida cuando la llave falta o no abre la base.
+    /// `AccessDenied` si quien llama es una aplicación confinada (AppArmor).
+    fn clear_memory(&self) -> Result<(), Error>;
 }
 
 #[cfg(test)]
@@ -277,6 +349,27 @@ mod tests {
         assert_eq!(signature::<ModelInfo>(), "(ssbs)");
         assert_eq!(signature::<ServiceStatus>(), "(bs(ssbs)u)");
         assert_eq!(signature::<Capability>(), "(sbs)");
+        assert_eq!(signature::<MemoryStatus>(), "(bbst)");
+    }
+
+    #[test]
+    fn el_estado_de_la_memoria_hace_ida_y_vuelta_por_dbus() {
+        for status in [
+            MemoryStatus {
+                enabled: true,
+                available: true,
+                reason: String::new(),
+                bytes: 4 << 20,
+            },
+            MemoryStatus {
+                enabled: false,
+                available: false,
+                reason: "La memoria está apagada".into(),
+                bytes: u64::MAX,
+            },
+        ] {
+            assert_eq!(round_trip(&status), status);
+        }
     }
 
     #[test]
@@ -338,6 +431,7 @@ mod tests {
             (Error::NotFound(String::new()), "NotFound"),
             (Error::LimitExceeded(String::new()), "LimitExceeded"),
             (Error::Busy(String::new()), "Busy"),
+            (Error::AccessDenied(String::new()), "AccessDenied"),
         ];
         for (error, name) in casos {
             assert_eq!(error.name().as_str(), format!("{prefix}.{name}"));

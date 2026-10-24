@@ -5,6 +5,7 @@
 //! `127.0.0.1:0` y la conexión D-Bus es un par de sockets de la misma prueba.
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -17,7 +18,8 @@ use zbus::{connection, Connection};
 
 use crate::backend::{BackendError, BoxFuture, ModelBackend};
 use crate::config::{select_backend, Selection, Settings};
-use crate::keyring::{ApiKey, SecretSource};
+use crate::keyring::{ApiKey, MemoryKey, SecretSource, MEMORY_KEY_BYTES};
+use crate::memory::Memory;
 
 /// Quien lee o cambia variables de entorno que `reqwest` mira al armar el
 /// cliente toma este candado: las pruebas corren en paralelo y el entorno es
@@ -247,6 +249,7 @@ pub fn local_selection(backend: &str, url: &str, model: Option<&str>) -> Selecti
         url: Some(url.into()),
         model: model.map(str::to_owned),
         allow_remote: false,
+        share_memory_with_remote: false,
     })
     .unwrap_or_else(|rejection| panic!("la selección local se acepta: {}", rejection.reason))
 }
@@ -255,11 +258,34 @@ pub fn local_selection(backend: &str, url: &str, model: Option<&str>) -> Selecti
 
 /// Una clave fija; guarda las direcciones por las que le preguntaron y lo que
 /// le pidieron guardar.
+///
+/// También hace de llavero para la llave de la memoria: la guarda en
+/// `memory_key`, se puede bloquear (`locked`) o dejar sin responder
+/// (`unreachable`), y anota cada llamada en `calls`, en orden.
 pub struct FixedKey {
     pub key: Option<ApiKey>,
     pub asked: Mutex<Vec<String>>,
     /// Cada `store_key`: la dirección y la clave.
     pub stored: Mutex<Vec<(String, ApiKey)>>,
+    /// La llave de la memoria tal como está en el llavero (cualquier largo,
+    /// para probar una inválida). `None`: no hay ítem.
+    pub memory_key: Mutex<Option<Vec<u8>>>,
+    /// Si es `true`, el llavero está bloqueado: `is_locked` da `true`,
+    /// `memory_key` da `Locked` si hay llave, y guardar o borrar dan
+    /// `Unavailable` sin tocarla.
+    pub locked: Mutex<bool>,
+    /// Si es `true`, el llavero no responde: todo lo de la memoria da
+    /// `Unavailable`.
+    pub unreachable: Mutex<bool>,
+    /// Si es `true`, `memory_key` da `Duplicated` (dos ítems).
+    pub duplicated: Mutex<bool>,
+    /// Las llamadas sobre la memoria en orden (`is_locked`, `memory_key`,
+    /// `store_memory_key`, `delete_memory_key`). Con `watch` puesto, cada una
+    /// lleva entre paréntesis si esa ruta existía en ese momento:
+    /// `delete_memory_key(true)` quiere decir que la llave se borró con la
+    /// carpeta todavía en disco.
+    pub calls: Mutex<Vec<String>>,
+    pub watch: Mutex<Option<PathBuf>>,
 }
 
 impl FixedKey {
@@ -268,7 +294,33 @@ impl FixedKey {
             key: key.and_then(|key| ApiKey::parse(key.as_bytes())),
             asked: Mutex::default(),
             stored: Mutex::default(),
+            memory_key: Mutex::default(),
+            locked: Mutex::default(),
+            unreachable: Mutex::default(),
+            duplicated: Mutex::default(),
+            calls: Mutex::default(),
+            watch: Mutex::default(),
         })
+    }
+
+    /// Anota la llamada y dice si el llavero responde.
+    fn call(&self, name: &str) -> Result<(), Error> {
+        let entry = match &*self.watch.lock() {
+            Some(path) => format!("{name}({})", path.exists()),
+            None => name.to_owned(),
+        };
+        self.calls.lock().push(entry);
+        if *self.unreachable.lock() {
+            return Err(Error::Unavailable("el llavero no responde".into()));
+        }
+        Ok(())
+    }
+
+    fn locked_error(&self) -> Result<(), Error> {
+        if *self.locked.lock() {
+            return Err(Error::Unavailable("El llavero está bloqueado".into()));
+        }
+        Ok(())
     }
 }
 
@@ -288,6 +340,138 @@ impl SecretSource for FixedKey {
     fn has_key<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<bool, Error>> {
         let has = self.key.is_some() || self.stored.lock().iter().any(|(u, _)| u == url);
         Box::pin(async move { Ok(has) })
+    }
+
+    fn is_locked(&self) -> BoxFuture<'_, Result<bool, Error>> {
+        let result = self.call("is_locked").map(|()| *self.locked.lock());
+        Box::pin(async move { result })
+    }
+
+    fn memory_key(&self) -> BoxFuture<'_, Result<MemoryKey, Error>> {
+        let result = self.call("memory_key").map(|()| {
+            let stored = self.memory_key.lock().clone();
+            match stored {
+                None => MemoryKey::Missing,
+                Some(_) if *self.duplicated.lock() => MemoryKey::Duplicated,
+                Some(_) if *self.locked.lock() => MemoryKey::Locked,
+                Some(bytes) => <[u8; MEMORY_KEY_BYTES]>::try_from(bytes.as_slice())
+                    .map(|key| MemoryKey::Found(zeroize::Zeroizing::new(key)))
+                    .unwrap_or(MemoryKey::Invalid),
+            }
+        });
+        Box::pin(async move { result })
+    }
+
+    fn store_memory_key<'a>(
+        &'a self,
+        key: &'a [u8; MEMORY_KEY_BYTES],
+    ) -> BoxFuture<'a, Result<(), Error>> {
+        let result = self
+            .call("store_memory_key")
+            .and_then(|()| self.locked_error())
+            .map(|()| *self.memory_key.lock() = Some(key.to_vec()));
+        Box::pin(async move { result })
+    }
+
+    fn delete_memory_key(&self) -> BoxFuture<'_, Result<(), Error>> {
+        let result = self
+            .call("delete_memory_key")
+            .and_then(|()| self.locked_error())
+            .map(|()| *self.memory_key.lock() = None);
+        Box::pin(async move { result })
+    }
+}
+
+// ── Etiqueta de AppArmor de mentira ───────────────────────────────────────────
+
+/// Una etiqueta de seguridad fija para quien llame, en lugar de preguntarle al
+/// bus: `FixedLabel::of(b"vasak-appimage (enforce)\0")` es un llamador
+/// confinado, `FixedLabel::none()` uno sin AppArmor, y `FixedLabel::failing()`
+/// un bus que no contesta (se trata como confinado). Anota cuántas veces se
+/// preguntó.
+pub struct FixedLabel {
+    pub label: Result<Option<Vec<u8>>, ()>,
+    pub asked: Mutex<usize>,
+}
+
+impl FixedLabel {
+    pub fn of(label: &[u8]) -> Arc<Self> {
+        Arc::new(Self {
+            label: Ok(Some(label.to_vec())),
+            asked: Mutex::default(),
+        })
+    }
+
+    pub fn none() -> Arc<Self> {
+        Arc::new(Self {
+            label: Ok(None),
+            asked: Mutex::default(),
+        })
+    }
+
+    pub fn failing() -> Arc<Self> {
+        Arc::new(Self {
+            label: Err(()),
+            asked: Mutex::default(),
+        })
+    }
+}
+
+impl crate::service::CallerLabels for FixedLabel {
+    fn label<'a>(
+        &'a self,
+        _connection: &'a Connection,
+        _sender: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, ()>> {
+        *self.asked.lock() += 1;
+        let label = self.label.clone();
+        Box::pin(async move { label })
+    }
+}
+
+// ── Memoria de prueba ─────────────────────────────────────────────────────────
+
+/// Una memoria sin carpeta de estado: apagada y sin poder encenderse. La de
+/// las pruebas que no son de la memoria.
+pub fn memory_off() -> Arc<Memory> {
+    Arc::new(Memory::new(None, FixedKey::new(None)))
+}
+
+/// El estado de una memoria apagada, para `service::capabilities`.
+pub fn memory_status_off() -> vasak_assistant_protocol::MemoryStatus {
+    vasak_assistant_protocol::MemoryStatus {
+        enabled: false,
+        available: false,
+        reason: crate::memory::REASON_OFF.into(),
+        bytes: 0,
+    }
+}
+
+/// Una carpeta temporal propia de la prueba, que se borra al soltarla. La
+/// memoria de una prueba va en `TempDir::new().memory_dir()`.
+pub struct TempDir(PathBuf);
+
+impl TempDir {
+    pub fn new() -> Self {
+        let path =
+            std::env::temp_dir().join(format!("vasak-assistant-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).expect("se crea la carpeta temporal");
+        Self(path)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+
+    /// Donde va `memory/`, como si esta carpeta fuera `$STATE_DIRECTORY`.
+    pub fn memory_dir(&self) -> PathBuf {
+        self.0.join("memory")
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -361,6 +545,67 @@ impl ModelBackend for FakeBackend {
                 gate.notified().await;
             }
             self.chat_result.lock().clone()
+        })
+    }
+}
+
+/// Un backend con respuestas programadas, para las pruebas de la memoria:
+/// contesta cada `chat` con la siguiente de `replies` (el chat de la persona y
+/// después la extracción de recuerdos en JSON, por ejemplo) y anota cada
+/// pedido en `seen`. Sin respuestas programadas contesta `""`. `local` decide
+/// si se presenta como local o remoto.
+pub struct ScriptedBackend {
+    pub replies: Mutex<std::collections::VecDeque<Result<String, BackendError>>>,
+    pub seen: Mutex<Vec<Vec<Message>>>,
+    pub local: bool,
+}
+
+impl ScriptedBackend {
+    pub fn new(replies: impl IntoIterator<Item = &'static str>) -> Arc<Self> {
+        Arc::new(Self {
+            replies: Mutex::new(replies.into_iter().map(|r| Ok(r.to_owned())).collect()),
+            seen: Mutex::default(),
+            local: true,
+        })
+    }
+
+    /// Espera hasta que haya `n` pedidos (la extracción corre en otra tarea).
+    /// Falla la prueba a los 5 segundos.
+    pub async fn wait_for_calls(&self, n: usize) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.seen.lock().len() < n {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "el backend recibió {} pedidos de {n}",
+                self.seen.lock().len()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+}
+
+impl ModelBackend for ScriptedBackend {
+    fn info(&self) -> ModelInfo {
+        ModelInfo {
+            local: self.local,
+            ..model_info("guionado")
+        }
+    }
+
+    fn models(&self) -> BoxFuture<'_, Result<Vec<String>, BackendError>> {
+        Box::pin(async { Ok(vec!["guionado".into()]) })
+    }
+
+    fn active_model(&self) -> BoxFuture<'_, Result<ModelInfo, BackendError>> {
+        let info = self.info();
+        Box::pin(async move { Ok(info) })
+    }
+
+    fn chat<'a>(&'a self, messages: &'a [Message]) -> BoxFuture<'a, Result<String, BackendError>> {
+        Box::pin(async move {
+            let reply = self.replies.lock().pop_front().unwrap_or(Ok(String::new()));
+            self.seen.lock().push(messages.to_vec());
+            reply
         })
     }
 }

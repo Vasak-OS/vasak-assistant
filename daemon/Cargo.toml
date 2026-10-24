@@ -28,6 +28,25 @@ parking_lot = "0.12"
 # (por hyper-util); no suma ningún crate.
 futures-util = { version = "0.3", default-features = false }
 tracing = "0.1"
+# La memoria (fase 4): Grafeo embebido, sólo con lo que se usa —grafo de
+# propiedades, GQL, WAL, un solo archivo y cifrado AES-256-GCM—, sin `mmap`,
+# `spill`, `parallel`, `ai` ni `arrow`. Rust puro: no suma ningún `-sys` ni
+# `cc`. Fijado con `=`: es una beta, la única que cifra (en 0.5.44 el rasgo
+# `encryption` de `grafeo-engine` existe pero la base se escribe en claro).
+grafeo = { version = "=0.6.0-beta.1", default-features = false, features = ["lpg", "gql", "wal", "grafeo-file", "encryption", "text-index"] }
+# Sólo por `Direction` (para recorrer las aristas `ABOUT`), que la fachada no
+# reexporta. Ya está en el grafo, en la misma versión.
+grafeo-core = { version = "=0.6.0-beta.1", default-features = false }
+# La llave de la memoria: 32 bytes del sistema y borrados al soltarlos. Los dos
+# ya los trae Grafeo.
+getrandom = "0.4"
+zeroize = "1"
+# Los filtros de la memoria (secretos y datos de la persona), los términos de
+# búsqueda sin diacríticos y la clave de deduplicación. Los tres ya estaban en
+# el grafo.
+regex = "1"
+unicode-normalization = "0.1"
+sha2 = "0.11"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
