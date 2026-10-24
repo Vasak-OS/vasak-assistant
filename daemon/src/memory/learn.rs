@@ -313,23 +313,27 @@ fn validate_item(raw: RawItem) -> Option<Item> {
 }
 
 /// Lo que puede entrar en una nota: en NFKC, sin las comillas `«»"“”` ni la
-/// comilla invertida, recortado a `max` bytes en un límite de carácter, y que
-/// no tenga caracteres de formato, de control o de uso privado, marcadores de
-/// rol o de instrucciones, palabras de credenciales, secretos ni datos de la
-/// persona. `None` si queda vacío o no pasa.
+/// comilla invertida, que no tenga caracteres de formato, de control o de uso
+/// privado, marcadores de rol o de instrucciones, palabras de credenciales,
+/// secretos ni datos de la persona (mirado sobre el texto entero), y recortado
+/// después a `max` bytes en un límite de carácter. `None` si queda vacío o no
+/// pasa.
 fn clean(text: &str, max: usize) -> Option<String> {
     let text: String = nfkc(text)
         .chars()
         .filter(|c| !matches!(c, '«' | '»' | '"' | '“' | '”' | '`'))
         .collect();
-    let text = truncate(text.trim(), max).trim();
+    let text = text.trim();
+    // Los filtros miran el texto entero y recién después se recorta: un
+    // secreto cortado en el límite dejaría de coincidir y quedaría un pedazo.
     let valid = !text.is_empty()
         && !has_forbidden_chars(text)
         && !has_injection_markers(text)
         && !mentions_credentials(text)
         && !contains_secret(text)
         && !is_user_data(text);
-    valid.then(|| text.to_owned())
+    let text = truncate(text, max).trim();
+    (valid && !text.is_empty()).then(|| text.to_owned())
 }
 
 /// Los primeros `max` bytes de `text`, cortados en un límite de carácter.

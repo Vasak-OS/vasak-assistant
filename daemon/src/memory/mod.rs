@@ -56,7 +56,7 @@ use std::fmt::Display;
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use grafeo::{Config, EncryptionConfig, GrafeoDB, KeyChain};
@@ -134,6 +134,9 @@ pub struct Memory {
     /// Por conversación, desde qué mensaje se puede aprender en la época
     /// actual: lo dicho antes de encender (o de borrar) no se aprende.
     windows: parking_lot::Mutex<HashMap<String, (u64, usize)>>,
+    /// Si ya se podó en el episodio actual sobre [`MAX_MEMORY_DISK_BYTES`].
+    /// Se limpia cuando la base vuelve a estar dentro del tope.
+    pruned_over_limit: Arc<AtomicBool>,
 }
 
 /// Cuántas conversaciones se recuerdan en `windows` antes de olvidar las de
@@ -150,6 +153,7 @@ impl Memory {
             learning: Semaphore::new(1),
             epoch: AtomicU64::new(0),
             windows: parking_lot::Mutex::default(),
+            pruned_over_limit: Arc::default(),
         }
     }
 
@@ -320,7 +324,9 @@ impl Memory {
         }
         let db = self.usable(dir, &mut guard).await?;
         let (dir, conversation_id) = (dir.clone(), conversation_id.to_owned());
-        blocking(move || write(&db, &dir, &extraction, &conversation_id).map_err(text)).await
+        let pruned = self.pruned_over_limit.clone();
+        blocking(move || write(&db, &dir, &extraction, &conversation_id, &pruned).map_err(text))
+            .await
     }
 
     /// La época actual (sube con cada encender, apagar y borrar). Sólo la
@@ -370,6 +376,11 @@ impl Memory {
             };
         };
         let mut db = self.db.lock().await;
+        // Ya encendida y abierta: nada que hacer. Subir la época descartaría
+        // las extracciones en curso y reiniciaría todas las ventanas.
+        if enabled && db.is_some() && is_file(&flag(dir)).await {
+            return Ok(());
+        }
         self.epoch.fetch_add(1, Ordering::SeqCst);
         if !enabled {
             // Apagar no borra nada: deja de usarla y de escribirla.
@@ -673,15 +684,23 @@ fn write(
     dir: &Path,
     extraction: &Extraction,
     conversation_id: &str,
+    pruned: &AtomicBool,
 ) -> grafeo::Result<()> {
     let now = schema::now();
     if dir_size(dir) > MAX_MEMORY_DISK_BYTES {
+        // Una sola poda por episodio sobre el tope: si el directorio sigue
+        // pasado por otra causa, podar en cada escritura terminaría borrando
+        // toda la memoria. Mientras siga pasado, no se escribe.
+        if pruned.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
         schema::prune_tenth(db, now)?;
         if dir_size(dir) > MAX_MEMORY_DISK_BYTES {
             tracing::warn!("la memoria llegó a su tope de espacio: no se guarda nada más");
             return Ok(());
         }
     }
+    pruned.store(false, Ordering::SeqCst);
     for item in &extraction.items {
         let node = schema::upsert(
             db,
