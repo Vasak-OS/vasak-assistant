@@ -78,7 +78,10 @@ reemplazar esos ítems sólo a `/usr/bin/vasak-assistant` (vasak-keyring#55), y
 el servicio busca con el mismo esquema, así que un ítem común plantado por otro
 programa no se usa. Por eso `secret-tool` no puede guardar la clave: se guarda
 desde Configuración. No hay migración: un ítem sin el esquema, aunque tenga los
-mismos `service` y `url`, no se cuenta ni se usa.
+mismos `service` y `url`, no se cuenta ni se usa. Es a propósito: adoptar un
+ítem viejo dejaría usar una clave que plantó otro programa. Quien haya guardado
+la clave con la 0.2.x (sin el esquema) la tiene que volver a guardar desde
+Configuración después de actualizar.
 
 Por la misma razón, el binario de desarrollo (`cargo run`, en
 `target/debug/vasak-assistant`) no es `/usr/bin/vasak-assistant` y el llavero no
@@ -105,8 +108,12 @@ chat y la CLI propia del asistente no tienen perfil.
 `vasak-appimage` permite `dbus,`, `file,` y `change_profile,`: con eso, un
 AppImage hostil puede lanzar un proceso sin confinar —con
 `systemd-run --user`, con `change_profile` o escribiendo unidades o archivos
-de arranque— y ese proceso pasa la puerta. Cerrarlo es trabajo del perfil, en
-Vasak-OS/vasak-desktop-settings#13.
+de arranque— y ese proceso pasa la puerta. Así, con la memoria encendida, la
+puerta por etiqueta **no** protege contra un AppImage que escapa de su perfil:
+puede encenderla, borrarla, leer las notas por `Chat` o plantar recuerdos.
+Cerrarlo es trabajo del perfil, en Vasak-OS/vasak-desktop-settings#13. Hasta
+que ese issue esté cerrado, la memoria no se publica en una ISO ni se promueve:
+viene apagada y queda para quien la encienda sabiendo este límite.
 
 | Método | Qué hace |
 |---|---|
