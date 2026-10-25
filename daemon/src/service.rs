@@ -2036,6 +2036,10 @@ mod bus_label_tests {
         // Con o sin AppArmor en la máquina que corre la prueba, el bus contesta.
         let label = BusLabels.label(&me, Some(&sender)).await;
         assert!(label.is_ok(), "{label:?}");
+        // Sin remitente, en una conexión de bus de verdad (pasa `is_bus()`): lo que
+        // falla es la guarda del remitente ausente, no el chequeo de punto a punto.
+        assert!(me.is_bus());
+        assert_eq!(BusLabels.label(&me, None).await, Err(()));
         assert_eq!(BusLabels.label(&me, Some(":1.99999")).await, Err(()));
     }
 }
