@@ -52,8 +52,8 @@ pub struct AssistantService {
 /// La etiqueta de seguridad de quien llama. Un rasgo para que las pruebas
 /// pongan una de mentira (`test_support::FixedLabel`).
 pub trait CallerLabels: Send + Sync {
-    /// `Ok(None)` sin etiqueta (no hay AppArmor, o es una conexión punto a
-    /// punto, sin remitente). `Err` si el bus no contestó: se trata como
+    /// `Ok(None)` sin etiqueta (no hay AppArmor). `Err` sin remitente o si el
+    /// bus no contestó: se trata como
     /// confinado.
     fn label<'a>(
         &'a self,
@@ -73,9 +73,15 @@ impl CallerLabels for BusLabels {
         sender: Option<&'a str>,
     ) -> BoxFuture<'a, Result<Option<Vec<u8>>, ()>> {
         Box::pin(async move {
+            // Sin remitente, o sin bus que lo respalde (punto a punto, donde
+            // el par pone el remitente que quiere), no hay a quién
+            // preguntarle: falla cerrado.
             let Some(sender) = sender else {
-                return Ok(None);
+                return Err(());
             };
+            if !connection.is_bus() {
+                return Err(());
+            }
             let name = zbus::names::UniqueName::try_from(sender).map_err(drop)?;
             let bus = zbus::fdo::DBusProxy::new(connection).await.map_err(drop)?;
             let credentials = bus
@@ -110,8 +116,8 @@ fn access_denied() -> Error {
 #[interface(name = "ar.net.vasak.os.Assistant")]
 impl AssistantService {
     /// Cómo está el servicio: si hay modelo, cuál, y por qué no si no.
-    async fn status(&self, #[zbus(header)] header: Header<'_>) -> ServiceStatus {
-        self.status_for(owner(&header)).await
+    async fn status(&self, #[zbus(header)] header: Header<'_>) -> Result<ServiceStatus, Error> {
+        Ok(self.status_for(owner(&header)?).await)
     }
 
     /// Las capacidades sobre cada dominio. Las de datos del usuario no están
@@ -138,12 +144,16 @@ impl AssistantService {
         #[zbus(header)] header: Header<'_>,
         #[zbus(connection)] connection: &Connection,
     ) -> Result<String, Error> {
-        let id = self.open(owner(&header))?;
-        // Sin remitente es una conexión punto a punto: no hay bus a quien
-        // preguntar, y el único par es el que está llamando.
         let Some(sender) = header.sender() else {
-            return Ok(id);
+            return Err(no_sender());
         };
+        let id = self.open(sender.as_str())?;
+        // Punto a punto no hay demonio del bus a quien preguntar (el par no
+        // contestaría y la llamada quedaría colgada), y el único par es el
+        // que está llamando.
+        if !connection.is_bus() {
+            return Ok(id);
+        }
         let still_connected = match zbus::fdo::DBusProxy::new(connection).await {
             Ok(bus) => bus
                 .name_has_owner(BusName::Unique(sender.as_ref()))
@@ -155,8 +165,8 @@ impl AssistantService {
     }
 
     /// Las conversaciones abiertas de quien llama.
-    fn conversations(&self, #[zbus(header)] header: Header<'_>) -> Vec<String> {
-        self.list(owner(&header))
+    fn conversations(&self, #[zbus(header)] header: Header<'_>) -> Result<Vec<String>, Error> {
+        Ok(self.list(owner(&header)?))
     }
 
     /// Los mensajes de una conversación de quien llama.
@@ -165,7 +175,7 @@ impl AssistantService {
         #[zbus(header)] header: Header<'_>,
         conversation_id: &str,
     ) -> Result<Vec<Message>, Error> {
-        self.history_of(owner(&header), conversation_id)
+        self.history_of(owner(&header)?, conversation_id)
     }
 
     /// Manda un mensaje y devuelve la respuesta del modelo. Un llamador
@@ -177,8 +187,9 @@ impl AssistantService {
         conversation_id: &str,
         content: &str,
     ) -> Result<String, Error> {
+        let owner = owner(&header)?;
         let use_memory = !self.confined(connection, &header).await;
-        self.chat_with(owner(&header), conversation_id, content, use_memory)
+        self.chat_with(owner, conversation_id, content, use_memory)
             .await
     }
 
@@ -188,7 +199,7 @@ impl AssistantService {
         #[zbus(header)] header: Header<'_>,
         conversation_id: &str,
     ) -> Result<(), Error> {
-        self.delete_as(owner(&header), conversation_id)
+        self.delete_as(owner(&header)?, conversation_id)
     }
 
     /// Guarda en el llavero la clave del proveedor de esa dirección.
@@ -472,11 +483,22 @@ pub fn settle_new_conversation(
 }
 
 /// El dueño de un pedido: el nombre único de la conexión que lo manda. En el
-/// bus siempre viene (lo pone el demonio del bus, no el cliente); sólo una
-/// conexión punto a punto, sin bus y con un único par, llega sin remitente, y
-/// ahí ese par es el único dueño posible.
-fn owner<'a>(header: &'a Header<'_>) -> &'a str {
-    header.sender().map(|sender| sender.as_str()).unwrap_or("")
+/// bus siempre viene (lo pone el demonio del bus, no el cliente). Sin
+/// remitente (una conexión punto a punto, o algo que no lo ponga) la llamada se
+/// rechaza: con un dueño vacío, todos los pares compartirían las mismas
+/// conversaciones (#4). Es `AccessDenied` y no `InvalidArgs`: los argumentos
+/// están bien, lo que falta es saber quién llama.
+fn owner<'a>(header: &'a Header<'_>) -> Result<&'a str, Error> {
+    header
+        .sender()
+        .map(|sender| sender.as_str())
+        .ok_or_else(no_sender)
+}
+
+fn no_sender() -> Error {
+    Error::AccessDenied(
+        "La llamada no trae remitente: no se puede saber de quién son las conversaciones.".into(),
+    )
 }
 
 /// Cierra el turno pase lo que pase: con la respuesta si la hubo, y si no —un
@@ -544,9 +566,7 @@ mod tests {
 
     use super::*;
     use crate::backend::RejectedBackend;
-    use crate::test_support::{
-        memory_off, memory_status_off, model_info, p2p_pair, FakeBackend, FixedKey,
-    };
+    use crate::test_support::{memory_off, memory_status_off, model_info, FakeBackend, FixedKey};
     use vasak_assistant_protocol::{
         AssistantProxy, Role, DOMAIN_MAIL, DOMAIN_MEMORY, MAX_CONVERSATIONS,
         MAX_CONVERSATIONS_PER_OWNER, SERVICE_PATH,
@@ -562,15 +582,19 @@ mod tests {
             remote_allowed,
             secrets: FixedKey::new(None),
             memory: memory_off(),
-            labels: std::sync::Arc::new(crate::service::BusLabels),
+            // Las pruebas por el bus van punto a punto: no hay demonio del bus
+            // a quien pedirle la etiqueta, y BusLabels fallaría cerrado.
+            labels: crate::test_support::FixedLabel::none(),
         }
     }
 
     /// El servicio servido por una conexión punto a punto y su proxy de cliente.
     async fn connected(service: AssistantService) -> (AssistantProxy<'static>, zbus::Connection) {
-        let (server, client) = p2p_pair(|builder| builder.serve_at(SERVICE_PATH, service))
-            .await
-            .unwrap();
+        let (server, client) = crate::test_support::p2p_pair_as(OWNER, |builder| {
+            builder.serve_at(SERVICE_PATH, service)
+        })
+        .await
+        .unwrap();
         let proxy = AssistantProxy::builder(&client)
             .path(SERVICE_PATH)
             .unwrap()
@@ -1160,7 +1184,7 @@ mod tests {
         let keys = FixedKey::new(None);
         let service = AssistantService {
             secrets: keys.clone(),
-            labels: std::sync::Arc::new(crate::service::BusLabels),
+            labels: crate::test_support::FixedLabel::none(),
             ..service(FakeBackend::replying(""), false)
         };
         (service, keys)
@@ -1400,7 +1424,7 @@ mod memory_tests {
                 remote_allowed: false,
                 secrets: keys.clone(),
                 memory,
-                labels: std::sync::Arc::new(crate::service::BusLabels),
+                labels: crate::test_support::FixedLabel::none(),
             };
             Self {
                 tmp,
@@ -1671,7 +1695,7 @@ mod memory_tests {
     async fn por_dbus_el_estado_de_la_memoria_cambia_al_encender_apagar_y_borrar() {
         let world = World::off([], false);
         let (server, client) =
-            crate::test_support::p2p_pair(|b| b.serve_at(SERVICE_PATH, world.service))
+            crate::test_support::p2p_pair_as(OWNER, |b| b.serve_at(SERVICE_PATH, world.service))
                 .await
                 .unwrap();
         let proxy = AssistantProxy::builder(&client)
@@ -1718,7 +1742,7 @@ mod gate_tests {
     use super::*;
     use crate::memory::learn::{Extraction, Item};
     use crate::memory::schema::MemoryKind;
-    use crate::test_support::{p2p_pair, FixedKey, FixedLabel, ScriptedBackend, TempDir};
+    use crate::test_support::{FixedKey, FixedLabel, ScriptedBackend, TempDir};
     use vasak_assistant_protocol::{AssistantProxy, DOMAIN_MEMORY, SERVICE_PATH};
 
     const CONFINED: &[u8] = b"vasak-appimage (enforce)\0";
@@ -1778,9 +1802,11 @@ mod gate_tests {
             memory: memory.clone(),
             labels: label.clone(),
         };
-        let (server, client) = p2p_pair(|builder| builder.serve_at(SERVICE_PATH, service))
-            .await
-            .unwrap();
+        let (server, client) = crate::test_support::p2p_pair_as(":1.1", |builder| {
+            builder.serve_at(SERVICE_PATH, service)
+        })
+        .await
+        .unwrap();
         let proxy = AssistantProxy::builder(&client)
             .path(SERVICE_PATH)
             .unwrap()
@@ -1991,7 +2017,8 @@ mod bus_label_tests {
     async fn sin_remitente_no_hay_etiqueta_y_con_un_nombre_invalido_el_bus_falla() {
         let (_server, client) = crate::test_support::p2p_pair(Ok).await.unwrap();
 
-        assert_eq!(BusLabels.label(&client, None).await, Ok(None));
+        // Sin remitente falla cerrado (#4).
+        assert_eq!(BusLabels.label(&client, None).await, Err(()));
         assert_eq!(
             BusLabels.label(&client, Some("no es un nombre")).await,
             Err(())

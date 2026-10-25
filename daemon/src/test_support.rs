@@ -725,6 +725,29 @@ pub async fn p2p_pair(
     tokio::try_join!(server, client)
 }
 
+/// Como [`p2p_pair`], pero el cliente lleva el nombre único `sender` y cada
+/// llamada sale con ese remitente, como en el bus: el servicio rechaza las
+/// llamadas sin remitente (#4). `sender` tiene que ser un nombre único
+/// (`:1.1`).
+pub async fn p2p_pair_as(
+    sender: &str,
+    serve: impl FnOnce(connection::Builder<'static>) -> zbus::Result<connection::Builder<'static>>,
+) -> zbus::Result<(Connection, Connection)> {
+    let (server_end, client_end) = tokio::net::UnixStream::pair().expect("par de sockets");
+    let server = serve(
+        connection::Builder::unix_stream(server_end)
+            .server(zbus::Guid::generate())?
+            .p2p(),
+    )?
+    .build();
+    let client = connection::Builder::unix_stream(client_end).p2p().build();
+    let (server, client) = tokio::try_join!(server, client)?;
+    // El constructor sólo pone el nombre único del lado servidor: el cliente
+    // lo recibe después.
+    client.set_unique_name(sender.to_owned())?;
+    Ok((server, client))
+}
+
 pub fn parse_url(text: &str) -> Url {
     Url::parse(text).expect("la dirección de prueba es válida")
 }

@@ -228,6 +228,8 @@ pub enum Error {
 /// `History`, `Chat` y `DeleteConversation` con ese id; para cualquier otra, el
 /// id da `NotFound`, igual que uno que no existe. Cuando la conexión se cierra,
 /// sus conversaciones se olvidan. `Status` cuenta sólo las de quien pregunta.
+/// Una llamada sin remitente (una conexión punto a punto, por ejemplo) a
+/// cualquiera de esos métodos da `AccessDenied`: sin remitente no hay dueño.
 #[zbus::proxy(
     interface = "ar.net.vasak.os.Assistant",
     default_service = "ar.net.vasak.os.Assistant",

@@ -2,6 +2,13 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-assistant 0.3.1
+
+- **`daemon`** — una llamada sin remitente se rechaza con `AccessDenied` en vez
+  de quedar con el dueño vacío `""` (#4): con varios pares punto a punto, todos
+  habrían compartido las mismas conversaciones. La puerta de AppArmor también
+  falla cerrado sin remitente o sin bus que lo respalde.
+
 ## vasak-assistant 0.3.0
 
 La memoria de Lince (fase 4 de #1), apagada por omisión, y la clave del
