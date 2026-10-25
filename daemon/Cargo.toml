@@ -51,4 +51,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 # Para las pruebas del servicio: una conexión D-Bus punto a punto, sin bus.
-zbus = { workspace = true, features = ["p2p"] }
+# `bus-impl` deja que el cliente de prueba lleve su propio nombre único, así
+# las llamadas punto a punto traen remitente como en el bus (#4).
+zbus = { workspace = true, features = ["p2p", "bus-impl"] }

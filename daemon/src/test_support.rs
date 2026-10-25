@@ -714,6 +714,24 @@ impl ModelBackend for FlippingBackend {
 pub async fn p2p_pair(
     serve: impl FnOnce(connection::Builder<'static>) -> zbus::Result<connection::Builder<'static>>,
 ) -> zbus::Result<(Connection, Connection)> {
+    p2p(None, serve).await
+}
+
+/// Como [`p2p_pair`], pero el cliente lleva el nombre único `sender` y cada
+/// llamada sale con ese remitente, como en el bus: el servicio rechaza las
+/// llamadas sin remitente (#4). `sender` tiene que ser un nombre único
+/// (`:1.1`).
+pub async fn p2p_pair_as(
+    sender: &str,
+    serve: impl FnOnce(connection::Builder<'static>) -> zbus::Result<connection::Builder<'static>>,
+) -> zbus::Result<(Connection, Connection)> {
+    p2p(Some(sender), serve).await
+}
+
+async fn p2p(
+    sender: Option<&str>,
+    serve: impl FnOnce(connection::Builder<'static>) -> zbus::Result<connection::Builder<'static>>,
+) -> zbus::Result<(Connection, Connection)> {
     let (server_end, client_end) = tokio::net::UnixStream::pair().expect("par de sockets");
     let server = serve(
         connection::Builder::unix_stream(server_end)
@@ -722,7 +740,13 @@ pub async fn p2p_pair(
     )?
     .build();
     let client = connection::Builder::unix_stream(client_end).p2p().build();
-    tokio::try_join!(server, client)
+    let (server, client) = tokio::try_join!(server, client)?;
+    if let Some(sender) = sender {
+        // El constructor sólo pone el nombre único del lado servidor: el
+        // cliente lo recibe después.
+        client.set_unique_name(sender.to_owned())?;
+    }
+    Ok((server, client))
 }
 
 pub fn parse_url(text: &str) -> Url {
