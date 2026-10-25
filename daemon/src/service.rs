@@ -2490,19 +2490,16 @@ mod no_sender_tests {
         rig(FixedLabel::none(), memory_off()).await
     }
 
-    fn denied<T: std::fmt::Debug>(name: &str, result: Result<T, Error>) {
+    /// `AccessDenied`; con `needle`, además el motivo tiene que decirlo.
+    fn denied_with<T: std::fmt::Debug>(name: &str, needle: &str, result: Result<T, Error>) {
         match result {
-            Err(Error::AccessDenied(text)) => assert!(text.contains("remitente"), "{name}: {text}"),
+            Err(Error::AccessDenied(text)) => assert!(text.contains(needle), "{name}: {text}"),
             other => panic!("{name}: se esperaba AccessDenied, vino {other:?}"),
         }
     }
 
-    /// `AccessDenied`, con el motivo que sea (confinado o sin remitente).
-    fn access_denied_any<T: std::fmt::Debug>(name: &str, result: Result<T, Error>) {
-        assert!(
-            matches!(result, Err(Error::AccessDenied(_))),
-            "{name}: se esperaba AccessDenied, vino {result:?}"
-        );
+    fn denied<T: std::fmt::Debug>(name: &str, result: Result<T, Error>) {
+        denied_with(name, "remitente", result);
     }
 
     /// Una llamada que no contesta en 5 s es un cuelgue.
@@ -2512,55 +2509,56 @@ mod no_sender_tests {
             .expect("la llamada se colgó")
     }
 
-    #[tokio::test]
-    async fn status_sin_remitente_da_access_denied() {
-        let rig = plain().await;
-        denied("Status", quickly(rig.proxy.status()).await);
+    /// Un `#[test]` por método, así cada falla dice cuál fue. La llamada va sin
+    /// remitente y con timeout; `$after` revisa que no se tocó nada.
+    macro_rules! denied_without_sender {
+        ($name:ident, |$rig:ident| $call:expr, $after:expr) => {
+            #[tokio::test]
+            async fn $name() {
+                let $rig = plain().await;
+                denied(stringify!($name), quickly($call).await);
+                let check: fn(&Rig) = $after;
+                check(&$rig);
+            }
+        };
     }
 
-    #[tokio::test]
-    async fn new_conversation_sin_remitente_da_access_denied_y_no_crea_nada() {
-        let rig = plain().await;
-
-        denied(
-            "NewConversation",
-            quickly(rig.proxy.new_conversation()).await,
-        );
-
+    fn nothing_created(rig: &Rig) {
         assert_eq!(rig.conversations.lock().len(), 0);
         assert_eq!(rig.conversations.lock().count_for(""), 0);
-    }
-
-    #[tokio::test]
-    async fn conversations_sin_remitente_da_access_denied() {
-        let rig = plain().await;
-        denied("Conversations", quickly(rig.proxy.conversations()).await);
-    }
-
-    #[tokio::test]
-    async fn history_sin_remitente_da_access_denied() {
-        let rig = plain().await;
-        denied("History", quickly(rig.proxy.history(ID)).await);
-    }
-
-    #[tokio::test]
-    async fn chat_sin_remitente_da_access_denied_y_no_llega_al_modelo() {
-        let rig = plain().await;
-
-        denied("Chat", quickly(rig.proxy.chat(ID, "hola")).await);
-
         assert!(rig.backend.seen.lock().is_empty());
-        assert_eq!(rig.conversations.lock().len(), 0);
     }
 
-    #[tokio::test]
-    async fn delete_conversation_sin_remitente_da_access_denied() {
-        let rig = plain().await;
-        denied(
-            "DeleteConversation",
-            quickly(rig.proxy.delete_conversation(ID)).await,
-        );
-    }
+    denied_without_sender!(
+        status_sin_remitente_da_access_denied,
+        |rig| rig.proxy.status(),
+        nothing_created
+    );
+    denied_without_sender!(
+        new_conversation_sin_remitente_da_access_denied_y_no_crea_nada,
+        |rig| rig.proxy.new_conversation(),
+        nothing_created
+    );
+    denied_without_sender!(
+        conversations_sin_remitente_da_access_denied,
+        |rig| rig.proxy.conversations(),
+        nothing_created
+    );
+    denied_without_sender!(
+        history_sin_remitente_da_access_denied,
+        |rig| rig.proxy.history(ID),
+        nothing_created
+    );
+    denied_without_sender!(
+        chat_sin_remitente_da_access_denied_y_no_llega_al_modelo,
+        |rig| rig.proxy.chat(ID, "hola"),
+        nothing_created
+    );
+    denied_without_sender!(
+        delete_conversation_sin_remitente_da_access_denied,
+        |rig| rig.proxy.delete_conversation(ID),
+        nothing_created
+    );
 
     #[tokio::test]
     async fn sin_remitente_dos_pares_no_comparten_un_duenio_vacio() {
@@ -2581,16 +2579,22 @@ mod no_sender_tests {
         // `BusLabels` de verdad, sin remitente: no se puede saber quién llama.
         let rig = rig(Arc::new(BusLabels), memory.clone()).await;
 
-        access_denied_any("SetMemoryEnabled", rig.proxy.set_memory_enabled(true).await);
-        access_denied_any("ClearMemory", rig.proxy.clear_memory().await);
-        access_denied_any(
+        denied_with(
+            "SetMemoryEnabled",
+            "",
+            rig.proxy.set_memory_enabled(true).await,
+        );
+        denied_with("ClearMemory", "", rig.proxy.clear_memory().await);
+        denied_with(
             "SetProviderKey",
+            "",
             rig.proxy
                 .set_provider_key("https://api.openai.com/v1", "sk-x")
                 .await,
         );
-        access_denied_any(
+        denied_with(
             "HasProviderKey",
+            "",
             rig.proxy
                 .has_provider_key("https://api.openai.com/v1")
                 .await,
