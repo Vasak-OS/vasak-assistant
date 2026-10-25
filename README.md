@@ -26,8 +26,10 @@ El servicio y el contrato:
 
   Las conversaciones viven en memoria y se pierden al cerrar el servicio.
 
-Todavía no tiene ninguna capacidad sobre datos del usuario: `Capabilities` las
-informa como **no disponibles**. Si el backend no responde, no tiene el modelo,
+Todavía no tiene ninguna capacidad sobre datos del usuario —correo, calendario,
+contactos, archivos, web—: `Capabilities` las informa como **no disponibles**.
+La excepción es su propia memoria (`memory`), que figura disponible cuando está
+encendida y abierta (ver más abajo). Si el backend no responde, no tiene el modelo,
 pide una clave que no está o la configuración no se puede usar, `Status` lo dice
 con un motivo legible y `Chat` devuelve el error
 `ar.net.vasak.os.Assistant.Error.Unavailable`; el servicio sigue en pie.
