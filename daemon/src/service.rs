@@ -2431,3 +2431,222 @@ mod effective_model_tests {
         assert!(!remembers(&rig, "mate amargo").await);
     }
 }
+
+/// Las llamadas sin remitente (#4): conexión punto a punto, sin demonio del bus
+/// que ponga el nombre del que llama.
+#[cfg(test)]
+mod no_sender_tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::conversations::Conversations;
+    use crate::test_support::{
+        memory_off, p2p_pair, p2p_pair_as, FakeBackend, FixedKey, FixedLabel, TempDir,
+    };
+    use vasak_assistant_protocol::{AssistantProxy, SERVICE_PATH};
+
+    const ID: &str = "00000000-0000-4000-8000-000000000000";
+
+    struct Rig {
+        proxy: AssistantProxy<'static>,
+        conversations: Arc<parking_lot::Mutex<Conversations>>,
+        backend: Arc<FakeBackend>,
+        keys: Arc<FixedKey>,
+        _server: Connection,
+    }
+
+    /// El servicio por una conexión punto a punto SIN remitente.
+    async fn rig(labels: Arc<dyn CallerLabels>, memory: Arc<Memory>) -> Rig {
+        let backend = Arc::new(FakeBackend::replying("hola"));
+        let keys = FixedKey::new(None);
+        let conversations = Arc::new(parking_lot::Mutex::new(Conversations::default()));
+        let service = AssistantService {
+            backend: backend.clone(),
+            conversations: conversations.clone(),
+            remote_allowed: false,
+            secrets: keys.clone(),
+            memory,
+            labels,
+        };
+        let (server, client) = p2p_pair(|b| b.serve_at(SERVICE_PATH, service))
+            .await
+            .unwrap();
+        let proxy = AssistantProxy::builder(&client)
+            .path(SERVICE_PATH)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        Rig {
+            proxy,
+            conversations,
+            backend,
+            keys,
+            _server: server,
+        }
+    }
+
+    async fn plain() -> Rig {
+        rig(FixedLabel::none(), memory_off()).await
+    }
+
+    fn denied<T: std::fmt::Debug>(name: &str, result: Result<T, Error>) {
+        match result {
+            Err(Error::AccessDenied(text)) => assert!(text.contains("remitente"), "{name}: {text}"),
+            other => panic!("{name}: se esperaba AccessDenied, vino {other:?}"),
+        }
+    }
+
+    /// `AccessDenied`, con el motivo que sea (confinado o sin remitente).
+    fn access_denied_any<T: std::fmt::Debug>(name: &str, result: Result<T, Error>) {
+        assert!(
+            matches!(result, Err(Error::AccessDenied(_))),
+            "{name}: se esperaba AccessDenied, vino {result:?}"
+        );
+    }
+
+    /// Una llamada que no contesta en 5 s es un cuelgue.
+    async fn quickly<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), future)
+            .await
+            .expect("la llamada se colgó")
+    }
+
+    #[tokio::test]
+    async fn status_sin_remitente_da_access_denied() {
+        let rig = plain().await;
+        denied("Status", quickly(rig.proxy.status()).await);
+    }
+
+    #[tokio::test]
+    async fn new_conversation_sin_remitente_da_access_denied_y_no_crea_nada() {
+        let rig = plain().await;
+
+        denied(
+            "NewConversation",
+            quickly(rig.proxy.new_conversation()).await,
+        );
+
+        assert_eq!(rig.conversations.lock().len(), 0);
+        assert_eq!(rig.conversations.lock().count_for(""), 0);
+    }
+
+    #[tokio::test]
+    async fn conversations_sin_remitente_da_access_denied() {
+        let rig = plain().await;
+        denied("Conversations", quickly(rig.proxy.conversations()).await);
+    }
+
+    #[tokio::test]
+    async fn history_sin_remitente_da_access_denied() {
+        let rig = plain().await;
+        denied("History", quickly(rig.proxy.history(ID)).await);
+    }
+
+    #[tokio::test]
+    async fn chat_sin_remitente_da_access_denied_y_no_llega_al_modelo() {
+        let rig = plain().await;
+
+        denied("Chat", quickly(rig.proxy.chat(ID, "hola")).await);
+
+        assert!(rig.backend.seen.lock().is_empty());
+        assert_eq!(rig.conversations.lock().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn delete_conversation_sin_remitente_da_access_denied() {
+        let rig = plain().await;
+        denied(
+            "DeleteConversation",
+            quickly(rig.proxy.delete_conversation(ID)).await,
+        );
+    }
+
+    #[tokio::test]
+    async fn sin_remitente_dos_pares_no_comparten_un_duenio_vacio() {
+        // Antes del arreglo todos los pares sin remitente eran el dueño «»: lo
+        // que uno abría lo veía y lo borraba otro.
+        let rig = plain().await;
+        denied("NewConversation", rig.proxy.new_conversation().await);
+        denied("Conversations", rig.proxy.conversations().await);
+        assert_eq!(rig.conversations.lock().count_for(""), 0);
+    }
+
+    #[tokio::test]
+    async fn con_la_puerta_de_verdad_los_metodos_de_la_memoria_y_las_claves_tambien_fallan_cerrado()
+    {
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
+        // `BusLabels` de verdad, sin remitente: no se puede saber quién llama.
+        let rig = rig(Arc::new(BusLabels), memory.clone()).await;
+
+        access_denied_any("SetMemoryEnabled", rig.proxy.set_memory_enabled(true).await);
+        access_denied_any("ClearMemory", rig.proxy.clear_memory().await);
+        access_denied_any(
+            "SetProviderKey",
+            rig.proxy
+                .set_provider_key("https://api.openai.com/v1", "sk-x")
+                .await,
+        );
+        access_denied_any(
+            "HasProviderKey",
+            rig.proxy
+                .has_provider_key("https://api.openai.com/v1")
+                .await,
+        );
+
+        assert!(!tmp.memory_dir().exists());
+        assert!(keys.memory_key.lock().is_none());
+        assert!(rig.keys.stored.lock().is_empty());
+        assert!(!memory.status().await.enabled);
+    }
+
+    #[tokio::test]
+    async fn bus_labels_sin_remitente_falla_cerrado() {
+        let (_server, client) = p2p_pair(Ok).await.unwrap();
+        assert_eq!(BusLabels.label(&client, None).await, Err(()));
+    }
+
+    #[tokio::test]
+    async fn bus_labels_en_una_conexion_que_no_es_de_bus_falla_cerrado_aunque_haya_remitente() {
+        let (server, client) = p2p_pair(Ok).await.unwrap();
+        for connection in [&server, &client] {
+            assert!(!connection.is_bus());
+            // El par pone el remitente que quiere: no hay a quién preguntarle.
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                BusLabels.label(connection, Some(":1.1")),
+            )
+            .await
+            .expect("no tiene que esperar a un bus que no existe");
+            assert_eq!(result, Err(()));
+        }
+    }
+
+    #[tokio::test]
+    async fn con_remitente_new_conversation_por_punto_a_punto_contesta_rapido_y_no_se_cuelga() {
+        let keys = FixedKey::new(None);
+        let service = AssistantService {
+            backend: Arc::new(FakeBackend::replying("hola")),
+            conversations: Arc::default(),
+            remote_allowed: false,
+            secrets: keys,
+            memory: memory_off(),
+            labels: FixedLabel::none(),
+        };
+        let (_server, client) = p2p_pair_as(":1.7", |b| b.serve_at(SERVICE_PATH, service))
+            .await
+            .unwrap();
+        let proxy = AssistantProxy::builder(&client)
+            .path(SERVICE_PATH)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let id = quickly(proxy.new_conversation()).await.unwrap();
+
+        assert_eq!(quickly(proxy.conversations()).await.unwrap(), [id]);
+    }
+}
