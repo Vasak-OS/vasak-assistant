@@ -2187,4 +2187,153 @@ mod effective_model_tests {
             .iter()
             .all(|m| m.role != Role::System));
     }
+
+    // ── La carrera entre la puerta y el envío ─────────────────────────────────
+
+    use crate::backend::Limited;
+    use crate::memory::REASON_MODEL_UNREACHABLE;
+    use crate::test_support::FlippingBackend;
+
+    /// El modelo se resuelve local en la puerta y `:cloud` al mandar el chat.
+    #[tokio::test]
+    async fn si_el_modelo_pasa_a_la_nube_entre_la_puerta_y_el_envio_el_chat_sale_sin_notas_y_no_se_aprende(
+    ) {
+        let backend = FlippingBackend::new(["Hola.", EXTRACTION]);
+        let rig = rig(backend.clone(), false).await;
+        let id = rig.service.open(OWNER).unwrap();
+
+        let reply = rig
+            .service
+            .chat_as(OWNER, &id, "prefiero el mate amargo, ¿qué tal?")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // La persona recibe su respuesta.
+        assert_eq!(reply, "Hola.");
+        // Un solo pedido salió al modelo, sin notas.
+        let seen = backend.inner.seen.lock().clone();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(seen[0].iter().all(|m| m.role != Role::System));
+        assert!(seen[0]
+            .iter()
+            .all(|m| !m.content.contains("Prefiere respuestas cortas")));
+        // El turno no se aprende: sin extracción y sin nada nuevo guardado.
+        assert!(!remembers(&rig, "mate amargo").await);
+        // La conversación quedó con el intercambio.
+        assert_eq!(rig.service.history_of(OWNER, &id).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn la_misma_carrera_por_un_backend_con_cache_tambien_se_frena() {
+        // `Limited` guarda el modelo activo 5 s: la puerta puede ver un local viejo.
+        let backend = FlippingBackend::new(["Hola.", EXTRACTION]);
+        let rig = rig(Arc::new(Limited::new(backend.clone())), false).await;
+
+        chat(&rig, "prefiero el mate amargo, ¿qué tal?").await;
+
+        let seen = backend.inner.seen.lock().clone();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].iter().all(|m| m.role != Role::System));
+        assert!(!remembers(&rig, "mate amargo").await);
+    }
+
+    #[tokio::test]
+    async fn si_el_modelo_pasa_a_la_nube_entre_la_puerta_y_la_extraccion_esta_no_sale() {
+        let backend = FlippingBackend::new([EXTRACTION]);
+        let rig = rig(backend.clone(), false).await;
+        let conversation = vec![
+            Message {
+                role: Role::User,
+                content: "prefiero el mate amargo".into(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: "Anotado.".into(),
+            },
+        ];
+
+        // La puerta (`allowed_for`, primera resolución) ve un modelo local y la
+        // extracción (`chat_local_only`, segunda) lo ve en la nube.
+        rig.service
+            .memory
+            .learn_after(backend.clone(), "c1", conversation);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(backend.inner.seen.lock().is_empty(), "nada salió a la nube");
+        assert_eq!(
+            backend
+                .resolutions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "la puerta y el envío"
+        );
+        assert!(!remembers(&rig, "mate amargo").await);
+    }
+
+    #[tokio::test]
+    async fn con_permiso_para_compartir_la_misma_carrera_no_frena_nada() {
+        let backend = FlippingBackend::new(["Hola.", EXTRACTION]);
+        let rig = rig(backend.clone(), true).await;
+
+        chat(&rig, "prefiero el mate amargo, ¿qué tal?").await;
+
+        let seen = backend.inner.seen.lock().clone();
+        assert_eq!(seen.len(), 2, "el chat con notas y la extracción");
+        assert_eq!(seen[0][0].role, Role::System);
+        assert!(remembers(&rig, "mate amargo").await);
+    }
+
+    #[tokio::test]
+    async fn un_modelo_local_estable_manda_las_notas_con_chat_local_only_y_se_aprende() {
+        let backend = ScriptedBackend::new(["Hola.", EXTRACTION]);
+        let rig = rig(backend.clone(), false).await;
+
+        chat(&rig, "prefiero el mate amargo, ¿qué tal?").await;
+
+        let seen = backend.seen.lock().clone();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0][0].role, Role::System);
+        assert!(remembers(&rig, "mate amargo").await);
+    }
+
+    #[tokio::test]
+    async fn el_estado_de_la_memoria_dice_por_que_no_esta_disponible_segun_el_modelo() {
+        // Local: disponible.
+        let local = rig(ScriptedBackend::new([]), false).await;
+        let status = local.service.memory_status_now().await;
+        assert!(status.available && status.reason.is_empty(), "{status:?}");
+
+        // En la nube: el motivo del remoto.
+        let cloud = rig(ScriptedBackend::cloud_by_default([]), false).await;
+        let status = cloud.service.memory_status_now().await;
+        assert!(!status.available && status.enabled);
+        assert_eq!(status.reason, REASON_REMOTE);
+
+        // Que el modelo no conteste es otro motivo, no el del remoto.
+        let mut fake = FakeBackend::replying("");
+        fake.active_result = Err(crate::backend::BackendError::Unavailable("apagado".into()));
+        let silent = rig(Arc::new(fake), false).await;
+        let status = silent.service.memory_status_now().await;
+        assert!(!status.available && status.enabled);
+        assert_eq!(status.reason, REASON_MODEL_UNREACHABLE);
+        assert_ne!(REASON_MODEL_UNREACHABLE, REASON_REMOTE);
+
+        // Con permiso para compartir, ni la nube ni el silencio la apagan.
+        let mut fake = FakeBackend::replying("");
+        fake.active_result = Err(crate::backend::BackendError::Unavailable("apagado".into()));
+        for backend in [
+            Arc::new(fake) as Arc<dyn ModelBackend>,
+            ScriptedBackend::cloud_by_default([]),
+        ] {
+            let shared = rig(backend, true).await;
+            assert!(shared.service.memory_status_now().await.available);
+        }
+
+        // Apagada, el motivo sigue siendo el de apagada.
+        let off = rig(ScriptedBackend::cloud_by_default([]), false).await;
+        off.service.memory.set_enabled(false).await.unwrap();
+        let status = off.service.memory_status_now().await;
+        assert_eq!(status.reason, crate::memory::REASON_OFF);
+    }
 }
