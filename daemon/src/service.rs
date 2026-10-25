@@ -2336,4 +2336,71 @@ mod effective_model_tests {
         let status = off.service.memory_status_now().await;
         assert_eq!(status.reason, crate::memory::REASON_OFF);
     }
+
+    /// Un modelo que está en la nube sólo en la segunda resolución (la del
+    /// envío del chat) y local antes y después: si el turno se aprendiera
+    /// igual, la extracción saldría bien y se guardaría.
+    struct Blink {
+        inner: Arc<ScriptedBackend>,
+        resolutions: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Blink {
+        fn local_now(&self) -> bool {
+            self.resolutions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                != 1
+        }
+    }
+
+    impl ModelBackend for Blink {
+        fn info(&self) -> vasak_assistant_protocol::ModelInfo {
+            self.inner.info()
+        }
+
+        fn models(&self) -> BoxFuture<'_, Result<Vec<String>, BackendError>> {
+            self.inner.models()
+        }
+
+        fn active_model(
+            &self,
+        ) -> BoxFuture<'_, Result<vasak_assistant_protocol::ModelInfo, BackendError>> {
+            let mut info = self.inner.info();
+            info.local = self.local_now();
+            Box::pin(async move { Ok(info) })
+        }
+
+        fn chat<'a>(
+            &'a self,
+            messages: &'a [Message],
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            self.inner.chat(messages)
+        }
+
+        fn chat_local_only<'a>(
+            &'a self,
+            messages: &'a [Message],
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            if !self.local_now() {
+                return Box::pin(async { Err(crate::backend::not_local()) });
+            }
+            self.inner.chat(messages)
+        }
+    }
+
+    #[tokio::test]
+    async fn el_turno_que_tuvo_que_reintentarse_sin_notas_no_se_aprende_aunque_el_modelo_vuelva_a_ser_local(
+    ) {
+        let inner = ScriptedBackend::new(["Hola.", EXTRACTION]);
+        let backend = Arc::new(Blink {
+            inner: inner.clone(),
+            resolutions: Default::default(),
+        });
+        let rig = rig(backend, false).await;
+
+        chat(&rig, "prefiero el mate amargo, ¿qué tal?").await;
+
+        assert_eq!(inner.seen.lock().len(), 1, "sólo el chat, sin extracción");
+        assert!(!remembers(&rig, "mate amargo").await);
+    }
 }
