@@ -628,6 +628,83 @@ impl ModelBackend for ScriptedBackend {
             reply
         })
     }
+
+    /// Decide con el modelo efectivo (`effective_local`, o `local`); si no es
+    /// local no anota ni consume ninguna respuesta: no se mandó nada.
+    fn chat_local_only<'a>(
+        &'a self,
+        messages: &'a [Message],
+    ) -> BoxFuture<'a, Result<String, BackendError>> {
+        Box::pin(async move {
+            if !self.effective_local.unwrap_or(self.local) {
+                return Err(crate::backend::not_local());
+            }
+            self.chat(messages).await
+        })
+    }
+}
+
+/// La carrera entre la puerta y el envío: el modelo resuelto es local la
+/// primera vez que se resuelve (`active_model` o `chat_local_only`) y `:cloud`
+/// de ahí en adelante, como si en el medio se hubiera hecho un
+/// `ollama pull x:cloud`. Responde y anota con el `ScriptedBackend` de
+/// adentro; `resolutions` cuenta cuántas veces se resolvió.
+// Infraestructura para las pruebas de la carrera, que escribe qa.
+#[allow(dead_code)]
+pub struct FlippingBackend {
+    pub inner: Arc<ScriptedBackend>,
+    pub resolutions: std::sync::atomic::AtomicUsize,
+}
+
+#[allow(dead_code)]
+impl FlippingBackend {
+    pub fn new(replies: impl IntoIterator<Item = &'static str>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: ScriptedBackend::new(replies),
+            resolutions: Default::default(),
+        })
+    }
+
+    /// Resuelve el modelo: local la primera vez, `:cloud` después.
+    fn resolve_local(&self) -> bool {
+        self.resolutions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 0
+    }
+}
+
+impl ModelBackend for FlippingBackend {
+    fn info(&self) -> ModelInfo {
+        self.inner.info()
+    }
+
+    fn models(&self) -> BoxFuture<'_, Result<Vec<String>, BackendError>> {
+        self.inner.models()
+    }
+
+    fn active_model(&self) -> BoxFuture<'_, Result<ModelInfo, BackendError>> {
+        let mut info = self.inner.info();
+        if !self.resolve_local() {
+            info.local = false;
+            info.name = "gpt-oss:120b-cloud".into();
+        }
+        Box::pin(async move { Ok(info) })
+    }
+
+    fn chat<'a>(&'a self, messages: &'a [Message]) -> BoxFuture<'a, Result<String, BackendError>> {
+        self.resolve_local();
+        self.inner.chat(messages)
+    }
+
+    fn chat_local_only<'a>(
+        &'a self,
+        messages: &'a [Message],
+    ) -> BoxFuture<'a, Result<String, BackendError>> {
+        if !self.resolve_local() {
+            return Box::pin(async { Err(crate::backend::not_local()) });
+        }
+        self.inner.chat(messages)
+    }
 }
 
 // ── D-Bus punto a punto ───────────────────────────────────────────────────────

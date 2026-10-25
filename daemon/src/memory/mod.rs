@@ -83,6 +83,7 @@ pub const REASON_NOT_OPENED: &str = "La memoria no se pudo abrir";
 pub const REASON_NO_KEYRING: &str = "El llavero no responde";
 pub const REASON_NO_PLACE: &str = "No hay una carpeta de estado donde guardar la memoria";
 pub const REASON_REMOTE: &str = "La memoria no se comparte con un proveedor remoto";
+pub const REASON_MODEL_UNREACHABLE: &str = "El modelo no responde";
 
 /// El tope de lo que ocupa la base en disco.
 pub const MAX_MEMORY_DISK_BYTES: u64 = 4 << 20;
@@ -165,6 +166,11 @@ impl Memory {
     pub fn with_remote_blocked(mut self, blocked: bool) -> Self {
         self.remote_blocked = blocked;
         self
+    }
+
+    /// Si `share_memory_with_remote` está en true.
+    pub fn shares_with_remote(&self) -> bool {
+        self.share_with_remote
     }
 
     /// Con `share_memory_with_remote` de `vasak.conf`.
@@ -303,7 +309,14 @@ impl Memory {
                 return;
             }
             let request = learn::extraction_request(&conversation, gate);
-            let reply = match backend.chat(&request).await {
+            // Sin permiso para el remoto, la extracción sólo va a un modelo
+            // local, decidido con la misma resolución que manda el pedido.
+            let sent = if memory.share_with_remote {
+                backend.chat(&request).await
+            } else {
+                backend.chat_local_only(&request).await
+            };
+            let reply = match sent {
                 Ok(reply) => reply,
                 Err(error) => {
                     tracing::info!("la extracción de recuerdos no respondió: {error:?}");

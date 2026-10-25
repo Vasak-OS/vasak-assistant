@@ -30,7 +30,7 @@ use vasak_assistant_protocol::{
     DOMAIN_REMOTE_BACKENDS,
 };
 
-use crate::backend::{BackendError, BoxFuture, ModelBackend};
+use crate::backend::{is_not_local, BackendError, BoxFuture, ModelBackend};
 use crate::config::{is_local, normalize_url};
 use crate::conversations::Conversations;
 use crate::keyring::{ApiKey, SecretSource};
@@ -252,9 +252,16 @@ impl AssistantService {
     /// disponible pero el modelo efectivo es remoto sin permiso, no lo está.
     pub async fn memory_status_now(&self) -> MemoryStatus {
         let mut status = self.memory.status().await;
-        if status.available && !self.memory.allowed_for(&*self.backend).await {
-            status.available = false;
-            status.reason = crate::memory::REASON_REMOTE.to_owned();
+        if status.available && !self.memory.shares_with_remote() {
+            let reason = match self.backend.active_model().await {
+                Ok(model) if model.local => None,
+                Ok(_) => Some(crate::memory::REASON_REMOTE),
+                Err(_) => Some(crate::memory::REASON_MODEL_UNREACHABLE),
+            };
+            if let Some(reason) = reason {
+                status.available = false;
+                status.reason = reason.to_owned();
+            }
         }
         status
     }
@@ -352,7 +359,10 @@ impl AssistantService {
         let first_turn = context.iter().filter(|m| m.role == Role::User).count() == 1;
         // La puerta del remoto con el modelo que va a responder este pedido:
         // remoto y sin `share_memory_with_remote`, ni notas ni aprendizaje.
-        let use_memory = use_memory && self.memory.allowed_for(&*self.backend).await;
+        // Filtro previo: no se lee la memoria si el modelo de ahora no la
+        // puede ver. La decisión que vale es la de `chat_local_only`, que usa
+        // la misma resolución que manda el pedido.
+        let mut use_memory = use_memory && self.memory.allowed_for(&*self.backend).await;
         // Las notas de la memoria van sólo en el contexto de este turno: no al
         // historial ni a `History`.
         let notes = if use_memory {
@@ -369,11 +379,24 @@ impl AssistantService {
             with_notes.extend(context.iter().cloned());
             with_notes
         });
-        let reply = self
-            .backend
-            .chat(with_notes.as_deref().unwrap_or(&context))
-            .await
-            .map_err(to_dbus)?;
+        let reply = match &with_notes {
+            Some(with_notes) if !self.memory.shares_with_remote() => {
+                match self.backend.chat_local_only(with_notes).await {
+                    // El modelo pasó a ser remoto entre la puerta y el envío:
+                    // se reintenta sin notas (la persona igual tiene respuesta,
+                    // y la conversación ya podía ir a ese modelo) y ese turno
+                    // no se aprende.
+                    Err(error) if is_not_local(&error) => {
+                        use_memory = false;
+                        self.backend.chat(&context).await
+                    }
+                    other => other,
+                }
+            }
+            Some(with_notes) => self.backend.chat(with_notes).await,
+            None => self.backend.chat(&context).await,
+        }
+        .map_err(to_dbus)?;
         turn.reply = Some(reply.clone());
         context.push(Message {
             role: Role::Assistant,

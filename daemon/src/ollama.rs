@@ -64,8 +64,18 @@ impl OllamaBackend {
         Ok(model)
     }
 
-    async fn send_chat(&self, messages: &[Message]) -> Result<String, BackendError> {
+    /// Una sola resolución del modelo para decidir y mandar. Con
+    /// `require_local`, si el modelo resuelto no es local (`cloud`, o una
+    /// dirección remota) no se manda nada.
+    async fn send_chat(
+        &self,
+        messages: &[Message],
+        require_local: bool,
+    ) -> Result<String, BackendError> {
         let model = self.resolve_model().await?;
+        if require_local && !(self.info().local && !crate::config::is_ollama_cloud_model(&model)) {
+            return Err(crate::backend::not_local());
+        }
         let response = self
             .client
             .post(http::endpoint(self.base(), "api/chat")?)
@@ -115,7 +125,14 @@ impl ModelBackend for OllamaBackend {
     }
 
     fn chat<'a>(&'a self, messages: &'a [Message]) -> BoxFuture<'a, Result<String, BackendError>> {
-        Box::pin(self.send_chat(messages))
+        Box::pin(self.send_chat(messages, false))
+    }
+
+    fn chat_local_only<'a>(
+        &'a self,
+        messages: &'a [Message],
+    ) -> BoxFuture<'a, Result<String, BackendError>> {
+        Box::pin(self.send_chat(messages, true))
     }
 }
 

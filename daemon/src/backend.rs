@@ -46,6 +46,38 @@ pub trait ModelBackend: Send + Sync {
     /// La respuesta del modelo a la conversación, que termina con el mensaje de
     /// la persona.
     fn chat<'a>(&'a self, messages: &'a [Message]) -> BoxFuture<'a, Result<String, BackendError>>;
+
+    /// Como [`Self::chat`], pero sólo si el modelo que responde es local: lo
+    /// decide la misma resolución que manda el pedido, así nada que haya
+    /// pasado la puerta de la memoria sale por un cambio de modelo en el
+    /// medio. Si no es local, o no se pudo saber, contesta
+    /// `Unavailable(NOT_LOCAL)` sin mandar nada. Por omisión decide
+    /// [`Self::info`], que vale para un backend cuya dirección y modelo son
+    /// fijos (el de OpenAI); el de Ollama lo resuelve por pedido.
+    fn chat_local_only<'a>(
+        &'a self,
+        messages: &'a [Message],
+    ) -> BoxFuture<'a, Result<String, BackendError>> {
+        Box::pin(async move {
+            if !self.info().local {
+                return Err(not_local());
+            }
+            self.chat(messages).await
+        })
+    }
+}
+
+/// El motivo de [`ModelBackend::chat_local_only`] cuando el modelo no es local.
+pub const NOT_LOCAL: &str =
+    "El modelo que respondería no es local: lo que viene de la memoria no se le manda.";
+
+pub fn not_local() -> BackendError {
+    BackendError::Unavailable(NOT_LOCAL.into())
+}
+
+/// Si el error es el rechazo de [`ModelBackend::chat_local_only`].
+pub fn is_not_local(error: &BackendError) -> bool {
+    matches!(error, BackendError::Unavailable(text) if text == NOT_LOCAL)
 }
 
 /// El backend que queda cuando la configuración no se puede usar (un remoto sin
@@ -148,6 +180,16 @@ impl ModelBackend for Limited {
         Box::pin(async move {
             let _permit = self.permit().await?;
             self.inner.chat(messages).await
+        })
+    }
+
+    fn chat_local_only<'a>(
+        &'a self,
+        messages: &'a [Message],
+    ) -> BoxFuture<'a, Result<String, BackendError>> {
+        Box::pin(async move {
+            let _permit = self.permit().await?;
+            self.inner.chat_local_only(messages).await
         })
     }
 }
