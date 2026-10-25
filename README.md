@@ -80,6 +80,12 @@ programa no se usa. Por eso `secret-tool` no puede guardar la clave: se guarda
 desde Configuración. No hay migración: un ítem sin el esquema, aunque tenga los
 mismos `service` y `url`, no se cuenta ni se usa.
 
+Por la misma razón, el binario de desarrollo (`cargo run`, en
+`target/debug/vasak-assistant`) no es `/usr/bin/vasak-assistant` y el llavero no
+lo deja pasar: ahí `SetProviderKey` falla, no se lee la clave del proveedor y la
+memoria no se puede encender (no hay llave). Para probar eso hace falta el
+paquete instalado; no hay una excepción de desarrollo en el llavero.
+
 **Aplicaciones confinadas.** La memoria y las claves son de la persona, no de
 cada aplicación. Si quien llama está confinado por AppArmor (el bus informa su
 `LinuxSecurityLabel` y no es `unconfined`), `SetProviderKey`, `HasProviderKey`,
@@ -157,10 +163,13 @@ systemd, `$STATE_DIRECTORY`). No va en el almacén de cuentas.
   apagó o se borró se descarta.
 - **Sólo lo suyo.** No guarda correo, calendario, contactos, archivos, cuentas
   ni claves: eso se lee de su servicio en el momento y no se persiste.
-- **Con un proveedor remoto**, la memoria no se lee ni se escribe salvo que la
+- **Con un modelo remoto**, la memoria no se lee ni se escribe salvo que la
   persona lo permita con `"share_memory_with_remote": true` en la sección
   `assistant` de `vasak.conf`; si no, `MemoryStatus` dice «La memoria no se
-  comparte con un proveedor remoto».
+  comparte con un proveedor remoto». Se decide en cada pedido con el modelo que
+  de verdad va a responder: sin modelo configurado, Ollama toma el primero
+  instalado, y si es uno `:cloud` cuenta como remoto aunque se le hable al
+  Ollama local.
 
 | Método | Qué hace |
 |---|---|
@@ -177,6 +186,11 @@ abierta.
 ollama pull llama3.2          # cualquier modelo sirve
 cargo run -p vasak-assistant-daemon
 ```
+
+Así corre el binario de desarrollo, no `/usr/bin/vasak-assistant`: alcanza para
+conversar con un modelo local, pero el llavero protegido no lo deja pasar, así
+que la clave del proveedor y la memoria no funcionan (ver «La clave del
+proveedor»).
 
 En otra terminal:
 

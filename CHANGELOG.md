@@ -30,8 +30,10 @@ proveedor en el esquema protegido del llavero.
     señales, el modelo extrae recuerdos en JSON en segundo plano; se validan y
     se guardan con deduplicación. Topes de 4 MiB con poda.
   - Los filtros (`memory/filter`): nada con secretos ni con datos de la persona.
-  - Con un proveedor remoto, la memoria no se lee ni se escribe salvo
-    `share_memory_with_remote` en `vasak.conf`.
+  - Con un modelo remoto, la memoria no se lee ni se escribe salvo
+    `share_memory_with_remote` en `vasak.conf`. Se decide en cada pedido con
+    el modelo efectivo, así que un `:cloud` que Ollama elige por omisión
+    también cuenta como remoto.
 - **`daemon/keyring`** — busca y guarda por un mapa de atributos y suma el
   borrado de ítems. La clave del proveedor y la llave de la memoria se buscan y
   se crean con el mismo mapa, con `xdg:schema=ar.net.vasak.os.Assistant`

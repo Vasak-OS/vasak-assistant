@@ -118,7 +118,7 @@ impl AssistantService {
     /// en esta fase: se dicen no disponibles, nunca rotas. `memory`, según la
     /// memoria esté encendida y abierta.
     async fn capabilities(&self) -> Vec<Capability> {
-        capabilities(self.remote_allowed, &self.memory.status().await)
+        capabilities(self.remote_allowed, &self.memory_status_now().await)
     }
 
     /// Los modelos instalados en el backend.
@@ -218,7 +218,7 @@ impl AssistantService {
 
     /// Cómo está la memoria. Nunca falla: el problema va en el motivo.
     async fn memory_status(&self) -> MemoryStatus {
-        self.memory.status().await
+        self.memory_status_now().await
     }
 
     /// Enciende o apaga la memoria. Encender reabre la base que haya (o la
@@ -244,6 +244,19 @@ impl AssistantService {
     ) -> Result<(), Error> {
         self.deny_confined(connection, &header).await?;
         self.memory.clear().await
+    }
+}
+
+impl AssistantService {
+    /// El estado de la memoria con la misma puerta que los pedidos: si está
+    /// disponible pero el modelo efectivo es remoto sin permiso, no lo está.
+    pub async fn memory_status_now(&self) -> MemoryStatus {
+        let mut status = self.memory.status().await;
+        if status.available && !self.memory.allowed_for(&*self.backend).await {
+            status.available = false;
+            status.reason = crate::memory::REASON_REMOTE.to_owned();
+        }
+        status
     }
 }
 
@@ -337,6 +350,9 @@ impl AssistantService {
             reply: None,
         };
         let first_turn = context.iter().filter(|m| m.role == Role::User).count() == 1;
+        // La puerta del remoto con el modelo que va a responder este pedido:
+        // remoto y sin `share_memory_with_remote`, ni notas ni aprendizaje.
+        let use_memory = use_memory && self.memory.allowed_for(&*self.backend).await;
         // Las notas de la memoria van sólo en el contexto de este turno: no al
         // historial ni a `History`.
         let notes = if use_memory {
@@ -1497,6 +1513,7 @@ mod memory_tests {
             replies: parking_lot::Mutex::default(),
             seen: parking_lot::Mutex::default(),
             local: false,
+            effective_local: None,
         });
         let remote =
             Memory::new(Some(world.tmp.memory_dir()), world.keys.clone()).with_remote_blocked(true);

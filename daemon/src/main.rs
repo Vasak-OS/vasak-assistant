@@ -120,7 +120,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Con un backend remoto, la memoria no se lee ni se escribe salvo que la
     // persona lo haya permitido.
     let remote_blocked = !backend.info().local && !settings.share_memory_with_remote;
-    let memory = Arc::new(Memory::from_env(secrets.clone()).with_remote_blocked(remote_blocked));
+    // `remote_blocked` mira lo configurado; la puerta de cada pedido mira el
+    // modelo efectivo (`Memory::allowed_for`).
+    let memory = Arc::new(
+        Memory::from_env(secrets.clone())
+            .with_remote_blocked(remote_blocked)
+            .with_share_with_remote(settings.share_memory_with_remote),
+    );
     let service = AssistantService {
         backend,
         conversations: conversations.clone(),

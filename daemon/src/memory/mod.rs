@@ -125,6 +125,9 @@ pub struct Memory {
     /// Con un backend remoto y sin `share_memory_with_remote`: ni se lee ni se
     /// escribe.
     remote_blocked: bool,
+    /// `share_memory_with_remote`: si la memoria se usa también con un modelo
+    /// que no es local. Decide la puerta de cada pedido ([`Self::allowed_for`]).
+    share_with_remote: bool,
     /// Una sola extracción a la vez, con `try_acquire`: si hay una en curso,
     /// el turno no se aprende. Propio, aparte de los permisos del chat.
     learning: Semaphore,
@@ -150,6 +153,7 @@ impl Memory {
             secrets,
             db: Mutex::new(None),
             remote_blocked: false,
+            share_with_remote: false,
             learning: Semaphore::new(1),
             epoch: AtomicU64::new(0),
             windows: parking_lot::Mutex::default(),
@@ -161,6 +165,21 @@ impl Memory {
     pub fn with_remote_blocked(mut self, blocked: bool) -> Self {
         self.remote_blocked = blocked;
         self
+    }
+
+    /// Con `share_memory_with_remote` de `vasak.conf`.
+    pub fn with_share_with_remote(mut self, share: bool) -> Self {
+        self.share_with_remote = share;
+        self
+    }
+
+    /// La puerta de cada pedido: si la memoria puede ir al modelo que va a
+    /// responder. Se decide con el modelo **efectivo** (`active_model`, el que
+    /// resuelve el backend en ese momento), no con el configurado: sin modelo
+    /// en `vasak.conf`, Ollama toma el primero instalado, y puede ser uno
+    /// `:cloud`. Si el backend no contesta, no (falla cerrado).
+    pub async fn allowed_for(&self, backend: &dyn ModelBackend) -> bool {
+        self.share_with_remote || backend.active_model().await.is_ok_and(|model| model.local)
     }
 
     /// Con la carpeta del entorno del proceso.
@@ -278,8 +297,9 @@ impl Memory {
             let Ok(_permit) = memory.learning.try_acquire() else {
                 return;
             };
-            // Antes de mandarle nada al modelo: que la memoria se pueda usar.
-            if memory.database().await.is_err() {
+            // Antes de mandarle nada al modelo: que la memoria se pueda usar
+            // y que el modelo que va a extraer pueda verla.
+            if memory.database().await.is_err() || !memory.allowed_for(&*backend).await {
                 return;
             }
             let request = learn::extraction_request(&conversation, gate);

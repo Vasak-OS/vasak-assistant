@@ -558,6 +558,10 @@ pub struct ScriptedBackend {
     pub replies: Mutex<std::collections::VecDeque<Result<String, BackendError>>>,
     pub seen: Mutex<Vec<Vec<Message>>>,
     pub local: bool,
+    /// Si el modelo que resuelve cada pedido (`active_model`) es local, cuando
+    /// difiere de lo configurado (`info`). `Some(false)` con `local: true`
+    /// simula Ollama sin modelo configurado cuyo primer instalado es `:cloud`.
+    pub effective_local: Option<bool>,
 }
 
 impl ScriptedBackend {
@@ -566,6 +570,20 @@ impl ScriptedBackend {
             replies: Mutex::new(replies.into_iter().map(|r| Ok(r.to_owned())).collect()),
             seen: Mutex::default(),
             local: true,
+            effective_local: None,
+        })
+    }
+
+    /// Como [`Self::new`], pero sin modelo configurado y con el primero
+    /// instalado `:cloud`: `info` dice local, `active_model` dice remoto.
+    // Infraestructura para las pruebas de la puerta del remoto, que escribe qa.
+    #[allow(dead_code)]
+    pub fn cloud_by_default(replies: impl IntoIterator<Item = &'static str>) -> Arc<Self> {
+        Arc::new(Self {
+            replies: Mutex::new(replies.into_iter().map(|r| Ok(r.to_owned())).collect()),
+            seen: Mutex::default(),
+            local: true,
+            effective_local: Some(false),
         })
     }
 
@@ -597,7 +615,11 @@ impl ModelBackend for ScriptedBackend {
     }
 
     fn active_model(&self) -> BoxFuture<'_, Result<ModelInfo, BackendError>> {
-        let info = self.info();
+        let mut info = self.info();
+        if let Some(local) = self.effective_local {
+            info.local = local;
+            info.name = "gpt-oss:120b-cloud".into();
+        }
         Box::pin(async move { Ok(info) })
     }
 
