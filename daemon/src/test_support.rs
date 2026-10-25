@@ -576,8 +576,6 @@ impl ScriptedBackend {
 
     /// Como [`Self::new`], pero sin modelo configurado y con el primero
     /// instalado `:cloud`: `info` dice local, `active_model` dice remoto.
-    // Infraestructura para las pruebas de la puerta del remoto, que escribe qa.
-    #[allow(dead_code)]
     pub fn cloud_by_default(replies: impl IntoIterator<Item = &'static str>) -> Arc<Self> {
         Arc::new(Self {
             replies: Mutex::new(replies.into_iter().map(|r| Ok(r.to_owned())).collect()),

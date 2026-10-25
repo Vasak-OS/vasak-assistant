@@ -1989,3 +1989,179 @@ mod bus_label_tests {
         assert_eq!(BusLabels.label(&me, Some(":1.99999")).await, Err(()));
     }
 }
+
+/// La puerta del remoto se decide con el modelo efectivo de cada pedido.
+#[cfg(test)]
+mod effective_model_tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::memory::schema::MemoryKind;
+    use crate::memory::{learn::Extraction, learn::Item, REASON_REMOTE};
+    use crate::test_support::{FakeBackend, FixedKey, ScriptedBackend, TempDir};
+
+    const OWNER: &str = ":1.1";
+    const EXTRACTION: &str =
+        r#"{"items":[{"kind":"preference","text":"Prefiere el mate amargo"}],"summary":null}"#;
+
+    struct Rig {
+        _tmp: TempDir,
+        service: AssistantService,
+    }
+
+    /// Un servicio con la memoria encendida y con "Prefiere respuestas cortas"
+    /// ya guardado, sobre el backend dado.
+    async fn rig(backend: Arc<dyn ModelBackend>, share_with_remote: bool) -> Rig {
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        // Como en `main`: lo configurado es local, así que `remote_blocked` es falso;
+        // lo que decide es el modelo efectivo de cada pedido.
+        let memory = Arc::new(
+            Memory::new(Some(tmp.memory_dir()), keys.clone())
+                .with_remote_blocked(false)
+                .with_share_with_remote(share_with_remote),
+        );
+        memory.set_enabled(true).await.unwrap();
+        memory
+            .store(
+                Extraction {
+                    items: vec![Item {
+                        kind: MemoryKind::Preference,
+                        text: "Prefiere respuestas cortas".into(),
+                        phrase: None,
+                        topics: Vec::new(),
+                    }],
+                    summary: None,
+                },
+                "c0",
+            )
+            .await
+            .unwrap();
+        let service = AssistantService {
+            backend,
+            conversations: Arc::default(),
+            remote_allowed: true,
+            secrets: keys,
+            memory,
+            labels: Arc::new(BusLabels),
+        };
+        Rig { _tmp: tmp, service }
+    }
+
+    async fn chat(rig: &Rig, text: &str) {
+        let id = rig.service.open(OWNER).unwrap();
+        rig.service.chat_as(OWNER, &id, text).await.unwrap();
+        // Una extracción que no tendría que ocurrir tendría tiempo de ocurrir.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    async fn remembers(rig: &Rig, needle: &str) -> bool {
+        rig.service
+            .memory
+            .recall("zzz", true)
+            .await
+            .is_some_and(|notes| notes.contains(needle))
+    }
+
+    #[tokio::test]
+    async fn con_el_primer_modelo_instalado_en_la_nube_y_sin_permiso_la_memoria_no_entra_ni_se_aprende(
+    ) {
+        let backend = ScriptedBackend::cloud_by_default(["Hola.", EXTRACTION]);
+        let rig = rig(backend.clone(), false).await;
+
+        chat(&rig, "prefiero el mate amargo, ¿qué tal?").await;
+
+        let seen = backend.seen.lock().clone();
+        assert_eq!(seen.len(), 1, "ni una extracción");
+        assert!(seen[0].iter().all(|m| m.role != Role::System));
+        assert!(seen[0]
+            .iter()
+            .all(|m| !m.content.contains("Prefiere respuestas cortas")));
+        assert!(!remembers(&rig, "mate amargo").await, "nada se guardó");
+        // Lo que ya había sigue ahí, para quien sí puede verlo.
+        assert!(remembers(&rig, "Prefiere respuestas cortas").await);
+    }
+
+    #[tokio::test]
+    async fn el_estado_y_las_capacidades_dicen_que_la_memoria_no_se_comparte_con_ese_modelo() {
+        let rig = rig(ScriptedBackend::cloud_by_default([]), false).await;
+
+        let status = rig.service.memory_status_now().await;
+        assert!(status.enabled && !status.available);
+        assert_eq!(status.reason, REASON_REMOTE);
+        let all = capabilities(true, &status);
+        let memory = all
+            .iter()
+            .find(|c| c.domain == vasak_assistant_protocol::DOMAIN_MEMORY)
+            .unwrap();
+        assert!(!memory.available);
+        assert_eq!(memory.reason, REASON_REMOTE);
+    }
+
+    #[tokio::test]
+    async fn con_share_memory_with_remote_el_mismo_modelo_en_la_nube_si_ve_la_memoria() {
+        let backend = ScriptedBackend::cloud_by_default(["Hola.", EXTRACTION]);
+        let rig = rig(backend.clone(), true).await;
+
+        chat(&rig, "prefiero el mate amargo, ¿qué tal?").await;
+
+        let seen = backend.seen.lock().clone();
+        assert_eq!(seen.len(), 2, "el chat y la extracción");
+        assert_eq!(seen[0][0].role, Role::System);
+        assert!(seen[0][0].content.contains("Prefiere respuestas cortas"));
+        assert!(remembers(&rig, "mate amargo").await);
+        let status = rig.service.memory_status_now().await;
+        assert!(status.available, "{status:?}");
+    }
+
+    #[tokio::test]
+    async fn con_un_modelo_efectivo_local_la_memoria_entra_aunque_no_se_comparta() {
+        let backend = ScriptedBackend::new(["Hola.", EXTRACTION]);
+        let rig = rig(backend.clone(), false).await;
+
+        chat(&rig, "prefiero el mate amargo, ¿qué tal?").await;
+
+        let seen = backend.seen.lock().clone();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0][0].role, Role::System);
+        assert!(remembers(&rig, "mate amargo").await);
+        assert!(rig.service.memory_status_now().await.available);
+    }
+
+    #[tokio::test]
+    async fn si_el_backend_no_dice_que_modelo_usa_la_puerta_falla_cerrada() {
+        let mut fake = FakeBackend::replying("Hola.");
+        fake.active_result = Err(crate::backend::BackendError::Unavailable(
+            "sin modelo".into(),
+        ));
+        let backend = Arc::new(fake);
+        let rig = rig(backend.clone(), false).await;
+
+        chat(&rig, "prefiero el mate amargo, ¿qué tal?").await;
+
+        let seen = backend.seen.lock().clone();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].iter().all(|m| m.role != Role::System));
+        assert!(!remembers(&rig, "mate amargo").await);
+        // Con permiso para compartir no hace falta saber qué modelo es.
+        let allowed = Memory::new(None, FixedKey::new(None)).with_share_with_remote(true);
+        assert!(allowed.allowed_for(&*backend).await);
+    }
+
+    #[tokio::test]
+    async fn un_llamador_sin_confinar_y_un_modelo_en_la_nube_tampoco_se_salta_la_puerta() {
+        // La puerta del modelo vale para cualquier llamador, no sólo para los confinados.
+        let backend = ScriptedBackend::cloud_by_default(["Hola."]);
+        let rig = rig(backend.clone(), false).await;
+        let id = rig.service.open(OWNER).unwrap();
+
+        rig.service
+            .chat_with(OWNER, &id, "hola", true)
+            .await
+            .unwrap();
+
+        assert!(backend.seen.lock()[0]
+            .iter()
+            .all(|m| m.role != Role::System));
+    }
+}
