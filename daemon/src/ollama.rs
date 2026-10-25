@@ -64,8 +64,18 @@ impl OllamaBackend {
         Ok(model)
     }
 
-    async fn send_chat(&self, messages: &[Message]) -> Result<String, BackendError> {
+    /// Una sola resolución del modelo para decidir y mandar. Con
+    /// `require_local`, si el modelo resuelto no es local (`cloud`, o una
+    /// dirección remota) no se manda nada.
+    async fn send_chat(
+        &self,
+        messages: &[Message],
+        require_local: bool,
+    ) -> Result<String, BackendError> {
         let model = self.resolve_model().await?;
+        if require_local && !(self.info().local && !crate::config::is_ollama_cloud_model(&model)) {
+            return Err(crate::backend::not_local());
+        }
         let response = self
             .client
             .post(http::endpoint(self.base(), "api/chat")?)
@@ -115,7 +125,14 @@ impl ModelBackend for OllamaBackend {
     }
 
     fn chat<'a>(&'a self, messages: &'a [Message]) -> BoxFuture<'a, Result<String, BackendError>> {
-        Box::pin(self.send_chat(messages))
+        Box::pin(self.send_chat(messages, false))
+    }
+
+    fn chat_local_only<'a>(
+        &'a self,
+        messages: &'a [Message],
+    ) -> BoxFuture<'a, Result<String, BackendError>> {
+        Box::pin(self.send_chat(messages, true))
     }
 }
 
@@ -491,5 +508,90 @@ mod tests {
             lista,
             BackendError::Failed("lista de modelos ilegible".into())
         );
+    }
+
+    // ── chat_local_only: una sola resolución decide y manda ───────────────────
+
+    use crate::backend::is_not_local;
+
+    fn chats(server: &FakeServer) -> usize {
+        server
+            .captured()
+            .iter()
+            .filter(|r| r.path == "/api/chat")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn chat_local_only_con_un_modelo_local_manda_el_chat_con_una_sola_lista_de_modelos() {
+        let server = ollama(|| Reply::json(CHAT)).await;
+
+        let reply = backend(&server, None)
+            .chat_local_only(&[user("hola")])
+            .await
+            .unwrap();
+
+        assert_eq!(reply, "Hola, soy Lince.");
+        let paths: Vec<_> = server.captured().iter().map(|r| r.path.clone()).collect();
+        assert_eq!(paths, ["/api/tags", "/api/chat"]);
+    }
+
+    #[tokio::test]
+    async fn chat_local_only_con_el_primer_modelo_en_la_nube_no_manda_nada_ni_con_allow_remote() {
+        let server = ollama_cloud().await;
+
+        let error = cloud_backend(&server, true)
+            .chat_local_only(&[user("hola")])
+            .await
+            .unwrap_err();
+
+        assert!(is_not_local(&error), "{error:?}");
+        assert_eq!(chats(&server), 0);
+        // El mismo modelo por `chat` común sí sale (allow_remote lo permite).
+        cloud_backend(&server, true)
+            .chat(&[user("hola")])
+            .await
+            .unwrap();
+        assert_eq!(chats(&server), 1);
+    }
+
+    #[tokio::test]
+    async fn chat_local_only_ve_el_cambio_de_modelo_aunque_el_estado_hubiera_dicho_local() {
+        let tags_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = tags_calls.clone();
+        let server = FakeServer::start(move |pedido| match pedido.path.as_str() {
+            // La primera lista tiene un local; de ahí en adelante, sólo uno `cloud`.
+            "/api/tags" if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 => {
+                Reply::json(TAGS)
+            }
+            "/api/tags" => Reply::json(CLOUD_TAGS),
+            "/api/chat" => Reply::json(CHAT),
+            _ => Reply::status(404),
+        })
+        .await;
+        let ollama = cloud_backend(&server, true);
+
+        let info = ollama.active_model().await.unwrap();
+        assert!(info.local, "{info:?}");
+        let error = ollama.chat_local_only(&[user("hola")]).await.unwrap_err();
+
+        assert!(is_not_local(&error), "{error:?}");
+        assert_eq!(chats(&server), 0);
+        assert_eq!(tags_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn chat_local_only_con_una_direccion_remota_no_manda() {
+        let server = ollama(|| Reply::json(CHAT)).await;
+        let mut selection = local_selection("ollama", &server.url(""), None);
+        selection.local = false;
+
+        let error = OllamaBackend::new(client(), selection, true)
+            .chat_local_only(&[user("hola")])
+            .await
+            .unwrap_err();
+
+        assert!(is_not_local(&error), "{error:?}");
+        assert_eq!(chats(&server), 0);
     }
 }

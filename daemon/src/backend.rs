@@ -46,6 +46,38 @@ pub trait ModelBackend: Send + Sync {
     /// La respuesta del modelo a la conversación, que termina con el mensaje de
     /// la persona.
     fn chat<'a>(&'a self, messages: &'a [Message]) -> BoxFuture<'a, Result<String, BackendError>>;
+
+    /// Como [`Self::chat`], pero sólo si el modelo que responde es local: lo
+    /// decide la misma resolución que manda el pedido, así nada que haya
+    /// pasado la puerta de la memoria sale por un cambio de modelo en el
+    /// medio. Si no es local, o no se pudo saber, contesta
+    /// `Unavailable(NOT_LOCAL)` sin mandar nada. Por omisión decide
+    /// [`Self::info`], que vale para un backend cuya dirección y modelo son
+    /// fijos (el de OpenAI); el de Ollama lo resuelve por pedido.
+    fn chat_local_only<'a>(
+        &'a self,
+        messages: &'a [Message],
+    ) -> BoxFuture<'a, Result<String, BackendError>> {
+        Box::pin(async move {
+            if !self.info().local {
+                return Err(not_local());
+            }
+            self.chat(messages).await
+        })
+    }
+}
+
+/// El motivo de [`ModelBackend::chat_local_only`] cuando el modelo no es local.
+pub const NOT_LOCAL: &str =
+    "El modelo que respondería no es local: lo que viene de la memoria no se le manda.";
+
+pub fn not_local() -> BackendError {
+    BackendError::Unavailable(NOT_LOCAL.into())
+}
+
+/// Si el error es el rechazo de [`ModelBackend::chat_local_only`].
+pub fn is_not_local(error: &BackendError) -> bool {
+    matches!(error, BackendError::Unavailable(text) if text == NOT_LOCAL)
 }
 
 /// El backend que queda cuando la configuración no se puede usar (un remoto sin
@@ -148,6 +180,16 @@ impl ModelBackend for Limited {
         Box::pin(async move {
             let _permit = self.permit().await?;
             self.inner.chat(messages).await
+        })
+    }
+
+    fn chat_local_only<'a>(
+        &'a self,
+        messages: &'a [Message],
+    ) -> BoxFuture<'a, Result<String, BackendError>> {
+        Box::pin(async move {
+            let _permit = self.permit().await?;
+            self.inner.chat_local_only(messages).await
         })
     }
 }
@@ -296,5 +338,60 @@ mod tests {
         assert_eq!(rejected.models().await.unwrap_err(), esperado);
         assert_eq!(rejected.active_model().await.unwrap_err(), esperado);
         assert_eq!(rejected.chat(&[]).await.unwrap_err(), esperado);
+    }
+
+    // ── chat_local_only ───────────────────────────────────────────────────────
+
+    fn hello() -> Vec<Message> {
+        vec![Message {
+            role: vasak_assistant_protocol::Role::User,
+            content: "hola".into(),
+        }]
+    }
+
+    #[tokio::test]
+    async fn por_omision_chat_local_only_decide_con_la_info_y_no_manda_si_no_es_local() {
+        let remote = RejectedBackend {
+            info: ModelInfo {
+                local: false,
+                ..model_info("gpt")
+            },
+            reason: "se mandó".into(),
+        };
+        let error = remote.chat_local_only(&hello()).await.unwrap_err();
+        assert!(is_not_local(&error), "{error:?}");
+        assert_eq!(error, not_local());
+
+        // Local: pasa a `chat` (acá, el error propio del backend rechazado).
+        let error = rejected().chat_local_only(&hello()).await.unwrap_err();
+        assert!(!is_not_local(&error), "{error:?}");
+        assert_eq!(
+            error,
+            BackendError::Unavailable("No se puede usar esta configuración.".into())
+        );
+    }
+
+    #[test]
+    fn solo_el_rechazo_de_chat_local_only_cuenta_como_no_local() {
+        assert!(is_not_local(&not_local()));
+        assert!(!is_not_local(&BackendError::Failed(NOT_LOCAL.into())));
+        assert!(!is_not_local(&BackendError::Unavailable("otro".into())));
+    }
+
+    #[tokio::test]
+    async fn limited_pasa_chat_local_only_al_backend_de_adentro_sin_cache() {
+        use crate::test_support::ScriptedBackend;
+        let cloud = ScriptedBackend::cloud_by_default(["no"]);
+        let limited = Limited::new(cloud.clone());
+        // Aunque el modelo activo quede en caché, chat_local_only vuelve a resolver.
+        limited.active_model().await.unwrap();
+        let error = limited.chat_local_only(&hello()).await.unwrap_err();
+        assert!(is_not_local(&error), "{error:?}");
+        assert!(cloud.seen.lock().is_empty(), "no se mandó nada");
+
+        let local = ScriptedBackend::new(["ok"]);
+        let limited = Limited::new(local.clone());
+        assert_eq!(limited.chat_local_only(&hello()).await.unwrap(), "ok");
+        assert_eq!(local.seen.lock().len(), 1);
     }
 }

@@ -6,6 +6,17 @@
 //! igual, en el proxy del crate `vasak-assistant-protocol`.
 //!
 //! El contenido de las conversaciones nunca va al registro.
+//!
+//! # Aplicaciones confinadas
+//!
+//! La memoria y las claves son de la persona, no de cada aplicación. Un
+//! llamador confinado por AppArmor (su `LinuxSecurityLabel`, que da el bus con
+//! `GetConnectionCredentials`, existe y no es `unconfined`) no puede
+//! encender, apagar ni borrar la memoria ni guardar o consultar claves
+//! (`AccessDenied`), y su `Chat` va sin memoria: no se le pasan notas ni se
+//! aprende de lo que dice. `MemoryStatus` y `Capabilities` siguen abiertos.
+//! Sin etiqueta (no hay AppArmor) se deja pasar; una vacía, no. No se mira
+//! `/proc/<pid>/exe`: la unidad corre con un namespace de usuario y da EACCES.
 
 use std::sync::Arc;
 
@@ -15,13 +26,15 @@ use zbus::names::BusName;
 use zbus::{interface, Connection};
 
 use vasak_assistant_protocol::{
-    Capability, Error, Message, ServiceStatus, DOMAINS, DOMAIN_REMOTE_BACKENDS,
+    Capability, Error, MemoryStatus, Message, Role, ServiceStatus, DOMAINS, DOMAIN_MEMORY,
+    DOMAIN_REMOTE_BACKENDS,
 };
 
-use crate::backend::{BackendError, ModelBackend};
+use crate::backend::{is_not_local, BackendError, BoxFuture, ModelBackend};
 use crate::config::{is_local, normalize_url};
 use crate::conversations::Conversations;
 use crate::keyring::{ApiKey, SecretSource};
+use crate::memory::Memory;
 
 pub struct AssistantService {
     pub backend: Arc<dyn ModelBackend>,
@@ -30,6 +43,68 @@ pub struct AssistantService {
     pub remote_allowed: bool,
     /// El llavero, para guardar y consultar la clave del proveedor.
     pub secrets: Arc<dyn SecretSource>,
+    /// La memoria del asistente (apagada hasta que la persona la enciende).
+    pub memory: Arc<Memory>,
+    /// De dónde sale la etiqueta de seguridad de quien llama.
+    pub labels: Arc<dyn CallerLabels>,
+}
+
+/// La etiqueta de seguridad de quien llama. Un rasgo para que las pruebas
+/// pongan una de mentira (`test_support::FixedLabel`).
+pub trait CallerLabels: Send + Sync {
+    /// `Ok(None)` sin etiqueta (no hay AppArmor, o es una conexión punto a
+    /// punto, sin remitente). `Err` si el bus no contestó: se trata como
+    /// confinado.
+    fn label<'a>(
+        &'a self,
+        connection: &'a Connection,
+        sender: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, ()>>;
+}
+
+/// La del bus: `org.freedesktop.DBus.GetConnectionCredentials(remitente)`,
+/// campo `LinuxSecurityLabel`.
+pub struct BusLabels;
+
+impl CallerLabels for BusLabels {
+    fn label<'a>(
+        &'a self,
+        connection: &'a Connection,
+        sender: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, ()>> {
+        Box::pin(async move {
+            let Some(sender) = sender else {
+                return Ok(None);
+            };
+            let name = zbus::names::UniqueName::try_from(sender).map_err(drop)?;
+            let bus = zbus::fdo::DBusProxy::new(connection).await.map_err(drop)?;
+            let credentials = bus
+                .get_connection_credentials(BusName::Unique(name))
+                .await
+                .map_err(|error| {
+                    tracing::warn!("no se pudieron leer las credenciales de {sender}: {error}");
+                })?;
+            Ok(credentials.into_linux_security_label())
+        })
+    }
+}
+
+/// Si la etiqueta de AppArmor dice que el llamador está confinado: existe y
+/// no es exactamente `unconfined`. Llega como bytes terminados en NUL, por
+/// ejemplo `vasak-appimage (enforce)`. Sin etiqueta (`None`), no está
+/// confinado; una etiqueta vacía o que no se entiende, sí: falla cerrado.
+pub fn is_confined(label: Option<&[u8]>) -> bool {
+    let Some(label) = label else {
+        return false;
+    };
+    let label = label.strip_suffix(&[0]).unwrap_or(label);
+    String::from_utf8_lossy(label).trim() != "unconfined"
+}
+
+fn access_denied() -> Error {
+    Error::AccessDenied(
+        "Una aplicación confinada no puede cambiar la memoria ni las claves del asistente.".into(),
+    )
 }
 
 #[interface(name = "ar.net.vasak.os.Assistant")]
@@ -40,9 +115,10 @@ impl AssistantService {
     }
 
     /// Las capacidades sobre cada dominio. Las de datos del usuario no están
-    /// en esta fase: se dicen no disponibles, nunca rotas.
-    fn capabilities(&self) -> Vec<Capability> {
-        capabilities(self.remote_allowed)
+    /// en esta fase: se dicen no disponibles, nunca rotas. `memory`, según la
+    /// memoria esté encendida y abierta.
+    async fn capabilities(&self) -> Vec<Capability> {
+        capabilities(self.remote_allowed, &self.memory_status_now().await)
     }
 
     /// Los modelos instalados en el backend.
@@ -92,14 +168,18 @@ impl AssistantService {
         self.history_of(owner(&header), conversation_id)
     }
 
-    /// Manda un mensaje y devuelve la respuesta del modelo.
+    /// Manda un mensaje y devuelve la respuesta del modelo. Un llamador
+    /// confinado chatea sin memoria.
     async fn chat(
         &self,
         #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
         conversation_id: &str,
         content: &str,
     ) -> Result<String, Error> {
-        self.chat_as(owner(&header), conversation_id, content).await
+        let use_memory = !self.confined(connection, &header).await;
+        self.chat_with(owner(&header), conversation_id, content, use_memory)
+            .await
     }
 
     /// Cierra una conversación de quien llama y olvida sus mensajes.
@@ -112,13 +192,101 @@ impl AssistantService {
     }
 
     /// Guarda en el llavero la clave del proveedor de esa dirección.
-    async fn set_provider_key(&self, url: &str, key: &str) -> Result<(), Error> {
+    /// `AccessDenied` para un llamador confinado.
+    async fn set_provider_key(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        url: &str,
+        key: &str,
+    ) -> Result<(), Error> {
+        self.deny_confined(connection, &header).await?;
         self.store_provider_key(url, key).await
     }
 
-    /// Si hay una clave guardada para esa dirección.
-    async fn has_provider_key(&self, url: &str) -> Result<bool, Error> {
+    /// Si hay una clave guardada para esa dirección. `AccessDenied` para un
+    /// llamador confinado.
+    async fn has_provider_key(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        url: &str,
+    ) -> Result<bool, Error> {
+        self.deny_confined(connection, &header).await?;
         self.has_provider_key_for(url).await
+    }
+
+    /// Cómo está la memoria. Nunca falla: el problema va en el motivo.
+    async fn memory_status(&self) -> MemoryStatus {
+        self.memory_status_now().await
+    }
+
+    /// Enciende o apaga la memoria. Encender reabre la base que haya (o la
+    /// crea vacía con una llave nueva); apagar deja de usarla y de escribirla,
+    /// sin borrar nada: borrar es sólo `ClearMemory`. `AccessDenied` para un
+    /// llamador confinado.
+    async fn set_memory_enabled(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        self.deny_confined(connection, &header).await?;
+        self.memory.set_enabled(enabled).await
+    }
+
+    /// Borra la memoria (la llave y los archivos) y, si estaba encendida, la
+    /// recrea vacía. `AccessDenied` para un llamador confinado.
+    async fn clear_memory(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> Result<(), Error> {
+        self.deny_confined(connection, &header).await?;
+        self.memory.clear().await
+    }
+}
+
+impl AssistantService {
+    /// El estado de la memoria con la misma puerta que los pedidos: si está
+    /// disponible pero el modelo efectivo es remoto sin permiso, no lo está.
+    pub async fn memory_status_now(&self) -> MemoryStatus {
+        let mut status = self.memory.status().await;
+        if status.available && !self.memory.shares_with_remote() {
+            let reason = match self.backend.active_model().await {
+                Ok(model) if model.local => None,
+                Ok(_) => Some(crate::memory::REASON_REMOTE),
+                Err(_) => Some(crate::memory::REASON_MODEL_UNREACHABLE),
+            };
+            if let Some(reason) = reason {
+                status.available = false;
+                status.reason = reason.to_owned();
+            }
+        }
+        status
+    }
+}
+
+/// El pegamento con el bus para la puerta de AppArmor.
+impl AssistantService {
+    /// Si quien manda el pedido está confinado. Si el bus no contesta, sí.
+    async fn confined(&self, connection: &Connection, header: &Header<'_>) -> bool {
+        let sender = header.sender().map(|sender| sender.as_str());
+        match self.labels.label(connection, sender).await {
+            Ok(label) => is_confined(label.as_deref()),
+            Err(()) => true,
+        }
+    }
+
+    async fn deny_confined(
+        &self,
+        connection: &Connection,
+        header: &Header<'_>,
+    ) -> Result<(), Error> {
+        if self.confined(connection, header).await {
+            return Err(access_denied());
+        }
+        Ok(())
     }
 }
 
@@ -155,24 +323,89 @@ impl AssistantService {
         self.conversations.lock().history(owner, conversation_id)
     }
 
+    /// El chat con memoria. Lo usan las pruebas; el bus pasa por
+    /// [`Self::chat_with`].
+    #[cfg(test)]
     pub async fn chat_as(
         &self,
         owner: &str,
         conversation_id: &str,
         content: &str,
     ) -> Result<String, Error> {
-        let context = self
+        self.chat_with(owner, conversation_id, content, true).await
+    }
+
+    /// El chat, con o sin memoria (un llamador confinado va sin: ni notas ni
+    /// aprendizaje).
+    pub async fn chat_with(
+        &self,
+        owner: &str,
+        conversation_id: &str,
+        content: &str,
+        use_memory: bool,
+    ) -> Result<String, Error> {
+        let mut context = self
             .conversations
             .lock()
             .begin_turn(owner, conversation_id, content)?;
+        // El guardián va antes de cualquier espera: si el pedido se abandona
+        // mientras se lee la memoria, la conversación igual se libera.
         let mut turn = Turn {
             conversations: &self.conversations,
             id: conversation_id,
             content,
             reply: None,
         };
-        let reply = self.backend.chat(&context).await.map_err(to_dbus)?;
+        let first_turn = context.iter().filter(|m| m.role == Role::User).count() == 1;
+        // La puerta del remoto con el modelo que va a responder este pedido:
+        // remoto y sin `share_memory_with_remote`, ni notas ni aprendizaje.
+        // Filtro previo: no se lee la memoria si el modelo de ahora no la
+        // puede ver. La decisión que vale es la de `chat_local_only`, que usa
+        // la misma resolución que manda el pedido.
+        let mut use_memory = use_memory && self.memory.allowed_for(&*self.backend).await;
+        // Las notas de la memoria van sólo en el contexto de este turno: no al
+        // historial ni a `History`.
+        let notes = if use_memory {
+            self.memory.recall(content, first_turn).await
+        } else {
+            None
+        };
+        let with_notes = notes.map(|notes| {
+            let mut with_notes = Vec::with_capacity(context.len() + 1);
+            with_notes.push(Message {
+                role: Role::System,
+                content: notes,
+            });
+            with_notes.extend(context.iter().cloned());
+            with_notes
+        });
+        let reply = match &with_notes {
+            Some(with_notes) if !self.memory.shares_with_remote() => {
+                match self.backend.chat_local_only(with_notes).await {
+                    // El modelo pasó a ser remoto entre la puerta y el envío:
+                    // se reintenta sin notas (la persona igual tiene respuesta,
+                    // y la conversación ya podía ir a ese modelo) y ese turno
+                    // no se aprende.
+                    Err(error) if is_not_local(&error) => {
+                        use_memory = false;
+                        self.backend.chat(&context).await
+                    }
+                    other => other,
+                }
+            }
+            Some(with_notes) => self.backend.chat(with_notes).await,
+            None => self.backend.chat(&context).await,
+        }
+        .map_err(to_dbus)?;
         turn.reply = Some(reply.clone());
+        context.push(Message {
+            role: Role::Assistant,
+            content: reply.clone(),
+        });
+        if use_memory {
+            self.memory
+                .learn_after(self.backend.clone(), conversation_id, context);
+        }
         Ok(reply)
     }
 
@@ -265,12 +498,14 @@ impl Drop for Turn<'_> {
 }
 
 /// Las capacidades de [`DOMAINS`]. `remote_backends` está si la configuración
-/// permite un proveedor remoto; las demás, todavía no.
-pub fn capabilities(remote_allowed: bool) -> Vec<Capability> {
+/// permite un proveedor remoto; `memory`, si la memoria está encendida y
+/// abierta, con el motivo de `memory` si no; las demás, todavía no.
+pub fn capabilities(remote_allowed: bool, memory: &MemoryStatus) -> Vec<Capability> {
     DOMAINS
         .iter()
         .map(|&domain| {
             let (available, reason) = match domain {
+                DOMAIN_MEMORY => (memory.enabled && memory.available, memory.reason.as_str()),
                 DOMAIN_REMOTE_BACKENDS if remote_allowed => (true, ""),
                 DOMAIN_REMOTE_BACKENDS => (
                     false,
@@ -309,7 +544,9 @@ mod tests {
 
     use super::*;
     use crate::backend::RejectedBackend;
-    use crate::test_support::{model_info, p2p_pair, FakeBackend, FixedKey};
+    use crate::test_support::{
+        memory_off, memory_status_off, model_info, p2p_pair, FakeBackend, FixedKey,
+    };
     use vasak_assistant_protocol::{
         AssistantProxy, Role, DOMAIN_MAIL, DOMAIN_MEMORY, MAX_CONVERSATIONS,
         MAX_CONVERSATIONS_PER_OWNER, SERVICE_PATH,
@@ -324,6 +561,8 @@ mod tests {
             conversations: Arc::new(Mutex::new(Conversations::default())),
             remote_allowed,
             secrets: FixedKey::new(None),
+            memory: memory_off(),
+            labels: std::sync::Arc::new(crate::service::BusLabels),
         }
     }
 
@@ -347,7 +586,7 @@ mod tests {
 
     #[test]
     fn las_capacidades_cubren_todos_los_dominios_en_orden_y_ninguna_de_datos_esta_disponible() {
-        let all = capabilities(false);
+        let all = capabilities(false, &memory_status_off());
         assert_eq!(
             all.iter().map(|c| c.domain.as_str()).collect::<Vec<_>>(),
             DOMAINS
@@ -360,12 +599,12 @@ mod tests {
 
     #[test]
     fn remote_backends_esta_disponible_solo_si_la_configuracion_lo_permite() {
-        let permitido = capabilities(true);
+        let permitido = capabilities(true, &memory_status_off());
         let remoto = capability(&permitido, DOMAIN_REMOTE_BACKENDS);
         assert!(remoto.available);
         assert!(remoto.reason.is_empty());
 
-        let prohibido = capabilities(false);
+        let prohibido = capabilities(false, &memory_status_off());
         let remoto = capability(&prohibido, DOMAIN_REMOTE_BACKENDS);
         assert!(!remoto.available);
         assert!(remoto.reason.contains("allow_remote"));
@@ -373,7 +612,7 @@ mod tests {
 
     #[test]
     fn permitir_lo_remoto_no_habilita_las_capacidades_sobre_datos_del_usuario() {
-        let all = capabilities(true);
+        let all = capabilities(true, &memory_status_off());
         assert!(!capability(&all, DOMAIN_MAIL).available);
         assert!(!capability(&all, DOMAIN_MEMORY).available);
     }
@@ -456,6 +695,8 @@ mod tests {
             conversations: Arc::default(),
             remote_allowed: false,
             secrets: FixedKey::new(None),
+            memory: memory_off(),
+            labels: std::sync::Arc::new(crate::service::BusLabels),
         };
         let id = service.open(OWNER).unwrap();
 
@@ -496,6 +737,8 @@ mod tests {
             conversations: Arc::default(),
             remote_allowed: false,
             secrets: FixedKey::new(None),
+            memory: memory_off(),
+            labels: std::sync::Arc::new(crate::service::BusLabels),
         };
         let id = service.open(OWNER).unwrap();
         service.chat_as(OWNER, &id, "primero").await.unwrap_err();
@@ -564,6 +807,8 @@ mod tests {
             conversations: Arc::default(),
             remote_allowed: false,
             secrets: FixedKey::new(None),
+            memory: memory_off(),
+            labels: std::sync::Arc::new(crate::service::BusLabels),
         };
         let id = service.open(OWNER).unwrap();
         assert!(matches!(
@@ -736,6 +981,8 @@ mod tests {
             conversations: Arc::default(),
             remote_allowed: false,
             secrets: FixedKey::new(None),
+            memory: memory_off(),
+            labels: std::sync::Arc::new(crate::service::BusLabels),
         };
         let id = service.open(":1.1").unwrap();
         service.chat_as(":1.1", &id, "secreto").await.unwrap();
@@ -913,6 +1160,7 @@ mod tests {
         let keys = FixedKey::new(None);
         let service = AssistantService {
             secrets: keys.clone(),
+            labels: std::sync::Arc::new(crate::service::BusLabels),
             ..service(FakeBackend::replying(""), false)
         };
         (service, keys)
@@ -1105,5 +1353,1054 @@ mod tests {
             proxy.has_provider_key("no es url").await,
             Err(Error::InvalidArgs(_))
         ));
+    }
+}
+
+/// La memoria de punta a punta, por el servicio: aprender de un turno y
+/// recuperarlo en otro, lo apagado, lo remoto y lo que nunca se guarda.
+#[cfg(test)]
+mod memory_tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::memory::{REASON_OFF, REASON_REMOTE};
+    use crate::test_support::{FixedKey, ScriptedBackend, TempDir};
+    use vasak_assistant_protocol::{AssistantProxy, SERVICE_PATH};
+
+    const OWNER: &str = ":1.1";
+    const PREFERENCE: &str =
+        r#"{"items":[{"kind":"preference","text":"Prefiere respuestas cortas"}],"summary":null}"#;
+
+    struct World {
+        tmp: TempDir,
+        keys: Arc<FixedKey>,
+        backend: Arc<ScriptedBackend>,
+        service: AssistantService,
+    }
+
+    impl World {
+        /// Un servicio con la memoria encendida y un backend guionado.
+        async fn new(replies: impl IntoIterator<Item = &'static str>) -> Self {
+            let world = Self::off(replies, false);
+            world.service.memory.set_enabled(true).await.unwrap();
+            world
+        }
+
+        fn off(replies: impl IntoIterator<Item = &'static str>, remote_blocked: bool) -> Self {
+            let tmp = TempDir::new();
+            let keys = FixedKey::new(None);
+            let backend = ScriptedBackend::new(replies);
+            let memory = Arc::new(
+                Memory::new(Some(tmp.memory_dir()), keys.clone())
+                    .with_remote_blocked(remote_blocked),
+            );
+            let service = AssistantService {
+                backend: backend.clone(),
+                conversations: Arc::default(),
+                remote_allowed: false,
+                secrets: keys.clone(),
+                memory,
+                labels: std::sync::Arc::new(crate::service::BusLabels),
+            };
+            Self {
+                tmp,
+                keys,
+                backend,
+                service,
+            }
+        }
+
+        async fn say(&self, content: &str) -> (String, String) {
+            let id = self.service.open(OWNER).unwrap();
+            let reply = self.service.chat_as(OWNER, &id, content).await.unwrap();
+            (id, reply)
+        }
+
+        /// Espera a que lo extraído en segundo plano esté guardado.
+        async fn until_remembered(&self, needle: &str) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let notes = self.service.memory.recall("zzz", true).await;
+                if notes.is_some_and(|notes| notes.contains(needle)) {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "«{needle}» no se guardó"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// Da tiempo a que una extracción que no tendría que ocurrir ocurra.
+        async fn settle() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        fn first_of_call(&self, n: usize) -> Message {
+            self.backend.seen.lock()[n][0].clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn lo_que_se_aprende_en_un_turno_llega_al_modelo_en_otra_conversacion_y_no_al_historial()
+    {
+        let world = World::new(["Listo.", PREFERENCE, "Hola."]).await;
+
+        world.say("prefiero respuestas cortas").await;
+        world.backend.wait_for_calls(2).await;
+        world.until_remembered("Prefiere respuestas cortas").await;
+
+        let (id, _) = world.say("hola, ¿qué tal?").await;
+
+        let first = world.first_of_call(2);
+        assert_eq!(first.role, Role::System);
+        assert!(first.content.contains("Prefiere respuestas cortas"));
+        assert!(first.content.len() <= crate::memory::recall::MEMORY_CONTEXT_BYTES);
+        // El bloque va una sola vez y el mensaje de la persona sigue último.
+        let sent = world.backend.seen.lock()[2].clone();
+        assert_eq!(sent.iter().filter(|m| m.role == Role::System).count(), 1);
+        assert_eq!(sent.last().unwrap().content, "hola, ¿qué tal?");
+        // La historia no lo muestra.
+        let history = world.service.history_of(OWNER, &id).unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(history.iter().all(|m| m.role != Role::System));
+        assert!(history.iter().all(|m| !m.content.contains("Prefiere")));
+    }
+
+    #[tokio::test]
+    async fn el_pedido_de_extraccion_no_lleva_las_notas_de_la_memoria() {
+        let world = World::new(["Listo.", PREFERENCE, "Ok.", PREFERENCE]).await;
+        world.say("prefiero respuestas cortas").await;
+        world.backend.wait_for_calls(2).await;
+        world.until_remembered("Prefiere respuestas cortas").await;
+
+        world.say("además prefiero el mate").await;
+        world.backend.wait_for_calls(4).await;
+
+        let extraction = world.backend.seen.lock()[3].clone();
+        assert!(extraction
+            .iter()
+            .all(|m| !m.content.contains("Prefiere respuestas cortas")));
+    }
+
+    #[tokio::test]
+    async fn sin_recuerdos_el_modelo_recibe_solo_la_conversacion() {
+        let world = World::new(["Hola."]).await;
+
+        world.say("hola, ¿qué tal?").await;
+
+        let sent = world.backend.seen.lock()[0].clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].role, Role::User);
+    }
+
+    #[tokio::test]
+    async fn apagada_no_se_lee_ni_se_escribe_y_al_encender_el_recuerdo_esta() {
+        let world = World::new(["Listo.", PREFERENCE, "Ok.", "Hola."]).await;
+        world.say("prefiero respuestas cortas").await;
+        world.backend.wait_for_calls(2).await;
+        world.until_remembered("Prefiere respuestas cortas").await;
+        let key = world.keys.memory_key.lock().clone();
+        assert!(key.is_some());
+
+        world.service.memory.set_enabled(false).await.unwrap();
+        world.say("prefiero el mate amargo").await;
+        World::settle().await;
+
+        // Sólo la llamada del chat: ni notas ni una extracción.
+        assert_eq!(world.backend.seen.lock().len(), 3);
+        assert_eq!(world.first_of_call(2).role, Role::User);
+        // Los archivos y la llave quedan.
+        assert!(world.tmp.memory_dir().exists());
+        assert_eq!(*world.keys.memory_key.lock(), key);
+
+        world.service.memory.set_enabled(true).await.unwrap();
+        world.say("hola otra vez").await;
+        let first = world.first_of_call(3);
+        assert_eq!(first.role, Role::System);
+        assert!(first.content.contains("Prefiere respuestas cortas"));
+    }
+
+    #[tokio::test]
+    async fn con_un_backend_remoto_sin_permiso_no_se_inyecta_ni_se_extrae_y_se_ve_el_motivo() {
+        // Primero se aprende con un backend local...
+        let world = World::new(["Listo.", PREFERENCE]).await;
+        world.say("prefiero respuestas cortas").await;
+        world.backend.wait_for_calls(2).await;
+        world.until_remembered("Prefiere respuestas cortas").await;
+        world.service.memory.close().await;
+
+        // ...y la misma carpeta con un backend remoto sin el permiso.
+        let backend = Arc::new(ScriptedBackend {
+            replies: parking_lot::Mutex::default(),
+            seen: parking_lot::Mutex::default(),
+            local: false,
+            effective_local: None,
+        });
+        let remote =
+            Memory::new(Some(world.tmp.memory_dir()), world.keys.clone()).with_remote_blocked(true);
+        let service = AssistantService {
+            backend: backend.clone(),
+            conversations: Arc::default(),
+            remote_allowed: true,
+            secrets: world.keys.clone(),
+            memory: Arc::new(remote),
+            labels: std::sync::Arc::new(crate::service::BusLabels),
+        };
+        let id = service.open(OWNER).unwrap();
+
+        service
+            .chat_as(OWNER, &id, "prefiero el mate amargo")
+            .await
+            .unwrap();
+        World::settle().await;
+
+        let seen = backend.seen.lock().clone();
+        assert_eq!(seen.len(), 1, "ni una extracción");
+        assert!(seen[0].iter().all(|m| m.role != Role::System));
+        let status = service.memory.status().await;
+        assert_eq!(status.reason, REASON_REMOTE);
+        assert_eq!(
+            REASON_REMOTE,
+            "La memoria no se comparte con un proveedor remoto"
+        );
+        let all = capabilities(true, &status);
+        let memory = all.iter().find(|c| c.domain == DOMAIN_MEMORY).unwrap();
+        assert!(!memory.available);
+        assert_eq!(memory.reason, REASON_REMOTE);
+    }
+
+    #[tokio::test]
+    async fn un_recuerdo_con_un_secreto_o_un_dato_de_la_persona_no_se_guarda() {
+        const EXTRACTION: &str = r#"{"items":[
+            {"kind":"preference","text":"Usa la clave sk-abcdefghijklmnop"},
+            {"kind":"habit","text":"Su correo es ana@ejemplo.com"},
+            {"kind":"habit","text":"Guarda todo en /home/ana/docs"},
+            {"kind":"habit","text":"Nació el 12/03/1990"},
+            {"kind":"habit","text":"Su tarjeta es 4111 1111 1111 1111"},
+            {"kind":"preference","text":"Madruga siempre"}
+          ],"summary":null}"#;
+        let world = World::new(["Listo.", EXTRACTION]).await;
+
+        world.say("suelo madrugar siempre").await;
+        world.backend.wait_for_calls(2).await;
+        world.until_remembered("Madruga siempre").await;
+
+        let notes = world.service.memory.recall("zzz", true).await.unwrap();
+        for forbidden in ["sk-", "clave", "ana@", "/home", "1990", "4111"] {
+            assert!(!notes.contains(forbidden), "{forbidden}: {notes}");
+        }
+        world.service.memory.close().await;
+        let db = world.service.memory.database().await.unwrap();
+        let count = tokio::task::spawn_blocking(move || {
+            crate::memory::schema::MemoryKind::ALL
+                .into_iter()
+                .map(|kind| crate::memory::schema::entries(&db, kind).len())
+                .sum::<usize>()
+        })
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn un_ultimo_mensaje_con_un_dato_de_la_persona_no_manda_nada_al_modelo_extractor() {
+        let world = World::new(["Listo."]).await;
+
+        world
+            .say("escribime a ana@ejemplo.com, prefiero el mate")
+            .await;
+        World::settle().await;
+
+        // La ventana quedó vacía: no hay nada que pedirle al modelo.
+        assert_eq!(world.backend.seen.lock().len(), 1, "sólo el chat");
+    }
+
+    #[tokio::test]
+    async fn un_turno_con_un_secreto_no_dispara_la_extraccion() {
+        let world = World::new(["Listo."]).await;
+
+        world.say("mi contraseña es hunter2").await;
+        world.say("prefiero usar sk-abcdefgh12345678 siempre").await;
+        World::settle().await;
+
+        assert_eq!(world.backend.seen.lock().len(), 2, "sólo los dos chats");
+    }
+
+    #[tokio::test]
+    async fn una_extraccion_con_json_roto_no_rompe_el_chat_ni_guarda_nada() {
+        let world = World::new(["Listo.", "{\"items\": [{\"kind\": ", "Sigue."]).await;
+
+        world.say("prefiero respuestas cortas").await;
+        world.backend.wait_for_calls(2).await;
+        World::settle().await;
+        let (_, reply) = world.say("hola, ¿qué tal?").await;
+
+        assert_eq!(reply, "Sigue.");
+        assert_eq!(world.first_of_call(2).role, Role::User);
+    }
+
+    #[tokio::test]
+    async fn el_resumen_de_la_conversacion_se_pide_cada_seis_turnos_y_vuelve_en_la_siguiente() {
+        const SUMMARY: &str = r#"{"items":[],"summary":"Hablaron de plantas y de mate"}"#;
+        let world = World::new(["r", "r", "r", "r", "r", "r", SUMMARY, "Hola."]).await;
+        let id = world.service.open(OWNER).unwrap();
+        for n in 0..6 {
+            world
+                .service
+                .chat_as(OWNER, &id, &format!("pregunta {n} sobre el clima"))
+                .await
+                .unwrap();
+        }
+        world.backend.wait_for_calls(7).await;
+        world
+            .until_remembered("Hablaron de plantas y de mate")
+            .await;
+
+        world.say("hola").await;
+
+        let first = world.first_of_call(7);
+        assert_eq!(first.role, Role::System);
+        assert!(first
+            .content
+            .contains(r#"Conversación anterior: "Hablaron de plantas"#));
+    }
+
+    #[tokio::test]
+    async fn por_dbus_el_estado_de_la_memoria_cambia_al_encender_apagar_y_borrar() {
+        let world = World::off([], false);
+        let (server, client) =
+            crate::test_support::p2p_pair(|b| b.serve_at(SERVICE_PATH, world.service))
+                .await
+                .unwrap();
+        let proxy = AssistantProxy::builder(&client)
+            .path(SERVICE_PATH)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let off = proxy.memory_status().await.unwrap();
+        assert!(!off.enabled && !off.available);
+        assert_eq!(off.reason, REASON_OFF);
+        assert_eq!(off.bytes, 0);
+
+        proxy.set_memory_enabled(true).await.unwrap();
+        let on = proxy.memory_status().await.unwrap();
+        assert!(on.enabled && on.available && on.reason.is_empty() && on.bytes > 0);
+        let capabilities = proxy.capabilities().await.unwrap();
+        assert!(
+            capabilities
+                .iter()
+                .find(|c| c.domain == DOMAIN_MEMORY)
+                .unwrap()
+                .available
+        );
+
+        proxy.set_memory_enabled(false).await.unwrap();
+        let apagada = proxy.memory_status().await.unwrap();
+        assert!(!apagada.enabled);
+        assert!(apagada.bytes > 0, "apagar no borra");
+
+        proxy.clear_memory().await.unwrap();
+        assert_eq!(proxy.memory_status().await.unwrap().bytes, 0);
+        drop(server);
+    }
+}
+
+/// La puerta de AppArmor: la decisión pura y de punta a punta por el bus, con
+/// una etiqueta de mentira.
+#[cfg(test)]
+mod gate_tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::memory::learn::{Extraction, Item};
+    use crate::memory::schema::MemoryKind;
+    use crate::test_support::{p2p_pair, FixedKey, FixedLabel, ScriptedBackend, TempDir};
+    use vasak_assistant_protocol::{AssistantProxy, DOMAIN_MEMORY, SERVICE_PATH};
+
+    const CONFINED: &[u8] = b"vasak-appimage (enforce)\0";
+
+    #[test]
+    fn solo_una_etiqueta_que_existe_y_no_es_unconfined_confina() {
+        for (label, confined) in [
+            (None, false),
+            // Una etiqueta vacía falla cerrado.
+            (Some(&b""[..]), true),
+            (Some(&b"\0"[..]), true),
+            (Some(&b"   \0"[..]), true),
+            (Some(&b"unconfined"[..]), false),
+            (Some(&b"unconfined\0"[..]), false),
+            (Some(&b" unconfined \0"[..]), false),
+            (Some(CONFINED), true),
+            (Some(&b"vasak-appimage (enforce)"[..]), true),
+            (Some(&b"docker-default (enforce)\0"[..]), true),
+            (Some(&b"/usr/bin/firefox (complain)\0"[..]), true),
+            (Some(&b"unconfined (enforce)\0"[..]), true),
+            (Some(&b"Unconfined\0"[..]), true),
+            // No es UTF-8: no se adivina, se la trata como una etiqueta cualquiera.
+            (Some(&[0xff, 0xfe, 0x00][..]), true),
+        ] {
+            assert_eq!(is_confined(label), confined, "{label:?}");
+        }
+    }
+
+    #[test]
+    fn el_mensaje_de_acceso_denegado_es_un_access_denied_y_no_nombra_secretos() {
+        let Error::AccessDenied(text) = access_denied() else {
+            panic!("tenía que ser AccessDenied");
+        };
+        assert!(text.contains("confinada"));
+    }
+
+    struct Gate {
+        tmp: TempDir,
+        keys: Arc<FixedKey>,
+        backend: Arc<ScriptedBackend>,
+        label: Arc<FixedLabel>,
+        memory: Arc<Memory>,
+        proxy: AssistantProxy<'static>,
+        _server: zbus::Connection,
+    }
+
+    async fn gate(label: Arc<FixedLabel>, replies: impl IntoIterator<Item = &'static str>) -> Gate {
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        let backend = ScriptedBackend::new(replies);
+        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
+        let service = AssistantService {
+            backend: backend.clone(),
+            conversations: Arc::default(),
+            remote_allowed: false,
+            secrets: keys.clone(),
+            memory: memory.clone(),
+            labels: label.clone(),
+        };
+        let (server, client) = p2p_pair(|builder| builder.serve_at(SERVICE_PATH, service))
+            .await
+            .unwrap();
+        let proxy = AssistantProxy::builder(&client)
+            .path(SERVICE_PATH)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        Gate {
+            tmp,
+            keys,
+            backend,
+            label,
+            memory,
+            proxy,
+            _server: server,
+        }
+    }
+
+    fn denied<T: std::fmt::Debug>(result: Result<T, Error>) {
+        assert!(
+            matches!(result, Err(Error::AccessDenied(_))),
+            "se esperaba AccessDenied: {result:?}"
+        );
+    }
+
+    fn labels() -> Vec<(&'static str, Arc<FixedLabel>)> {
+        vec![
+            ("confinado", FixedLabel::of(CONFINED)),
+            ("el bus no contesta", FixedLabel::failing()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn un_llamador_confinado_no_enciende_la_memoria_y_no_se_crea_nada() {
+        for (name, label) in labels() {
+            let gate = gate(label, []).await;
+
+            denied(gate.proxy.set_memory_enabled(true).await);
+
+            assert!(!gate.tmp.memory_dir().exists(), "{name}");
+            assert!(gate.keys.memory_key.lock().is_none(), "{name}");
+            assert!(gate.keys.calls.lock().is_empty(), "{name}");
+            assert!(!gate.memory.status().await.enabled, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn un_llamador_confinado_no_apaga_ni_borra_una_memoria_encendida() {
+        for (name, label) in labels() {
+            let gate = gate(label, []).await;
+            gate.memory.set_enabled(true).await.unwrap();
+            let key = gate.keys.memory_key.lock().clone();
+            let calls = gate.keys.calls.lock().len();
+
+            denied(gate.proxy.set_memory_enabled(false).await);
+            denied(gate.proxy.clear_memory().await);
+
+            let status = gate.memory.status().await;
+            assert!(status.enabled && status.available, "{name}");
+            assert_eq!(*gate.keys.memory_key.lock(), key, "{name}");
+            assert!(
+                !gate.keys.calls.lock()[calls..]
+                    .iter()
+                    .any(|call| call.starts_with("delete_memory_key")),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn un_llamador_confinado_no_guarda_ni_consulta_claves_del_proveedor() {
+        for (name, label) in labels() {
+            let gate = gate(label, []).await;
+
+            denied(
+                gate.proxy
+                    .set_provider_key("https://api.openai.com/v1", "sk-del-confinado")
+                    .await,
+            );
+            denied(
+                gate.proxy
+                    .has_provider_key("https://api.openai.com/v1")
+                    .await,
+            );
+
+            assert!(gate.keys.stored.lock().is_empty(), "{name}");
+            assert!(gate.keys.asked.lock().is_empty(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sin_etiqueta_o_unconfined_los_cuatro_metodos_funcionan() {
+        for (name, label) in [
+            ("sin AppArmor", FixedLabel::none()),
+            ("unconfined", FixedLabel::of(b"unconfined\0")),
+        ] {
+            let gate = gate(label, []).await;
+
+            gate.proxy.set_memory_enabled(true).await.unwrap();
+            assert!(gate.memory.status().await.available, "{name}");
+            gate.proxy
+                .set_provider_key("https://api.openai.com/v1", "sk-propia")
+                .await
+                .unwrap();
+            assert!(gate
+                .proxy
+                .has_provider_key("https://api.openai.com/v1")
+                .await
+                .unwrap());
+            gate.proxy.clear_memory().await.unwrap();
+            gate.proxy.set_memory_enabled(false).await.unwrap();
+            assert!(!gate.memory.status().await.enabled, "{name}");
+            assert!(*gate.label.asked.lock() >= 5, "se pregunta en cada pedido");
+        }
+    }
+
+    #[tokio::test]
+    async fn el_estado_las_capacidades_y_las_conversaciones_siguen_abiertos_a_un_confinado() {
+        let gate = gate(FixedLabel::of(CONFINED), []).await;
+        gate.memory.set_enabled(true).await.unwrap();
+
+        let status = gate.proxy.memory_status().await.unwrap();
+        assert!(status.enabled && status.available);
+        let capabilities = gate.proxy.capabilities().await.unwrap();
+        assert!(
+            capabilities
+                .iter()
+                .find(|c| c.domain == DOMAIN_MEMORY)
+                .unwrap()
+                .available
+        );
+        let id = gate.proxy.new_conversation().await.unwrap();
+        gate.proxy.conversations().await.unwrap();
+        gate.proxy.status().await.unwrap();
+        gate.proxy.history(&id).await.unwrap();
+        gate.proxy.delete_conversation(&id).await.unwrap();
+    }
+
+    fn remembered() -> Extraction {
+        Extraction {
+            items: vec![Item {
+                kind: MemoryKind::Preference,
+                text: "Prefiere respuestas cortas".into(),
+                phrase: None,
+                topics: Vec::new(),
+            }],
+            summary: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn el_chat_de_un_confinado_funciona_pero_sin_notas_y_sin_aprender() {
+        for (name, label) in labels() {
+            let gate = gate(label, ["Hola.", "No debería pedirse"]).await;
+            gate.memory.set_enabled(true).await.unwrap();
+            gate.memory.store(remembered(), "c0").await.unwrap();
+            let id = gate.proxy.new_conversation().await.unwrap();
+
+            let reply = gate
+                .proxy
+                .chat(&id, "prefiero respuestas cortas, ¿qué tal?")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            assert_eq!(reply, "Hola.", "{name}");
+            let seen = gate.backend.seen.lock().clone();
+            assert_eq!(seen.len(), 1, "{name}: ni una extracción");
+            assert!(seen[0].iter().all(|m| m.role != Role::System), "{name}");
+            assert!(
+                seen[0]
+                    .iter()
+                    .all(|m| !m.content.contains("Prefiere respuestas cortas")),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn el_chat_de_un_llamador_sin_confinar_si_recibe_las_notas() {
+        for (name, label) in [
+            ("sin AppArmor", FixedLabel::none()),
+            ("unconfined", FixedLabel::of(b"unconfined\0")),
+        ] {
+            let gate = gate(label, ["Hola."]).await;
+            gate.memory.set_enabled(true).await.unwrap();
+            gate.memory.store(remembered(), "c0").await.unwrap();
+            let id = gate.proxy.new_conversation().await.unwrap();
+
+            gate.proxy.chat(&id, "hola, ¿qué tal?").await.unwrap();
+
+            let seen = gate.backend.seen.lock().clone();
+            assert_eq!(seen[0][0].role, Role::System, "{name}");
+            assert!(
+                seen[0][0].content.contains("Prefiere respuestas cortas"),
+                "{name}"
+            );
+        }
+    }
+}
+
+/// La etiqueta que da el bus de verdad, contra un `dbus-daemon` privado.
+#[cfg(test)]
+mod bus_label_tests {
+    use super::*;
+    use crate::test_support::PrivateBus;
+
+    #[tokio::test]
+    async fn sin_remitente_no_hay_etiqueta_y_con_un_nombre_invalido_el_bus_falla() {
+        let (_server, client) = crate::test_support::p2p_pair(Ok).await.unwrap();
+
+        assert_eq!(BusLabels.label(&client, None).await, Ok(None));
+        assert_eq!(
+            BusLabels.label(&client, Some("no es un nombre")).await,
+            Err(())
+        );
+    }
+
+    #[tokio::test]
+    async fn por_un_bus_real_se_pregunta_por_el_remitente_y_uno_inexistente_es_un_error() {
+        let Some(bus) = PrivateBus::start_or_skip() else {
+            return;
+        };
+        let (me, other) = (bus.connect().await, bus.connect().await);
+        let sender = other.unique_name().unwrap().to_string();
+
+        // Con o sin AppArmor en la máquina que corre la prueba, el bus contesta.
+        let label = BusLabels.label(&me, Some(&sender)).await;
+        assert!(label.is_ok(), "{label:?}");
+        assert_eq!(BusLabels.label(&me, Some(":1.99999")).await, Err(()));
+    }
+}
+
+/// La puerta del remoto se decide con el modelo efectivo de cada pedido.
+#[cfg(test)]
+mod effective_model_tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::memory::schema::MemoryKind;
+    use crate::memory::{learn::Extraction, learn::Item, REASON_REMOTE};
+    use crate::test_support::{FakeBackend, FixedKey, ScriptedBackend, TempDir};
+
+    const OWNER: &str = ":1.1";
+    const EXTRACTION: &str =
+        r#"{"items":[{"kind":"preference","text":"Prefiere el mate amargo"}],"summary":null}"#;
+
+    struct Rig {
+        _tmp: TempDir,
+        service: AssistantService,
+    }
+
+    /// Un servicio con la memoria encendida y con "Prefiere respuestas cortas"
+    /// ya guardado, sobre el backend dado.
+    async fn rig(backend: Arc<dyn ModelBackend>, share_with_remote: bool) -> Rig {
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        // Como en `main`: lo configurado es local, así que `remote_blocked` es falso;
+        // lo que decide es el modelo efectivo de cada pedido.
+        let memory = Arc::new(
+            Memory::new(Some(tmp.memory_dir()), keys.clone())
+                .with_remote_blocked(false)
+                .with_share_with_remote(share_with_remote),
+        );
+        memory.set_enabled(true).await.unwrap();
+        memory
+            .store(
+                Extraction {
+                    items: vec![Item {
+                        kind: MemoryKind::Preference,
+                        text: "Prefiere respuestas cortas".into(),
+                        phrase: None,
+                        topics: Vec::new(),
+                    }],
+                    summary: None,
+                },
+                "c0",
+            )
+            .await
+            .unwrap();
+        let service = AssistantService {
+            backend,
+            conversations: Arc::default(),
+            remote_allowed: true,
+            secrets: keys,
+            memory,
+            labels: Arc::new(BusLabels),
+        };
+        Rig { _tmp: tmp, service }
+    }
+
+    async fn chat(rig: &Rig, text: &str) {
+        let id = rig.service.open(OWNER).unwrap();
+        rig.service.chat_as(OWNER, &id, text).await.unwrap();
+        // Una extracción que no tendría que ocurrir tendría tiempo de ocurrir.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    async fn remembers(rig: &Rig, needle: &str) -> bool {
+        rig.service
+            .memory
+            .recall("zzz", true)
+            .await
+            .is_some_and(|notes| notes.contains(needle))
+    }
+
+    #[tokio::test]
+    async fn con_el_primer_modelo_instalado_en_la_nube_y_sin_permiso_la_memoria_no_entra_ni_se_aprende(
+    ) {
+        let backend = ScriptedBackend::cloud_by_default(["Hola.", EXTRACTION]);
+        let rig = rig(backend.clone(), false).await;
+
+        chat(&rig, "prefiero el mate amargo, ¿qué tal?").await;
+
+        let seen = backend.seen.lock().clone();
+        assert_eq!(seen.len(), 1, "ni una extracción");
+        assert!(seen[0].iter().all(|m| m.role != Role::System));
+        assert!(seen[0]
+            .iter()
+            .all(|m| !m.content.contains("Prefiere respuestas cortas")));
+        assert!(!remembers(&rig, "mate amargo").await, "nada se guardó");
+        // Lo que ya había sigue ahí, para quien sí puede verlo.
+        assert!(remembers(&rig, "Prefiere respuestas cortas").await);
+    }
+
+    #[tokio::test]
+    async fn el_estado_y_las_capacidades_dicen_que_la_memoria_no_se_comparte_con_ese_modelo() {
+        let rig = rig(ScriptedBackend::cloud_by_default([]), false).await;
+
+        let status = rig.service.memory_status_now().await;
+        assert!(status.enabled && !status.available);
+        assert_eq!(status.reason, REASON_REMOTE);
+        let all = capabilities(true, &status);
+        let memory = all
+            .iter()
+            .find(|c| c.domain == vasak_assistant_protocol::DOMAIN_MEMORY)
+            .unwrap();
+        assert!(!memory.available);
+        assert_eq!(memory.reason, REASON_REMOTE);
+    }
+
+    #[tokio::test]
+    async fn con_share_memory_with_remote_el_mismo_modelo_en_la_nube_si_ve_la_memoria() {
+        let backend = ScriptedBackend::cloud_by_default(["Hola.", EXTRACTION]);
+        let rig = rig(backend.clone(), true).await;
+
+        chat(&rig, "prefiero el mate amargo, ¿qué tal?").await;
+
+        let seen = backend.seen.lock().clone();
+        assert_eq!(seen.len(), 2, "el chat y la extracción");
+        assert_eq!(seen[0][0].role, Role::System);
+        assert!(seen[0][0].content.contains("Prefiere respuestas cortas"));
+        assert!(remembers(&rig, "mate amargo").await);
+        let status = rig.service.memory_status_now().await;
+        assert!(status.available, "{status:?}");
+    }
+
+    #[tokio::test]
+    async fn con_un_modelo_efectivo_local_la_memoria_entra_aunque_no_se_comparta() {
+        let backend = ScriptedBackend::new(["Hola.", EXTRACTION]);
+        let rig = rig(backend.clone(), false).await;
+
+        chat(&rig, "prefiero el mate amargo, ¿qué tal?").await;
+
+        let seen = backend.seen.lock().clone();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0][0].role, Role::System);
+        assert!(remembers(&rig, "mate amargo").await);
+        assert!(rig.service.memory_status_now().await.available);
+    }
+
+    #[tokio::test]
+    async fn si_el_backend_no_dice_que_modelo_usa_la_puerta_falla_cerrada() {
+        let mut fake = FakeBackend::replying("Hola.");
+        fake.active_result = Err(crate::backend::BackendError::Unavailable(
+            "sin modelo".into(),
+        ));
+        let backend = Arc::new(fake);
+        let rig = rig(backend.clone(), false).await;
+
+        chat(&rig, "prefiero el mate amargo, ¿qué tal?").await;
+
+        let seen = backend.seen.lock().clone();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].iter().all(|m| m.role != Role::System));
+        assert!(!remembers(&rig, "mate amargo").await);
+        // Con permiso para compartir no hace falta saber qué modelo es.
+        let allowed = Memory::new(None, FixedKey::new(None)).with_share_with_remote(true);
+        assert!(allowed.allowed_for(&*backend).await);
+    }
+
+    #[tokio::test]
+    async fn un_llamador_sin_confinar_y_un_modelo_en_la_nube_tampoco_se_salta_la_puerta() {
+        // La puerta del modelo vale para cualquier llamador, no sólo para los confinados.
+        let backend = ScriptedBackend::cloud_by_default(["Hola."]);
+        let rig = rig(backend.clone(), false).await;
+        let id = rig.service.open(OWNER).unwrap();
+
+        rig.service
+            .chat_with(OWNER, &id, "hola", true)
+            .await
+            .unwrap();
+
+        assert!(backend.seen.lock()[0]
+            .iter()
+            .all(|m| m.role != Role::System));
+    }
+
+    // ── La carrera entre la puerta y el envío ─────────────────────────────────
+
+    use crate::backend::Limited;
+    use crate::memory::REASON_MODEL_UNREACHABLE;
+    use crate::test_support::FlippingBackend;
+
+    /// El modelo se resuelve local en la puerta y `:cloud` al mandar el chat.
+    #[tokio::test]
+    async fn si_el_modelo_pasa_a_la_nube_entre_la_puerta_y_el_envio_el_chat_sale_sin_notas_y_no_se_aprende(
+    ) {
+        let backend = FlippingBackend::new(["Hola.", EXTRACTION]);
+        let rig = rig(backend.clone(), false).await;
+        let id = rig.service.open(OWNER).unwrap();
+
+        let reply = rig
+            .service
+            .chat_as(OWNER, &id, "prefiero el mate amargo, ¿qué tal?")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // La persona recibe su respuesta.
+        assert_eq!(reply, "Hola.");
+        // Un solo pedido salió al modelo, sin notas.
+        let seen = backend.inner.seen.lock().clone();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(seen[0].iter().all(|m| m.role != Role::System));
+        assert!(seen[0]
+            .iter()
+            .all(|m| !m.content.contains("Prefiere respuestas cortas")));
+        // El turno no se aprende: sin extracción y sin nada nuevo guardado.
+        assert!(!remembers(&rig, "mate amargo").await);
+        // La conversación quedó con el intercambio.
+        assert_eq!(rig.service.history_of(OWNER, &id).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn la_misma_carrera_por_un_backend_con_cache_tambien_se_frena() {
+        // `Limited` guarda el modelo activo 5 s: la puerta puede ver un local viejo.
+        let backend = FlippingBackend::new(["Hola.", EXTRACTION]);
+        let rig = rig(Arc::new(Limited::new(backend.clone())), false).await;
+
+        chat(&rig, "prefiero el mate amargo, ¿qué tal?").await;
+
+        let seen = backend.inner.seen.lock().clone();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].iter().all(|m| m.role != Role::System));
+        assert!(!remembers(&rig, "mate amargo").await);
+    }
+
+    #[tokio::test]
+    async fn si_el_modelo_pasa_a_la_nube_entre_la_puerta_y_la_extraccion_esta_no_sale() {
+        let backend = FlippingBackend::new([EXTRACTION]);
+        let rig = rig(backend.clone(), false).await;
+        let conversation = vec![
+            Message {
+                role: Role::User,
+                content: "prefiero el mate amargo".into(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: "Anotado.".into(),
+            },
+        ];
+
+        // La puerta (`allowed_for`, primera resolución) ve un modelo local y la
+        // extracción (`chat_local_only`, segunda) lo ve en la nube.
+        rig.service
+            .memory
+            .learn_after(backend.clone(), "c1", conversation);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(backend.inner.seen.lock().is_empty(), "nada salió a la nube");
+        assert_eq!(
+            backend
+                .resolutions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "la puerta y el envío"
+        );
+        assert!(!remembers(&rig, "mate amargo").await);
+    }
+
+    #[tokio::test]
+    async fn con_permiso_para_compartir_la_misma_carrera_no_frena_nada() {
+        let backend = FlippingBackend::new(["Hola.", EXTRACTION]);
+        let rig = rig(backend.clone(), true).await;
+
+        chat(&rig, "prefiero el mate amargo, ¿qué tal?").await;
+
+        let seen = backend.inner.seen.lock().clone();
+        assert_eq!(seen.len(), 2, "el chat con notas y la extracción");
+        assert_eq!(seen[0][0].role, Role::System);
+        assert!(remembers(&rig, "mate amargo").await);
+    }
+
+    #[tokio::test]
+    async fn un_modelo_local_estable_manda_las_notas_con_chat_local_only_y_se_aprende() {
+        let backend = ScriptedBackend::new(["Hola.", EXTRACTION]);
+        let rig = rig(backend.clone(), false).await;
+
+        chat(&rig, "prefiero el mate amargo, ¿qué tal?").await;
+
+        let seen = backend.seen.lock().clone();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0][0].role, Role::System);
+        assert!(remembers(&rig, "mate amargo").await);
+    }
+
+    #[tokio::test]
+    async fn el_estado_de_la_memoria_dice_por_que_no_esta_disponible_segun_el_modelo() {
+        // Local: disponible.
+        let local = rig(ScriptedBackend::new([]), false).await;
+        let status = local.service.memory_status_now().await;
+        assert!(status.available && status.reason.is_empty(), "{status:?}");
+
+        // En la nube: el motivo del remoto.
+        let cloud = rig(ScriptedBackend::cloud_by_default([]), false).await;
+        let status = cloud.service.memory_status_now().await;
+        assert!(!status.available && status.enabled);
+        assert_eq!(status.reason, REASON_REMOTE);
+
+        // Que el modelo no conteste es otro motivo, no el del remoto.
+        let mut fake = FakeBackend::replying("");
+        fake.active_result = Err(crate::backend::BackendError::Unavailable("apagado".into()));
+        let silent = rig(Arc::new(fake), false).await;
+        let status = silent.service.memory_status_now().await;
+        assert!(!status.available && status.enabled);
+        assert_eq!(status.reason, REASON_MODEL_UNREACHABLE);
+        assert_ne!(REASON_MODEL_UNREACHABLE, REASON_REMOTE);
+
+        // Con permiso para compartir, ni la nube ni el silencio la apagan.
+        let mut fake = FakeBackend::replying("");
+        fake.active_result = Err(crate::backend::BackendError::Unavailable("apagado".into()));
+        for backend in [
+            Arc::new(fake) as Arc<dyn ModelBackend>,
+            ScriptedBackend::cloud_by_default([]),
+        ] {
+            let shared = rig(backend, true).await;
+            assert!(shared.service.memory_status_now().await.available);
+        }
+
+        // Apagada, el motivo sigue siendo el de apagada.
+        let off = rig(ScriptedBackend::cloud_by_default([]), false).await;
+        off.service.memory.set_enabled(false).await.unwrap();
+        let status = off.service.memory_status_now().await;
+        assert_eq!(status.reason, crate::memory::REASON_OFF);
+    }
+
+    /// Un modelo que está en la nube sólo en la segunda resolución (la del
+    /// envío del chat) y local antes y después: si el turno se aprendiera
+    /// igual, la extracción saldría bien y se guardaría.
+    struct Blink {
+        inner: Arc<ScriptedBackend>,
+        resolutions: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Blink {
+        fn local_now(&self) -> bool {
+            self.resolutions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                != 1
+        }
+    }
+
+    impl ModelBackend for Blink {
+        fn info(&self) -> vasak_assistant_protocol::ModelInfo {
+            self.inner.info()
+        }
+
+        fn models(&self) -> BoxFuture<'_, Result<Vec<String>, BackendError>> {
+            self.inner.models()
+        }
+
+        fn active_model(
+            &self,
+        ) -> BoxFuture<'_, Result<vasak_assistant_protocol::ModelInfo, BackendError>> {
+            let mut info = self.inner.info();
+            info.local = self.local_now();
+            Box::pin(async move { Ok(info) })
+        }
+
+        fn chat<'a>(
+            &'a self,
+            messages: &'a [Message],
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            self.inner.chat(messages)
+        }
+
+        fn chat_local_only<'a>(
+            &'a self,
+            messages: &'a [Message],
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            if !self.local_now() {
+                return Box::pin(async { Err(crate::backend::not_local()) });
+            }
+            self.inner.chat(messages)
+        }
+    }
+
+    #[tokio::test]
+    async fn el_turno_que_tuvo_que_reintentarse_sin_notas_no_se_aprende_aunque_el_modelo_vuelva_a_ser_local(
+    ) {
+        let inner = ScriptedBackend::new(["Hola.", EXTRACTION]);
+        let backend = Arc::new(Blink {
+            inner: inner.clone(),
+            resolutions: Default::default(),
+        });
+        let rig = rig(backend, false).await;
+
+        chat(&rig, "prefiero el mate amargo, ¿qué tal?").await;
+
+        assert_eq!(inner.seen.lock().len(), 1, "sólo el chat, sin extracción");
+        assert!(!remembers(&rig, "mate amargo").await);
     }
 }

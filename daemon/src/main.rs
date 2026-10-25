@@ -3,8 +3,11 @@
 //! Fase 1: el servicio y el contrato. Expone D-Bus en el bus de sesión y
 //! conversa con un modelo —local por omisión (Ollama), o un proveedor
 //! compatible con OpenAI si la configuración lo elige— sin ninguna capacidad
-//! sobre los datos del usuario. Las conversaciones viven en memoria; nada se
-//! guarda.
+//! sobre los datos del usuario. Las conversaciones viven en memoria.
+//!
+//! Fase 4: la memoria de Lince (`memory`), una base de grafos cifrada en la
+//! carpeta de estado del servicio. Viene apagada; encendida, en esta fase
+//! queda lista y vacía.
 //!
 //! No dibuja nada: el chat y el panel de Configuración son otras superficies
 //! que le hablan por D-Bus. Por eso es un demonio de Rust y no una aplicación
@@ -15,6 +18,7 @@ mod config;
 mod conversations;
 mod http;
 mod keyring;
+mod memory;
 mod ollama;
 mod openai;
 mod service;
@@ -39,6 +43,7 @@ use backend::{Limited, ModelBackend, RejectedBackend};
 use config::BackendKind;
 use conversations::Conversations;
 use keyring::SecretService;
+use memory::Memory;
 use ollama::OllamaBackend;
 use openai::OpenAiBackend;
 use service::AssistantService;
@@ -112,11 +117,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let conversations = Arc::new(Mutex::new(Conversations::default()));
+    // Con un backend remoto, la memoria no se lee ni se escribe salvo que la
+    // persona lo haya permitido.
+    let remote_blocked = !backend.info().local && !settings.share_memory_with_remote;
+    // `remote_blocked` mira lo configurado; la puerta de cada pedido mira el
+    // modelo efectivo (`Memory::allowed_for`).
+    let memory = Arc::new(
+        Memory::from_env(secrets.clone())
+            .with_remote_blocked(remote_blocked)
+            .with_share_with_remote(settings.share_memory_with_remote),
+    );
     let service = AssistantService {
         backend,
         conversations: conversations.clone(),
         remote_allowed: settings.allow_remote,
         secrets,
+        memory,
+        labels: Arc::new(service::BusLabels),
     };
 
     let connection = connection::Builder::session()?

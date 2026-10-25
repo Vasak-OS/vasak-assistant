@@ -12,7 +12,8 @@
 //!     "backend": "openai",
 //!     "url": "https://api.openai.com/v1",
 //!     "model": "gpt-4o-mini",
-//!     "allow_remote": true
+//!     "allow_remote": true,
+//!     "share_memory_with_remote": false
 //!   }
 //! }
 //! ```
@@ -49,6 +50,10 @@ pub struct Settings {
     /// omisión no: la conversación no sale de la máquina sin que la persona lo
     /// haya elegido.
     pub allow_remote: bool,
+    /// Si la memoria del asistente se usa también con un backend remoto (se
+    /// manda en el contexto y se aprende de esas conversaciones). Por omisión
+    /// no: con un remoto, la memoria no se lee ni se escribe.
+    pub share_memory_with_remote: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,6 +307,7 @@ mod tests {
             url: some(url),
             model: some(model),
             allow_remote,
+            share_memory_with_remote: false,
         }
     }
 
