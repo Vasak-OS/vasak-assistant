@@ -714,15 +714,7 @@ impl ModelBackend for FlippingBackend {
 pub async fn p2p_pair(
     serve: impl FnOnce(connection::Builder<'static>) -> zbus::Result<connection::Builder<'static>>,
 ) -> zbus::Result<(Connection, Connection)> {
-    let (server_end, client_end) = tokio::net::UnixStream::pair().expect("par de sockets");
-    let server = serve(
-        connection::Builder::unix_stream(server_end)
-            .server(zbus::Guid::generate())?
-            .p2p(),
-    )?
-    .build();
-    let client = connection::Builder::unix_stream(client_end).p2p().build();
-    tokio::try_join!(server, client)
+    p2p(None, serve).await
 }
 
 /// Como [`p2p_pair`], pero el cliente lleva el nombre único `sender` y cada
@@ -731,6 +723,13 @@ pub async fn p2p_pair(
 /// (`:1.1`).
 pub async fn p2p_pair_as(
     sender: &str,
+    serve: impl FnOnce(connection::Builder<'static>) -> zbus::Result<connection::Builder<'static>>,
+) -> zbus::Result<(Connection, Connection)> {
+    p2p(Some(sender), serve).await
+}
+
+async fn p2p(
+    sender: Option<&str>,
     serve: impl FnOnce(connection::Builder<'static>) -> zbus::Result<connection::Builder<'static>>,
 ) -> zbus::Result<(Connection, Connection)> {
     let (server_end, client_end) = tokio::net::UnixStream::pair().expect("par de sockets");
@@ -742,9 +741,11 @@ pub async fn p2p_pair_as(
     .build();
     let client = connection::Builder::unix_stream(client_end).p2p().build();
     let (server, client) = tokio::try_join!(server, client)?;
-    // El constructor sólo pone el nombre único del lado servidor: el cliente
-    // lo recibe después.
-    client.set_unique_name(sender.to_owned())?;
+    if let Some(sender) = sender {
+        // El constructor sólo pone el nombre único del lado servidor: el
+        // cliente lo recibe después.
+        client.set_unique_name(sender.to_owned())?;
+    }
     Ok((server, client))
 }
 
