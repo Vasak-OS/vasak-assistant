@@ -2,6 +2,11 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-assistant 0.3.2
+
+- **`daemon`** — tokio 1.54.1, que corrige una carrera en `tokio::time::Interval`
+  (alerta de Dependabot).
+
 ## vasak-assistant 0.3.1
 
 - **`daemon`** — una llamada sin remitente se rechaza con `AccessDenied` en vez
