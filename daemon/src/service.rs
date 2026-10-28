@@ -2780,7 +2780,10 @@ mod delete_conversation_tests {
         proxy.delete_conversation(&a).await.unwrap();
 
         assert_eq!(summaries(&memory).await, ["Resumen de B"]);
-        assert_eq!(proxy.conversations().await.unwrap(), [b.clone()]);
+        assert_eq!(
+            proxy.conversations().await.unwrap(),
+            std::slice::from_ref(&b)
+        );
         // Borrar la otra deja la memoria sin resúmenes.
         proxy.delete_conversation(&b).await.unwrap();
         assert!(summaries(&memory).await.is_empty());
