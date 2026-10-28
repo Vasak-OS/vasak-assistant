@@ -2016,3 +2016,206 @@ mod review_tests {
         assert_eq!(preferences(&memory).await, 9);
     }
 }
+
+/// Olvidar una conversación borrada.
+#[cfg(test)]
+mod forget_tests {
+    use super::learn::Item;
+    use super::*;
+    use crate::test_support::{FakeBackend, FixedKey, ScriptedBackend, TempDir};
+
+    async fn enabled() -> (TempDir, Arc<Memory>) {
+        let tmp = TempDir::new();
+        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), FixedKey::new(None)));
+        memory.set_enabled(true).await.unwrap();
+        (tmp, memory)
+    }
+
+    fn summary(text: &str) -> Extraction {
+        Extraction {
+            items: Vec::new(),
+            summary: Some(text.into()),
+        }
+    }
+
+    fn preference(text: &str) -> Extraction {
+        Extraction {
+            items: vec![Item {
+                kind: MemoryKind::Preference,
+                text: text.into(),
+                phrase: None,
+                topics: Vec::new(),
+            }],
+            summary: None,
+        }
+    }
+
+    async fn summaries(memory: &Memory) -> Vec<String> {
+        let db = memory.database().await.unwrap();
+        let mut all = blocking(move || {
+            Ok(schema::entries(&db, MemoryKind::ConversationSummary)
+                .into_iter()
+                .map(|e| e.text)
+                .collect::<Vec<_>>())
+        })
+        .await
+        .unwrap();
+        all.sort();
+        all
+    }
+
+    fn turn() -> Vec<Message> {
+        vec![
+            Message {
+                role: Role::User,
+                content: "prefiero el mate amargo".into(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: "Anotado.".into(),
+            },
+        ]
+    }
+
+    const EXTRACTION: &str =
+        r#"{"items":[{"kind":"preference","text":"Prefiere el mate amargo"}],"summary":null}"#;
+
+    #[tokio::test]
+    async fn olvidar_una_conversacion_borra_su_resumen_y_deja_el_de_las_otras() {
+        let (_tmp, memory) = enabled().await;
+        memory.store(summary("Resumen de A"), "a").await.unwrap();
+        memory.store(summary("Resumen de B"), "b").await.unwrap();
+
+        memory.forget_conversation("a").await;
+
+        assert_eq!(summaries(&memory).await, ["Resumen de B"]);
+        let block = memory.recall("hola", true).await.unwrap();
+        assert!(block.contains("Resumen de B") && !block.contains("Resumen de A"));
+    }
+
+    #[tokio::test]
+    async fn lo_que_llega_de_una_extraccion_de_una_conversacion_borrada_se_descarta() {
+        let (_tmp, memory) = enabled().await;
+        let epoch = memory.epoch();
+        memory.forget_conversation("a").await;
+
+        let late = memory.store_at(summary("Resumen tardío"), "a", epoch).await;
+
+        assert!(late.is_err());
+        assert!(summaries(&memory).await.is_empty());
+        // Las demás conversaciones siguen guardando.
+        memory
+            .store_at(summary("Resumen de B"), "b", epoch)
+            .await
+            .unwrap();
+        assert_eq!(summaries(&memory).await, ["Resumen de B"]);
+    }
+
+    #[tokio::test]
+    async fn borrar_la_conversacion_en_medio_de_una_extraccion_no_guarda_nada() {
+        let (_tmp, memory) = enabled().await;
+        let (backend, gate) = FakeBackend::gated(EXTRACTION);
+        let backend = Arc::new(backend);
+
+        memory.learn_after(backend.clone(), "a", turn());
+        backend.entered.notified().await;
+        memory.forget_conversation("a").await;
+        gate.notify_one();
+        // Espera a que la extracción termine (suelta el permiso).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while memory.learning.available_permits() != 1 {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(memory.recall("mate", true).await, None);
+    }
+
+    #[tokio::test]
+    async fn si_la_conversacion_ya_se_borro_la_extraccion_no_llama_al_modelo() {
+        let (_tmp, memory) = enabled().await;
+        let backend = ScriptedBackend::new([EXTRACTION]);
+        memory.forget_conversation("a").await;
+
+        memory.learn_after(backend.clone(), "a", turn());
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert!(backend.seen.lock().is_empty());
+        assert_eq!(memory.recall("mate", true).await, None);
+        // Otra conversación sí aprende.
+        memory.learn_after(backend.clone(), "b", turn());
+        backend.wait_for_calls(1).await;
+    }
+
+    #[tokio::test]
+    async fn con_la_memoria_apagada_no_se_toca_la_base_y_el_resumen_queda() {
+        let (tmp, memory) = enabled().await;
+        memory.store(summary("Resumen de A"), "a").await.unwrap();
+        memory.set_enabled(false).await.unwrap();
+        let files = |dir: &Path| -> Vec<(PathBuf, Vec<u8>)> {
+            fn walk(path: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+                for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        walk(&p, out);
+                    } else {
+                        out.push((p.clone(), std::fs::read(&p).unwrap()));
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            walk(dir, &mut out);
+            out.sort();
+            out
+        };
+        let before = files(&tmp.memory_dir());
+
+        memory.forget_conversation("a").await;
+
+        assert_eq!(files(&tmp.memory_dir()), before);
+        memory.set_enabled(true).await.unwrap();
+        assert_eq!(summaries(&memory).await, ["Resumen de A"]);
+    }
+
+    #[tokio::test]
+    async fn sin_carpeta_de_estado_olvidar_solo_cancela_y_no_falla() {
+        let memory = Memory::new(None, FixedKey::new(None));
+        memory.forget_conversation("a").await;
+        assert!(memory
+            .store_at(preference("x"), "a", memory.epoch())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn con_la_llave_ausente_olvidar_no_falla_ni_borra_nada() {
+        let (tmp, memory) = enabled().await;
+        memory.store(summary("Resumen de A"), "a").await.unwrap();
+        memory.close().await;
+        let keys = FixedKey::new(None);
+        let broken = Memory::new(Some(tmp.memory_dir()), keys);
+
+        broken.forget_conversation("a").await;
+
+        assert!(!broken.status().await.available);
+        assert!(tmp.memory_dir().join(DB_FILE).is_file());
+    }
+
+    #[tokio::test]
+    async fn solo_se_recuerdan_las_ultimas_conversaciones_borradas_y_olvidar_libera_su_ventana() {
+        let (_tmp, memory) = enabled().await;
+        memory.window_start("primera", memory.epoch(), 4);
+
+        for n in 0..(MAX_FORGOTTEN_CONVERSATIONS + 10) {
+            memory.forget_conversation(&format!("c{n}")).await;
+        }
+
+        assert!(memory.forgotten.lock().len() <= MAX_FORGOTTEN_CONVERSATIONS);
+        // La más vieja ya se olvidó del todo; la última sigue anotada.
+        let last = format!("c{}", MAX_FORGOTTEN_CONVERSATIONS + 9);
+        assert!(memory.forgotten.lock().iter().any(|id| *id == last));
+        assert!(!memory.forgotten.lock().iter().any(|id| id == "c0"));
+        memory.forget_conversation("primera").await;
+        assert!(!memory.windows.lock().contains_key("primera"));
+    }
+}

@@ -889,3 +889,97 @@ mod alias_tests {
         assert_eq!(entries(&db, MemoryKind::Alias).len(), 2);
     }
 }
+
+/// Borrar los resúmenes de una conversación.
+#[cfg(test)]
+mod delete_summaries_tests {
+    use super::*;
+
+    fn db() -> GrafeoDB {
+        let db = GrafeoDB::new_in_memory();
+        ensure_indexes(&db).unwrap();
+        db
+    }
+
+    fn add(db: &GrafeoDB, kind: MemoryKind, text: &str, conversation: &str) {
+        upsert(
+            db,
+            &NewMemory {
+                kind,
+                text,
+                phrase: None,
+                conversation: Some(conversation),
+            },
+            1_800_000_000,
+        )
+        .unwrap();
+    }
+
+    fn texts(db: &GrafeoDB, kind: MemoryKind) -> Vec<String> {
+        let mut all: Vec<String> = entries(db, kind).into_iter().map(|e| e.text).collect();
+        all.sort();
+        all
+    }
+
+    #[test]
+    fn borra_solo_los_resumenes_de_esa_conversacion_y_dice_cuantos() {
+        let db = db();
+        add(&db, MemoryKind::ConversationSummary, "Resumen de A", "a");
+        add(
+            &db,
+            MemoryKind::ConversationSummary,
+            "Otro resumen de A",
+            "a",
+        );
+        add(&db, MemoryKind::ConversationSummary, "Resumen de B", "b");
+        // Un recuerdo que de algún modo lleve la misma propiedad no es un resumen.
+        add(&db, MemoryKind::Habit, "Madruga", "a");
+
+        assert_eq!(delete_summaries(&db, "a").unwrap(), 2);
+
+        assert_eq!(
+            texts(&db, MemoryKind::ConversationSummary),
+            ["Resumen de B"]
+        );
+        assert_eq!(texts(&db, MemoryKind::Habit), ["Madruga"]);
+    }
+
+    #[test]
+    fn una_conversacion_sin_resumenes_o_inexistente_no_borra_nada() {
+        let db = db();
+        add(&db, MemoryKind::ConversationSummary, "Resumen de B", "b");
+
+        assert_eq!(delete_summaries(&db, "a").unwrap(), 0);
+        assert_eq!(delete_summaries(&db, "").unwrap(), 0);
+
+        assert_eq!(
+            texts(&db, MemoryKind::ConversationSummary),
+            ["Resumen de B"]
+        );
+    }
+
+    #[test]
+    fn el_resumen_borrado_ya_no_se_busca_y_se_puede_volver_a_escribir() {
+        let db = db();
+        add(
+            &db,
+            MemoryKind::ConversationSummary,
+            "Hablaron de gatos",
+            "a",
+        );
+        delete_summaries(&db, "a").unwrap();
+        assert!(db
+            .text_search(LABEL, "terms", "gatos", 5, None)
+            .unwrap()
+            .is_empty());
+
+        add(
+            &db,
+            MemoryKind::ConversationSummary,
+            "Hablaron de gatos",
+            "c",
+        );
+
+        assert_eq!(entries(&db, MemoryKind::ConversationSummary).len(), 1);
+    }
+}

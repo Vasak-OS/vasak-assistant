@@ -2672,3 +2672,198 @@ mod no_sender_tests {
         assert_eq!(quickly(proxy.conversations()).await.unwrap(), [id]);
     }
 }
+
+/// `DeleteConversation` también borra el resumen de la conversación (#12).
+#[cfg(test)]
+mod delete_conversation_tests {
+    use super::*;
+    use crate::memory::learn::{Extraction, Item};
+    use crate::memory::schema::{entries, MemoryKind};
+    use crate::test_support::{p2p_pair_as, FakeBackend, FixedKey, FixedLabel, TempDir};
+    use vasak_assistant_protocol::{AssistantProxy, SERVICE_PATH};
+
+    const OWNER: &str = ":1.1";
+    const OTHER: &str = ":1.2";
+
+    struct Rig {
+        tmp: TempDir,
+        service: AssistantService,
+    }
+
+    async fn rig() -> Rig {
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
+        memory.set_enabled(true).await.unwrap();
+        let service = AssistantService {
+            backend: Arc::new(FakeBackend::replying("hola")),
+            conversations: Arc::default(),
+            remote_allowed: false,
+            secrets: keys,
+            memory,
+            labels: FixedLabel::none(),
+        };
+        Rig { tmp, service }
+    }
+
+    fn summary(text: &str) -> Extraction {
+        Extraction {
+            items: Vec::<Item>::new(),
+            summary: Some(text.into()),
+        }
+    }
+
+    /// Los textos de los resúmenes guardados, en orden.
+    async fn summaries(memory: &Memory) -> Vec<String> {
+        let db = memory.database().await.unwrap();
+        let mut all: Vec<String> = tokio::task::spawn_blocking(move || {
+            entries(&db, MemoryKind::ConversationSummary)
+                .into_iter()
+                .map(|e| e.text)
+                .collect()
+        })
+        .await
+        .unwrap();
+        all.sort();
+        all
+    }
+
+    /// Dos conversaciones del mismo dueño, cada una con su resumen.
+    async fn two_with_summaries(rig: &Rig) -> (String, String) {
+        let (a, b) = (
+            rig.service.open(OWNER).unwrap(),
+            rig.service.open(OWNER).unwrap(),
+        );
+        rig.service
+            .memory
+            .store(summary("Resumen de A"), &a)
+            .await
+            .unwrap();
+        rig.service
+            .memory
+            .store(summary("Resumen de B"), &b)
+            .await
+            .unwrap();
+        (a, b)
+    }
+
+    #[tokio::test]
+    async fn borrar_una_conversacion_borra_su_resumen_y_queda_solo_el_de_la_otra() {
+        let rig = rig().await;
+        let (a, b) = two_with_summaries(&rig).await;
+
+        rig.service.delete_conversation_as(OWNER, &a).await.unwrap();
+
+        assert_eq!(summaries(&rig.service.memory).await, ["Resumen de B"]);
+        assert_eq!(rig.service.list(OWNER), [b]);
+        // En la próxima conversación, la memoria ya no menciona la borrada.
+        let block = rig.service.memory.recall("hola", true).await.unwrap();
+        assert!(block.contains("Resumen de B") && !block.contains("Resumen de A"));
+    }
+
+    #[tokio::test]
+    async fn por_dbus_delete_conversation_borra_el_resumen_de_esa_conversacion() {
+        let rig = rig().await;
+        let (a, b) = two_with_summaries(&rig).await;
+        let memory = rig.service.memory.clone();
+        let (_server, client) =
+            p2p_pair_as(OWNER, |builder| builder.serve_at(SERVICE_PATH, rig.service))
+                .await
+                .unwrap();
+        let proxy = AssistantProxy::builder(&client)
+            .path(SERVICE_PATH)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        proxy.delete_conversation(&a).await.unwrap();
+
+        assert_eq!(summaries(&memory).await, ["Resumen de B"]);
+        assert_eq!(proxy.conversations().await.unwrap(), [b.clone()]);
+        // Borrar la otra deja la memoria sin resúmenes.
+        proxy.delete_conversation(&b).await.unwrap();
+        assert!(summaries(&memory).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn con_la_memoria_apagada_borrar_la_conversacion_no_toca_la_base_y_el_resumen_queda() {
+        let rig = rig().await;
+        let (a, _b) = two_with_summaries(&rig).await;
+        rig.service.memory.set_enabled(false).await.unwrap();
+
+        rig.service.delete_conversation_as(OWNER, &a).await.unwrap();
+
+        // La conversación se cerró; la memoria apagada no se leyó ni se escribió.
+        assert!(rig.service.history_of(OWNER, &a).is_err());
+        rig.service.memory.set_enabled(true).await.unwrap();
+        assert_eq!(
+            summaries(&rig.service.memory).await,
+            ["Resumen de A", "Resumen de B"]
+        );
+        assert!(rig.tmp.memory_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn si_la_conexion_del_duenio_se_cierra_los_resumenes_quedan() {
+        let rig = rig().await;
+        let (_a, _b) = two_with_summaries(&rig).await;
+
+        let released = rig.service.conversations.lock().release_owner(OWNER);
+
+        assert_eq!(released, 2);
+        assert!(rig.service.list(OWNER).is_empty());
+        assert_eq!(
+            summaries(&rig.service.memory).await,
+            ["Resumen de A", "Resumen de B"]
+        );
+    }
+
+    #[tokio::test]
+    async fn borrar_una_que_no_existe_o_de_otro_duenio_no_borra_resumenes_ajenos() {
+        let rig = rig().await;
+        let (a, _b) = two_with_summaries(&rig).await;
+        let unknown = "00000000-0000-4000-8000-000000000000";
+        // Un resumen de una conversación que nadie tiene abierta.
+        rig.service
+            .memory
+            .store(summary("Resumen de una vieja"), unknown)
+            .await
+            .unwrap();
+
+        // Inexistente.
+        assert!(matches!(
+            rig.service.delete_conversation_as(OWNER, unknown).await,
+            Err(Error::NotFound(_))
+        ));
+        // De otro dueño: el mismo NotFound, y la conversación sigue abierta.
+        assert!(matches!(
+            rig.service.delete_conversation_as(OTHER, &a).await,
+            Err(Error::NotFound(_))
+        ));
+
+        assert_eq!(
+            summaries(&rig.service.memory).await,
+            ["Resumen de A", "Resumen de B", "Resumen de una vieja"]
+        );
+        assert_eq!(rig.service.list(OWNER).len(), 2);
+        // Y la extracción de esa conversación sigue pudiendo guardar: no se anotó como borrada.
+        rig.service
+            .memory
+            .store(summary("Otro de A"), &a)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn borrar_dos_veces_la_misma_da_not_found_la_segunda_y_no_rompe_nada() {
+        let rig = rig().await;
+        let (a, _b) = two_with_summaries(&rig).await;
+
+        rig.service.delete_conversation_as(OWNER, &a).await.unwrap();
+        let second = rig.service.delete_conversation_as(OWNER, &a).await;
+
+        assert!(matches!(second, Err(Error::NotFound(_))));
+        assert_eq!(summaries(&rig.service.memory).await, ["Resumen de B"]);
+    }
+}
