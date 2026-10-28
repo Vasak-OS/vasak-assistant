@@ -155,6 +155,11 @@ impl Conversations {
         }
     }
 
+    /// Si `owner` tiene abierta la conversación `id`.
+    pub fn contains(&self, owner: &str, id: &str) -> bool {
+        self.get(owner, id).is_ok()
+    }
+
     fn get(&self, owner: &str, id: &str) -> Result<&Conversation, Error> {
         validate_id(id)?;
         self.open

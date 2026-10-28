@@ -294,10 +294,17 @@ pub struct NewMemory<'a> {
 /// Crea un recuerdo, o refuerza el que tenga la misma clave. Antes de crear,
 /// poda la clase para que quepa.
 pub fn upsert(db: &GrafeoDB, new: &NewMemory<'_>, now: i64) -> grafeo::Result<NodeId> {
-    let key = match (new.kind, new.phrase) {
+    let key = match (new.kind, new.phrase, new.conversation) {
         // Dos alias con el mismo texto y distinta frase son dos recuerdos. El
         // NUL separa sin ambigüedad: `clean` no deja caracteres de control.
-        (MemoryKind::Alias, Some(phrase)) => key_for(new.kind, &format!("{phrase}\0{}", new.text)),
+        (MemoryKind::Alias, Some(phrase), _) => {
+            key_for(new.kind, &format!("{phrase}\0{}", new.text))
+        }
+        // Lo mismo con un resumen y su conversación: dos conversaciones con un
+        // resumen igual son dos nodos, y borrar una no toca el de la otra.
+        (MemoryKind::ConversationSummary, _, Some(conversation)) => {
+            key_for(new.kind, &format!("{conversation}\0{}", new.text))
+        }
         _ => key_for(new.kind, new.text),
     };
     if let Some(node) = find_by_key(db, &key) {

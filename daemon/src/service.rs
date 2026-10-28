@@ -415,8 +415,14 @@ impl AssistantService {
             content: reply.clone(),
         });
         if use_memory {
-            self.memory
-                .learn_after(self.backend.clone(), conversation_id, context);
+            // Con el candado de las conversaciones: o el aprendizaje queda
+            // anotado en vuelo antes de que un borrado lo busque, o la
+            // conversación ya se borró y no se aprende.
+            let conversations = self.conversations.lock();
+            if conversations.contains(owner, conversation_id) {
+                self.memory
+                    .learn_after(self.backend.clone(), conversation_id, context);
+            }
         }
         Ok(reply)
     }

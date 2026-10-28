@@ -131,7 +131,12 @@ pub struct Memory {
     share_with_remote: bool,
     /// Una sola extracción a la vez, con `try_acquire`: si hay una en curso,
     /// el turno no se aprende. Propio, aparte de los permisos del chat.
-    learning: Semaphore,
+    learning: Arc<Semaphore>,
+    /// La extracción en vuelo (hay una sola a la vez, por `learning`): de qué
+    /// conversación es y su marca de cancelada. `forget_conversation` la marca
+    /// si el id coincide, y `store_at` la mira bajo el candado. No tiene tope
+    /// que se pueda vaciar borrando otras conversaciones.
+    in_flight: parking_lot::Mutex<Option<(String, Arc<AtomicBool>)>>,
     /// La época: sube con cada `set_enabled` y cada `clear`, bajo el candado.
     /// Una extracción lanzada en una época no se guarda en otra.
     epoch: AtomicU64,
@@ -148,11 +153,31 @@ pub struct Memory {
     forgotten: parking_lot::Mutex<std::collections::VecDeque<String>>,
 }
 
-/// Cuántas conversaciones borradas se recuerdan en `forgotten`.
-// shortcut: una extracción tarda segundos y hay una sola a la vez, así que
-// alcanza con las últimas 256; si alguna vez pudiera durar tanto como 256
-// borrados, pasar a una época por conversación persistida junto a `windows`.
+/// Cuántas conversaciones borradas se recuerdan en `forgotten`. Vaciarlo no
+/// deja pasar nada: la extracción en vuelo se cancela por `in_flight`, y el
+/// servicio no lanza aprendizajes de una conversación que ya no existe
+/// (`chat_with` lo mira con el candado de las conversaciones). `forgotten`
+/// queda para quien llame a `learn_after` o `store_at` directamente.
 const MAX_FORGOTTEN_CONVERSATIONS: usize = 256;
+
+/// Al terminar la tarea de extracción, de cualquier forma, saca la marca de en
+/// vuelo si sigue siendo la suya.
+struct InFlight<'a> {
+    memory: &'a Memory,
+    cancelled: &'a Arc<AtomicBool>,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        let mut in_flight = self.memory.in_flight.lock();
+        if in_flight
+            .as_ref()
+            .is_some_and(|(_, cancelled)| Arc::ptr_eq(cancelled, self.cancelled))
+        {
+            *in_flight = None;
+        }
+    }
+}
 
 /// Cuántas conversaciones se recuerdan en `windows` antes de olvidar las de
 /// épocas viejas (y, si no alcanza, todas: olvidar sólo achica la ventana).
@@ -166,7 +191,8 @@ impl Memory {
             db: Mutex::new(None),
             remote_blocked: false,
             share_with_remote: false,
-            learning: Semaphore::new(1),
+            learning: Arc::new(Semaphore::new(1)),
+            in_flight: parking_lot::Mutex::default(),
             epoch: AtomicU64::new(0),
             windows: parking_lot::Mutex::default(),
             pruned_over_limit: Arc::default(),
@@ -309,11 +335,20 @@ impl Memory {
         let Some((conversation, gate)) = learn::extraction_window(&conversation, gate) else {
             return;
         };
+        // El permiso y la marca de en vuelo se toman acá, antes de lanzar la
+        // tarea: un borrado que llegue después de esta llamada ya la encuentra.
+        let Ok(permit) = self.learning.clone().try_acquire_owned() else {
+            return;
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        *self.in_flight.lock() = Some((conversation_id.to_owned(), cancelled.clone()));
         let memory = self.clone();
         let conversation_id = conversation_id.to_owned();
         tokio::spawn(async move {
-            let Ok(_permit) = memory.learning.try_acquire() else {
-                return;
+            let _permit = permit;
+            let _in_flight = InFlight {
+                memory: &memory,
+                cancelled: &cancelled,
             };
             // Antes de mandarle nada al modelo: que la memoria se pueda usar
             // y que el modelo que va a extraer pueda verla.
@@ -377,7 +412,11 @@ impl Memory {
         if self.epoch.load(Ordering::SeqCst) != epoch {
             return Err("la memoria cambió mientras se extraían los recuerdos".into());
         }
-        if self.forgotten.lock().iter().any(|id| id == conversation_id) {
+        let cancelled = matches!(
+            &*self.in_flight.lock(),
+            Some((id, cancelled)) if id == conversation_id && cancelled.load(Ordering::SeqCst)
+        );
+        if cancelled || self.forgotten.lock().iter().any(|id| id == conversation_id) {
             return Err("la conversación se borró mientras se extraían los recuerdos".into());
         }
         let db = self.usable(dir, &mut guard).await?;
@@ -398,6 +437,11 @@ impl Memory {
     /// `ClearMemory`. Lo mismo si la memoria no se pudo abrir (llavero
     /// bloqueado, llave que falta): no se reintenta después.
     pub async fn forget_conversation(&self, conversation_id: &str) {
+        if let Some((id, cancelled)) = &*self.in_flight.lock() {
+            if id == conversation_id {
+                cancelled.store(true, Ordering::SeqCst);
+            }
+        }
         {
             let mut forgotten = self.forgotten.lock();
             if forgotten.len() >= MAX_FORGOTTEN_CONVERSATIONS {
