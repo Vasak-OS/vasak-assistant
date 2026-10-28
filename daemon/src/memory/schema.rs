@@ -361,6 +361,28 @@ fn delete(db: &GrafeoDB, node: NodeId) -> grafeo::Result<()> {
     db.delete_node(node).map(drop)
 }
 
+/// Borra los resúmenes de la conversación `conversation` (su propiedad
+/// `conversation`) y después corre `gc` y `wal_checkpoint`, como la poda.
+/// Devuelve cuántos borró.
+pub fn delete_summaries(db: &GrafeoDB, conversation: &str) -> grafeo::Result<usize> {
+    let summaries: Vec<NodeId> = db
+        .find_nodes_by_property("conversation", &Value::from(conversation))
+        .into_iter()
+        .filter(|node| {
+            db.get_node(*node)
+                .is_some_and(|found| found.has_label(MemoryKind::ConversationSummary.label()))
+        })
+        .collect();
+    for node in &summaries {
+        delete(db, *node)?;
+    }
+    if !summaries.is_empty() {
+        db.gc();
+        db.wal_checkpoint()?;
+    }
+    Ok(summaries.len())
+}
+
 /// Deja como mucho `keep` nodos de la clase, sacando los de menor puntaje.
 pub fn prune_kind(db: &GrafeoDB, kind: MemoryKind, keep: usize, now: i64) -> grafeo::Result<usize> {
     let mut all = entries(db, kind);

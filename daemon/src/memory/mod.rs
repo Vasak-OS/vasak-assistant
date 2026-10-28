@@ -141,7 +141,18 @@ pub struct Memory {
     /// Si ya se podó en el episodio actual sobre [`MAX_MEMORY_DISK_BYTES`].
     /// Se limpia cuando la base vuelve a estar dentro del tope.
     pruned_over_limit: Arc<AtomicBool>,
+    /// Las conversaciones borradas hace poco (`DeleteConversation`): lo que
+    /// llegue de una extracción de alguna de ellas se descarta en
+    /// [`Self::store_at`], bajo el candado. Hace de época por conversación:
+    /// los ids son uuid y no vuelven, así que basta con recordar que se borró.
+    forgotten: parking_lot::Mutex<std::collections::VecDeque<String>>,
 }
+
+/// Cuántas conversaciones borradas se recuerdan en `forgotten`.
+// shortcut: una extracción tarda segundos y hay una sola a la vez, así que
+// alcanza con las últimas 256; si alguna vez pudiera durar tanto como 256
+// borrados, pasar a una época por conversación persistida junto a `windows`.
+const MAX_FORGOTTEN_CONVERSATIONS: usize = 256;
 
 /// Cuántas conversaciones se recuerdan en `windows` antes de olvidar las de
 /// épocas viejas (y, si no alcanza, todas: olvidar sólo achica la ventana).
@@ -159,6 +170,7 @@ impl Memory {
             epoch: AtomicU64::new(0),
             windows: parking_lot::Mutex::default(),
             pruned_over_limit: Arc::default(),
+            forgotten: parking_lot::Mutex::default(),
         }
     }
 
@@ -308,6 +320,16 @@ impl Memory {
             if memory.database().await.is_err() || !memory.allowed_for(&*backend).await {
                 return;
             }
+            // Si ya se borró, ni se le pide nada al modelo (`store_at` igual lo
+            // descartaría).
+            if memory
+                .forgotten
+                .lock()
+                .iter()
+                .any(|id| *id == conversation_id)
+            {
+                return;
+            }
             let request = learn::extraction_request(&conversation, gate);
             // Sin permiso para el remoto, la extracción sólo va a un modelo
             // local, decidido con la misma resolución que manda el pedido.
@@ -355,11 +377,54 @@ impl Memory {
         if self.epoch.load(Ordering::SeqCst) != epoch {
             return Err("la memoria cambió mientras se extraían los recuerdos".into());
         }
+        if self.forgotten.lock().iter().any(|id| id == conversation_id) {
+            return Err("la conversación se borró mientras se extraían los recuerdos".into());
+        }
         let db = self.usable(dir, &mut guard).await?;
         let (dir, conversation_id) = (dir.clone(), conversation_id.to_owned());
         let pruned = self.pruned_over_limit.clone();
         blocking(move || write(&db, &dir, &extraction, &conversation_id, &pruned).map_err(text))
             .await
+    }
+
+    /// Una conversación borrada (`DeleteConversation`): se descarta lo que
+    /// esté extrayéndose de ella y se borran sus resúmenes. Nunca falla: si la
+    /// memoria no se puede usar, sólo queda la cancelación.
+    ///
+    /// Con la memoria apagada no se toca la base (apagar no lee ni escribe,
+    /// decisión 10), y el resumen de una conversación borrada mientras estaba
+    /// apagada queda: no se anota en ningún lado para borrarlo al encender,
+    /// porque eso sería escribir con la memoria apagada. La salida para eso es
+    /// `ClearMemory`. Lo mismo si la memoria no se pudo abrir (llavero
+    /// bloqueado, llave que falta): no se reintenta después.
+    pub async fn forget_conversation(&self, conversation_id: &str) {
+        {
+            let mut forgotten = self.forgotten.lock();
+            if forgotten.len() >= MAX_FORGOTTEN_CONVERSATIONS {
+                forgotten.pop_front();
+            }
+            forgotten.push_back(conversation_id.to_owned());
+        }
+        self.windows.lock().remove(conversation_id);
+        let Some(dir) = &self.dir else {
+            return;
+        };
+        let mut db = self.db.lock().await;
+        if !is_file(&flag(dir)).await {
+            return;
+        }
+        // Borrar no le manda nada a ningún modelo: la puerta del remoto no
+        // aplica, sólo que esté encendida y abierta.
+        if let Err(reason) = self.ensure_open(dir, &mut db).await {
+            tracing::info!("no se borraron los resúmenes de la conversación: {reason}");
+            return;
+        }
+        let Some(db) = db.clone() else { return };
+        let id = conversation_id.to_owned();
+        if let Err(error) = blocking(move || schema::delete_summaries(&db, &id).map_err(text)).await
+        {
+            tracing::warn!("no se borraron los resúmenes de la conversación: {error}");
+        }
     }
 
     /// La época actual (sube con cada encender, apagar y borrar). Sólo la

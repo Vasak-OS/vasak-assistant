@@ -168,6 +168,12 @@ systemd, `$STATE_DIRECTORY`). No va en el almacén de cuentas.
 - **Sólo desde que se encendió.** No se aprende de lo dicho antes de encender
   la memoria ni de antes de borrarla, y lo que se estaba extrayendo cuando se
   apagó o se borró se descarta.
+- **Borrar una conversación borra su resumen.** `DeleteConversation` cancela lo
+  que se esté extrayendo de ella y borra sus resúmenes de la memoria. Con la
+  memoria apagada no se toca la base, así que el resumen de una conversación
+  borrada mientras estaba apagada queda (para eso, `ClearMemory`). Una
+  conversación que se olvida porque su aplicación se cerró no cuenta como
+  borrada: su resumen queda, que para eso está.
 - **Sólo lo suyo.** No guarda correo, calendario, contactos, archivos, cuentas
   ni claves: eso se lee de su servicio en el momento y no se persiste.
 - **Con un modelo remoto**, la memoria no se lee ni se escribe salvo que la

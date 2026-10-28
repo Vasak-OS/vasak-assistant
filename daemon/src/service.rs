@@ -194,12 +194,13 @@ impl AssistantService {
     }
 
     /// Cierra una conversación de quien llama y olvida sus mensajes.
-    fn delete_conversation(
+    async fn delete_conversation(
         &self,
         #[zbus(header)] header: Header<'_>,
         conversation_id: &str,
     ) -> Result<(), Error> {
-        self.delete_as(owner(&header)?, conversation_id)
+        self.delete_conversation_as(owner(&header)?, conversation_id)
+            .await
     }
 
     /// Guarda en el llavero la clave del proveedor de esa dirección.
@@ -422,6 +423,19 @@ impl AssistantService {
 
     pub fn delete_as(&self, owner: &str, conversation_id: &str) -> Result<(), Error> {
         self.conversations.lock().delete(owner, conversation_id)
+    }
+
+    /// `DeleteConversation`: la cierra y, en la memoria, cancela lo que se
+    /// esté extrayendo de ella y borra sus resúmenes. Lo de la memoria nunca
+    /// hace fallar el borrado ([`Memory::forget_conversation`]).
+    pub async fn delete_conversation_as(
+        &self,
+        owner: &str,
+        conversation_id: &str,
+    ) -> Result<(), Error> {
+        self.delete_as(owner, conversation_id)?;
+        self.memory.forget_conversation(conversation_id).await;
+        Ok(())
     }
 
     /// La dirección se normaliza igual que al elegir el backend, así el ítem
