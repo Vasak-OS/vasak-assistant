@@ -898,5 +898,9 @@ pub fn capture_logs() -> (LogCapture, tracing::subscriber::DefaultGuard) {
                 .with_filter(crate::logging::library_filter()),
         ),
     );
+    // Con las pruebas en paralelo, una línea vista antes en otro hilo sin
+    // captura puede quedar con el interés cacheado en «nunca» y no llegar acá.
+    // Recalcularlo al instalar la captura lo evita.
+    tracing::callsite::rebuild_interest_cache();
     (log, guard)
 }

@@ -2875,4 +2875,76 @@ mod log_tests {
         }
         assert!(!text.contains("[7, 7"), "{text}");
     }
+
+    // ── El texto fijo de una tarea que falla y el indicador ───────────────────
+
+    #[tokio::test]
+    async fn una_tarea_bloqueante_que_entra_en_panico_no_deja_su_mensaje_en_el_error_ni_en_el_registro(
+    ) {
+        let (log, _guard) = capture_logs();
+
+        let result: Result<(), String> =
+            blocking(|| panic!("mensajecanariopanicoqzx con valorcanarioqzx")).await;
+
+        let error = result.unwrap_err();
+        assert_eq!(error, "la tarea de la memoria falló (pánico)");
+        assert!(!error.contains("canario"), "{error}");
+        assert!(!log.text().contains("canario"), "{}", log.text());
+        // Una tarea que anda sigue andando.
+        assert_eq!(blocking(|| Ok::<_, String>(7)).await, Ok(7));
+        assert_eq!(
+            blocking(|| Err::<(), _>("motivo propio".to_owned())).await,
+            Err("motivo propio".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn un_fallo_al_escribir_el_indicador_dice_ruta_y_clase_y_no_el_texto_del_sistema() {
+        let tmp = TempDir::new();
+        let memory = Memory::new(Some(tmp.memory_dir()), FixedKey::new(None));
+        // `enabled` ya existe y es una carpeta: no se puede abrir como archivo.
+        std::fs::create_dir(tmp.path().join("enabled")).unwrap();
+        let (log, _guard) = capture_logs();
+
+        let error = memory.set_enabled(true).await.unwrap_err();
+
+        let Error::Unavailable(text) = error else {
+            panic!("tenía que ser Unavailable");
+        };
+        assert!(
+            text.starts_with("No se pudo encender la memoria: "),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{}", tmp.path().join("enabled").display())),
+            "{text}"
+        );
+        for system in ["Is a directory", "os error"] {
+            assert!(!text.contains(system), "{text}");
+        }
+        assert!(!log.text().contains("os error"), "{}", log.text());
+    }
+
+    #[tokio::test]
+    async fn un_fallo_al_borrar_el_indicador_dice_ruta_y_clase_y_no_el_texto_del_sistema() {
+        let tmp = TempDir::new();
+        let memory = Memory::new(Some(tmp.memory_dir()), FixedKey::new(None));
+        let flag_dir = tmp.path().join("enabled");
+        std::fs::create_dir(&flag_dir).unwrap();
+        std::fs::write(flag_dir.join("algo"), b"x").unwrap();
+
+        let error = memory.set_enabled(false).await.unwrap_err();
+
+        let Error::Unavailable(text) = error else {
+            panic!("tenía que ser Unavailable");
+        };
+        assert!(text.starts_with("No se pudo apagar la memoria: "), "{text}");
+        assert!(text.contains(&format!("{}", flag_dir.display())), "{text}");
+        for system in ["os error", "Directory not empty", "Is a directory"] {
+            assert!(!text.contains(system), "{system}: {text}");
+        }
+        // Un indicador que ya no está no es un error.
+        std::fs::remove_dir_all(&flag_dir).unwrap();
+        memory.set_enabled(false).await.unwrap();
+    }
 }
