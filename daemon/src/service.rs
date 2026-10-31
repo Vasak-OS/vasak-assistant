@@ -2875,4 +2875,119 @@ mod delete_conversation_tests {
         assert!(matches!(second, Err(Error::NotFound(_))));
         assert_eq!(summaries(&rig.service.memory).await, ["Resumen de B"]);
     }
+
+    #[tokio::test]
+    async fn dos_resumenes_iguales_de_conversaciones_distintas_borrar_una_deja_el_de_la_otra() {
+        let rig = rig().await;
+        let (a, b) = (
+            rig.service.open(OWNER).unwrap(),
+            rig.service.open(OWNER).unwrap(),
+        );
+        for id in [&a, &b] {
+            rig.service
+                .memory
+                .store(summary("Hablaron de gatos"), id)
+                .await
+                .unwrap();
+        }
+        assert_eq!(summaries(&rig.service.memory).await.len(), 2);
+
+        rig.service.delete_conversation_as(OWNER, &a).await.unwrap();
+
+        assert_eq!(summaries(&rig.service.memory).await, ["Hablaron de gatos"]);
+        rig.service.delete_conversation_as(OWNER, &b).await.unwrap();
+        assert!(summaries(&rig.service.memory).await.is_empty());
+    }
+
+    const EXTRACTION: &str =
+        r#"{"items":[{"kind":"preference","text":"Prefiere el mate amargo"}],"summary":null}"#;
+
+    /// Un servicio cuyo backend (el chat y la extracción) espera la compuerta.
+    async fn gated_rig() -> (Rig, Arc<FakeBackend>, Arc<tokio::sync::Notify>) {
+        let (fake, gate) = FakeBackend::gated(EXTRACTION);
+        let backend = Arc::new(fake);
+        let mut rig = rig().await;
+        rig.service.backend = backend.clone();
+        (rig, backend, gate)
+    }
+
+    #[tokio::test]
+    async fn borrar_la_conversacion_mientras_su_extraccion_esta_en_vuelo_no_guarda_nada() {
+        let (rig, backend, gate) = gated_rig().await;
+        let service = Arc::new(rig.service);
+        let id = service.open(OWNER).unwrap();
+
+        let chat = {
+            let (service, id) = (service.clone(), id.clone());
+            tokio::spawn(async move {
+                service
+                    .chat_as(OWNER, &id, "prefiero el mate amargo, ¿qué tal?")
+                    .await
+            })
+        };
+        // El chat sale al modelo; se lo libera y arranca la extracción.
+        backend.entered.notified().await;
+        gate.notify_one();
+        chat.await.unwrap().unwrap();
+        backend.entered.notified().await;
+        assert_eq!(backend.seen.lock().len(), 2, "el chat y la extracción");
+
+        service.delete_conversation_as(OWNER, &id).await.unwrap();
+        gate.notify_one();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        assert_eq!(service.memory.recall("mate", true).await, None);
+    }
+
+    #[tokio::test]
+    async fn borrar_la_conversacion_mientras_el_chat_espera_la_respuesta_no_aprende_nada() {
+        let (rig, backend, gate) = gated_rig().await;
+        let service = Arc::new(rig.service);
+        let id = service.open(OWNER).unwrap();
+
+        let chat = {
+            let (service, id) = (service.clone(), id.clone());
+            tokio::spawn(async move {
+                service
+                    .chat_as(OWNER, &id, "prefiero el mate amargo, ¿qué tal?")
+                    .await
+            })
+        };
+        backend.entered.notified().await;
+        service.delete_conversation_as(OWNER, &id).await.unwrap();
+        gate.notify_one();
+        // La persona igual recibe la respuesta.
+        chat.await.unwrap().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        assert_eq!(backend.seen.lock().len(), 1, "sin extracción");
+        assert_eq!(service.memory.recall("mate", true).await, None);
+        assert!(service.list(OWNER).is_empty());
+    }
+
+    #[tokio::test]
+    async fn sin_borrar_nada_la_misma_secuencia_si_aprende() {
+        let (rig, backend, gate) = gated_rig().await;
+        let service = Arc::new(rig.service);
+        let id = service.open(OWNER).unwrap();
+
+        let chat = {
+            let (service, id) = (service.clone(), id.clone());
+            tokio::spawn(async move {
+                service
+                    .chat_as(OWNER, &id, "prefiero el mate amargo, ¿qué tal?")
+                    .await
+            })
+        };
+        backend.entered.notified().await;
+        gate.notify_one();
+        chat.await.unwrap().unwrap();
+        backend.entered.notified().await;
+        gate.notify_one();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while service.memory.recall("mate", true).await.is_none() {
+            assert!(tokio::time::Instant::now() < deadline, "no se aprendió");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
 }

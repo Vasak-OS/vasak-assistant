@@ -2262,4 +2262,83 @@ mod forget_tests {
         memory.forget_conversation("primera").await;
         assert!(!memory.windows.lock().contains_key("primera"));
     }
+
+    async fn until_idle(memory: &Memory) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while memory.learning.available_permits() != 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "la extracción no terminó"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn borrar_cientos_de_otras_conversaciones_no_deja_pasar_la_extraccion_de_la_borrada() {
+        let (_tmp, memory) = enabled().await;
+        let (backend, gate) = FakeBackend::gated(EXTRACTION);
+        let backend = Arc::new(backend);
+
+        memory.learn_after(backend.clone(), "a", turn());
+        backend.entered.notified().await;
+        memory.forget_conversation("a").await;
+        // Más que el tope de `forgotten`: «a» ya no está en esa lista.
+        for n in 0..(MAX_FORGOTTEN_CONVERSATIONS + 44) {
+            memory.forget_conversation(&format!("otra-{n}")).await;
+        }
+        assert!(!memory.forgotten.lock().iter().any(|id| id == "a"));
+        gate.notify_one();
+        until_idle(&memory).await;
+
+        assert_eq!(memory.recall("mate", true).await, None);
+    }
+
+    #[tokio::test]
+    async fn borrar_otra_conversacion_no_cancela_la_extraccion_en_vuelo() {
+        let (_tmp, memory) = enabled().await;
+        let (backend, gate) = FakeBackend::gated(EXTRACTION);
+        let backend = Arc::new(backend);
+
+        memory.learn_after(backend.clone(), "a", turn());
+        backend.entered.notified().await;
+        memory.forget_conversation("b").await;
+        gate.notify_one();
+        until_idle(&memory).await;
+
+        assert!(memory
+            .recall("mate", true)
+            .await
+            .unwrap()
+            .contains("mate amargo"));
+    }
+
+    #[tokio::test]
+    async fn al_terminar_la_extraccion_la_marca_de_en_vuelo_se_saca() {
+        let (_tmp, memory) = enabled().await;
+        let backend = ScriptedBackend::new([EXTRACTION]);
+
+        memory.learn_after(backend.clone(), "a", turn());
+        backend.wait_for_calls(1).await;
+        until_idle(&memory).await;
+
+        assert!(memory.in_flight.lock().is_none());
+        // Y una extracción que ni empezó (otra en curso) no deja marca de más.
+        let held = memory.learning.clone().try_acquire_owned().unwrap();
+        memory.learn_after(backend.clone(), "b", turn());
+        assert!(memory.in_flight.lock().is_none());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn una_extraccion_que_falla_o_no_aprende_nada_tambien_saca_la_marca() {
+        let (_tmp, memory) = enabled().await;
+        let backend = ScriptedBackend::new(["no es json"]);
+
+        memory.learn_after(backend.clone(), "a", turn());
+        backend.wait_for_calls(1).await;
+        until_idle(&memory).await;
+
+        assert!(memory.in_flight.lock().is_none());
+    }
 }

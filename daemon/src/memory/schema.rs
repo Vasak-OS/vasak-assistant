@@ -989,4 +989,69 @@ mod delete_summaries_tests {
 
         assert_eq!(entries(&db, MemoryKind::ConversationSummary).len(), 1);
     }
+
+    #[test]
+    fn dos_resumenes_iguales_de_conversaciones_distintas_son_dos_nodos_y_borrar_uno_deja_el_otro() {
+        let db = db();
+        add(
+            &db,
+            MemoryKind::ConversationSummary,
+            "Hablaron de gatos",
+            "a",
+        );
+        add(
+            &db,
+            MemoryKind::ConversationSummary,
+            "Hablaron de gatos",
+            "b",
+        );
+
+        assert_eq!(entries(&db, MemoryKind::ConversationSummary).len(), 2);
+        assert_eq!(delete_summaries(&db, "a").unwrap(), 1);
+
+        assert_eq!(
+            texts(&db, MemoryKind::ConversationSummary),
+            ["Hablaron de gatos"]
+        );
+        assert_eq!(delete_summaries(&db, "b").unwrap(), 1);
+        assert!(entries(&db, MemoryKind::ConversationSummary).is_empty());
+    }
+
+    #[test]
+    fn el_mismo_resumen_de_la_misma_conversacion_se_refuerza_y_no_se_duplica() {
+        let db = db();
+        add(
+            &db,
+            MemoryKind::ConversationSummary,
+            "Hablaron de gatos",
+            "a",
+        );
+        add(
+            &db,
+            MemoryKind::ConversationSummary,
+            "hablaron de GATOS",
+            "a",
+        );
+
+        assert_eq!(entries(&db, MemoryKind::ConversationSummary).len(), 1);
+    }
+
+    #[test]
+    fn la_conversacion_no_se_confunde_con_el_texto_en_la_clave_del_resumen() {
+        let db = db();
+        add(&db, MemoryKind::ConversationSummary, "b c", "a");
+        add(&db, MemoryKind::ConversationSummary, "c", "a b");
+
+        assert_eq!(entries(&db, MemoryKind::ConversationSummary).len(), 2);
+    }
+
+    #[test]
+    fn una_preferencia_con_el_mismo_texto_que_un_resumen_no_choca_con_el() {
+        let db = db();
+        add(&db, MemoryKind::ConversationSummary, "Madruga", "a");
+        add(&db, MemoryKind::Preference, "Madruga", "a");
+
+        assert_eq!(entries(&db, MemoryKind::ConversationSummary).len(), 1);
+        assert_eq!(entries(&db, MemoryKind::Preference).len(), 1);
+    }
 }
