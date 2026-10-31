@@ -2955,6 +2955,14 @@ mod delete_conversation_tests {
         };
         backend.entered.notified().await;
         service.delete_conversation_as(OWNER, &id).await.unwrap();
+        // Con otros cientos de borrados, «id» ya no está en la lista de borradas:
+        // lo que frena el aprendizaje es que la conversación ya no existe.
+        for n in 0..300 {
+            service
+                .memory
+                .forget_conversation(&format!("otra-{n}"))
+                .await;
+        }
         gate.notify_one();
         // La persona igual recibe la respuesta.
         chat.await.unwrap().unwrap();
