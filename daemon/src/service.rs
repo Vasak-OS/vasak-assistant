@@ -1758,7 +1758,6 @@ mod memory_tests {
 /// una etiqueta de mentira.
 #[cfg(test)]
 mod gate_tests {
-    use std::time::Duration;
 
     use super::*;
     use crate::memory::learn::{Extraction, Item};
@@ -2068,7 +2067,6 @@ mod bus_label_tests {
 /// La puerta del remoto se decide con el modelo efectivo de cada pedido.
 #[cfg(test)]
 mod effective_model_tests {
-    use std::time::Duration;
 
     use super::*;
     use crate::memory::schema::MemoryKind;
