@@ -180,7 +180,8 @@ systemd, `$STATE_DIRECTORY`). No va en el almacén de cuentas.
     `ClearMemory` (#28).
   - Los resúmenes de conversaciones de antes de reiniciar el servicio (las
     conversaciones no sobreviven al reinicio, así que ya no se pueden borrar
-    una por una) se van sólo con `ClearMemory`.
+    una por una) no se borran a pedido: se van con `ClearMemory`, o solos
+    cuando la poda los desplaza porque se llegó al tope de resúmenes.
   - Una conversación que se olvida porque su aplicación se cerró no cuenta como
     borrada: su resumen queda, que para eso está.
 - **Sólo lo suyo.** No guarda correo, calendario, contactos, archivos, cuentas
