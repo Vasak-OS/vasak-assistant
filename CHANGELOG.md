@@ -2,6 +2,17 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-assistant 0.3.3
+
+- **`daemon`** — borrar una conversación (`DeleteConversation`) borra su resumen
+  de la memoria y cancela la extracción que tuviera en curso (#12). La clave del
+  resumen incluye la conversación, así dos resúmenes iguales no se pisan.
+
+## vasak-assistant 0.3.2
+
+- **`daemon`** — tokio 1.54.1, que corrige una carrera en `tokio::time::Interval`
+  (alerta de Dependabot).
+
 ## vasak-assistant 0.3.1
 
 - **`daemon`** — una llamada sin remitente se rechaza con `AccessDenied` en vez
