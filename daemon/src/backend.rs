@@ -667,9 +667,10 @@ mod log_tests {
     async fn una_direccion_con_usuario_clave_y_consulta_no_se_repite_en_un_error_de_conexion() {
         let port_url = closed_port_url();
         let mut selection = local_selection("ollama", &port_url, None);
-        selection.url = reqwest::Url::parse(&format!(
-            "{}",
-            port_url.replacen("http://", "http://usuariocanario:clavecanaria@", 1)
+        selection.url = reqwest::Url::parse(&port_url.replacen(
+            "http://",
+            "http://usuariocanario:clavecanaria@",
+            1,
         ))
         .unwrap();
         selection.url.set_query(Some("token=consultacanaria"));
