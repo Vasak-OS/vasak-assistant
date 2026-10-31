@@ -236,7 +236,9 @@ notas, los recuerdos ni los resúmenes, las claves ni los tokens, ni una
 dirección con usuario, contraseña, ruta o consulta (se muestra sólo esquema,
 host y puerto). De un error de la base de la memoria se registra sólo su código
 (`GRAFEO-…`), de uno de archivos la ruta y la clase, y de un `vasak.conf` que no
-se puede leer, la línea, la columna y la clase del error, nunca el valor. Las
+se puede leer, la línea, la columna y la clase del error, nunca el valor. Los
+errores del bus y del llavero (zbus) sí se registran con su texto: viene del
+demonio del bus o de `vasak-keyring` y no trae secretos. Las
 bibliotecas que ven los cuerpos (el bus, HTTP, TLS) no pasan de `info` aunque
 `RUST_LOG` pida más.
 

@@ -733,21 +733,29 @@ fn flag(dir: &Path) -> PathBuf {
 }
 
 async fn write_flag(dir: &Path) -> Result<(), Error> {
+    let path = flag(dir);
     tokio::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(flag(dir))
+        .open(&path)
         .await
         .map(drop)
-        .map_err(|error| Error::Unavailable(format!("No se pudo encender la memoria: {error}")))
+        .map_err(|error| {
+            Error::Unavailable(format!(
+                "No se pudo encender la memoria: {}",
+                io_error(&path)(error)
+            ))
+        })
 }
 
 async fn remove_flag(dir: &Path) -> Result<(), Error> {
-    match tokio::fs::remove_file(flag(dir)).await {
+    let path = flag(dir);
+    match tokio::fs::remove_file(&path).await {
         Err(error) if error.kind() != io::ErrorKind::NotFound => Err(Error::Unavailable(format!(
-            "No se pudo apagar la memoria: {error}"
+            "No se pudo apagar la memoria: {}",
+            io_error(&path)(error)
         ))),
         _ => Ok(()),
     }
@@ -989,7 +997,15 @@ async fn blocking<T: Send + 'static>(
 ) -> Result<T, String> {
     tokio::task::spawn_blocking(work)
         .await
-        .unwrap_or_else(|error| Err(error.to_string()))
+        // Un texto fijo: el de un `JoinError` trae el mensaje del pánico de lo
+        // que corría adentro, y eso puede llevar un valor.
+        .unwrap_or_else(|error| {
+            Err(if error.is_panic() {
+                "la tarea de la memoria falló (pánico)".to_owned()
+            } else {
+                "la tarea de la memoria se canceló".to_owned()
+            })
+        })
 }
 
 #[cfg(test)]
