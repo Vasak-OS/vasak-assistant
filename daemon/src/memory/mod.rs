@@ -2704,4 +2704,159 @@ mod log_tests {
         let l = line(&log, &["la llave de la memoria no se pudo releer"]);
         assert!(l.contains("WARN"), "{l}");
     }
+
+    // ── Sin texto libre de Grafeo ni de E/S ───────────────────────────────────
+
+    #[test]
+    fn un_error_de_grafeo_se_cuenta_solo_por_su_codigo() {
+        for error in [
+            grafeo::Error::InvalidValue("valorcanarioqzx".into()),
+            grafeo::Error::PropertyNotFound("valorcanarioqzx".into()),
+            grafeo::Error::LabelNotFound("valorcanarioqzx".into()),
+            grafeo::Error::Internal("valorcanarioqzx".into()),
+            grafeo::Error::TypeMismatch {
+                expected: "valorcanarioqzx".into(),
+                found: "valorcanarioqzx".into(),
+            },
+        ] {
+            let code = error.error_code().to_string();
+            let shown = db_error(error);
+            assert_eq!(shown, code);
+            assert!(shown.starts_with("GRAFEO-"), "{shown}");
+            assert!(!shown.contains("canarioqzx"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn un_error_de_e_s_se_cuenta_por_la_ruta_y_la_clase_y_nunca_por_su_texto() {
+        let path = Path::new("/var/lib/vasak-assistant/memory");
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::NotFound,
+            io::ErrorKind::Other,
+        ] {
+            let shown = io_error(path)(io::Error::new(kind, "textolibrecanarioqzx"));
+            assert_eq!(shown, format!("{}: {kind}", path.display()));
+            assert!(!shown.contains("canarioqzx"), "{shown}");
+        }
+        let os = io_error(path)(io::Error::from_raw_os_error(13));
+        assert_eq!(os, format!("{}: permission denied", path.display()));
+    }
+
+    #[tokio::test]
+    async fn un_fallo_real_de_e_s_al_crear_la_memoria_dice_la_ruta_y_la_clase() {
+        let tmp = TempDir::new();
+        // La carpeta de estado es un archivo: no se puede crear `memory/` adentro.
+        let blocker = tmp.path().join("estado");
+        std::fs::write(&blocker, b"x").unwrap();
+        let memory = Memory::new(Some(blocker.join("memory")), FixedKey::new(None));
+        let (log, _guard) = capture_logs();
+
+        let error = memory.set_enabled(true).await.unwrap_err();
+
+        let Error::Unavailable(text) = error else {
+            panic!("tenía que ser Unavailable");
+        };
+        assert!(text.contains("estado"), "{text}");
+        assert!(!text.contains("Not a directory"), "{text}");
+        assert!(!log.text().contains("Not a directory"), "{}", log.text());
+    }
+
+    // ── La memoria que no se abre: una línea por motivo ───────────────────────
+
+    fn count(log: &LogCapture, text: &str) -> usize {
+        log.text().matches(text).count()
+    }
+
+    #[tokio::test]
+    async fn el_warn_de_que_no_se_puede_abrir_no_se_repite_con_el_mismo_motivo() {
+        let (tmp, keys, memory) = enabled().await;
+        memory.close().await;
+        *keys.memory_key.lock() = None;
+        let broken = Memory::new(Some(tmp.memory_dir()), keys);
+        let (log, _guard) = capture_logs();
+
+        for _ in 0..4 {
+            assert_eq!(broken.status().await.reason, REASON_MISSING_KEY);
+            assert_eq!(broken.recall("hola", true).await, None);
+        }
+
+        let l = line(&log, &["la memoria no se puede abrir"]);
+        assert!(l.contains("WARN") && l.contains(REASON_MISSING_KEY), "{l}");
+        assert_eq!(count(&log, "la memoria no se puede abrir"), 1);
+        assert_eq!(count(&log, "la memoria se abrió"), 0);
+    }
+
+    #[tokio::test]
+    async fn el_warn_vuelve_a_salir_cuando_cambia_el_motivo_y_hay_info_al_reabrir() {
+        let (tmp, keys, memory) = enabled().await;
+        memory.close().await;
+        let good = keys.memory_key.lock().clone();
+        let broken = Memory::new(Some(tmp.memory_dir()), keys.clone());
+        let (log, _guard) = capture_logs();
+
+        // Primer motivo: la llave falta.
+        *keys.memory_key.lock() = None;
+        broken.status().await;
+        broken.status().await;
+        // Segundo motivo: el llavero está bloqueado (con la llave puesta).
+        *keys.memory_key.lock() = good.clone();
+        *keys.locked.lock() = true;
+        broken.status().await;
+        broken.status().await;
+        assert_eq!(count(&log, "la memoria no se puede abrir"), 2);
+        assert!(log.text().contains(REASON_MISSING_KEY) && log.text().contains(REASON_LOCKED));
+        // Vuelve el primero: otro aviso, porque cambió respecto del último.
+        *keys.locked.lock() = false;
+        *keys.memory_key.lock() = None;
+        broken.status().await;
+        assert_eq!(count(&log, "la memoria no se puede abrir"), 3);
+        // Se arregla: un info, una sola vez.
+        *keys.memory_key.lock() = good;
+        assert!(broken.status().await.available);
+        broken.status().await;
+        broken.recall("hola", true).await;
+        let l = line(&log, &["la memoria se abrió"]);
+        assert!(l.contains("INFO"), "{l}");
+        assert_eq!(count(&log, "la memoria se abrió"), 1);
+        // Si vuelve a fallar después de reabrir, avisa de nuevo.
+        broken.close().await;
+        *keys.memory_key.lock() = None;
+        broken.status().await;
+        assert_eq!(count(&log, "la memoria no se puede abrir"), 4);
+    }
+
+    #[tokio::test]
+    async fn abrir_bien_desde_el_principio_no_deja_ni_warn_ni_info() {
+        let (_tmp, _keys, memory) = enabled().await;
+        let (log, _guard) = capture_logs();
+
+        memory.status().await;
+        memory.recall("hola", true).await;
+
+        assert_eq!(count(&log, "la memoria no se puede abrir"), 0);
+        assert_eq!(count(&log, "la memoria se abrió"), 0);
+    }
+
+    #[tokio::test]
+    async fn el_warn_de_no_poder_abrir_lleva_el_motivo_fijo_y_nunca_la_llave() {
+        let (tmp, keys, memory) = enabled().await;
+        memory.close().await;
+        let key = keys.memory_key.lock().clone().unwrap();
+        *keys.memory_key.lock() = Some(vec![7u8; 32]);
+        let broken = Memory::new(Some(tmp.memory_dir()), keys);
+        let (log, _guard) = capture_logs();
+
+        broken.status().await;
+
+        let text = log.text();
+        assert!(text.contains(REASON_NOT_OPENED), "{text}");
+        for byte in [key[0], 7u8] {
+            assert!(
+                !text.contains(&format!("{byte:02x}{byte:02x}{byte:02x}")),
+                "{text}"
+            );
+        }
+        assert!(!text.contains("[7, 7"), "{text}");
+    }
 }

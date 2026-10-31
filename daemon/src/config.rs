@@ -744,4 +744,49 @@ mod tests {
         assert_eq!(settings.url.as_deref(), Some("http://127.0.0.1:8080/v1"));
         assert!(select_backend(&settings).is_ok());
     }
+
+    // ── El motivo no repite el valor ─────────────────────────────────────────
+
+    #[test]
+    fn un_valor_sensible_en_un_campo_de_tipo_equivocado_no_se_repite_en_el_motivo() {
+        for content in [
+            r#"{"assistant":{"allow_remote":"sk-clavecanariaqzx"}}"#,
+            r#"{"assistant":{"share_memory_with_remote":"sk-clavecanariaqzx"}}"#,
+            r#"{"assistant":{"url":["sk-clavecanariaqzx"]}}"#,
+            r#"{"assistant":{"model":{"clave":"sk-clavecanariaqzx"}}}"#,
+            r#"{"assistant":"sk-clavecanariaqzx"}"#,
+            r#"{"assistant":{"allow_remote":123456789}}"#,
+        ] {
+            let reason = settings_from_json(content).unwrap_err();
+            assert!(!reason.contains("clavecanariaqzx"), "{content}: {reason}");
+            assert!(!reason.contains("123456789"), "{content}: {reason}");
+            assert!(reason.contains("vasak.conf"), "{reason}");
+            assert!(
+                reason.contains("línea 1, columna") || reason.contains("tipo o valor"),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn un_json_roto_dice_linea_columna_y_clase_sin_el_texto() {
+        let content = "{\n  \"assistant\": {\"url\": \"sk-clavecanariaqzx\" \"model\": 1}\n}";
+        let reason = settings_from_json(content).unwrap_err();
+        assert!(reason.contains("línea 2, columna"), "{reason}");
+        assert!(reason.contains("sintaxis"), "{reason}");
+        assert!(!reason.contains("clavecanariaqzx"), "{reason}");
+
+        let eof = settings_from_json("{\"assistant\": {\"url\": \"sk-clavecanariaqzx").unwrap_err();
+        assert!(
+            eof.contains("termina antes de tiempo") && !eof.contains("clavecanariaqzx"),
+            "{eof}"
+        );
+    }
+
+    #[test]
+    fn una_configuracion_buena_sigue_leyendose() {
+        let settings = settings_from_json(r#"{"assistant":{"allow_remote":true}}"#).unwrap();
+        assert!(settings.allow_remote);
+        assert_eq!(settings_from_json("{}").unwrap(), Settings::default());
+    }
 }

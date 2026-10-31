@@ -374,3 +374,145 @@ mod tests {
         );
     }
 }
+
+/// Las líneas de arranque: contenido y nada de credenciales ni rutas.
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use crate::config::Settings;
+    use crate::test_support::{local_selection, model_info};
+
+    fn settings(allow_remote: bool, share: bool) -> Settings {
+        Settings {
+            backend: Some("openai".into()),
+            url: Some("https://usuariocanario:clavecanaria@api.ejemplo.com/v1/cuentacanaria?token=consultacanaria".into()),
+            model: Some("modelo-canario".into()),
+            allow_remote,
+            share_memory_with_remote: share,
+        }
+    }
+
+    #[test]
+    fn el_arranque_dice_version_proveedor_permisos_y_memoria() {
+        let local = model_info("llama");
+        let remote = vasak_assistant_protocol::ModelInfo {
+            local: false,
+            provider: "openai".into(),
+            ..model_info("gpt")
+        };
+        for (settings, info, memory, pieces) in [
+            (
+                settings(false, false),
+                local.clone(),
+                false,
+                vec![
+                    "ollama (local)",
+                    "allow_remote=false",
+                    "share_memory_with_remote=false",
+                    "memoria apagada",
+                ],
+            ),
+            (
+                settings(true, true),
+                remote.clone(),
+                true,
+                vec![
+                    "openai (remoto)",
+                    "allow_remote=true",
+                    "share_memory_with_remote=true",
+                    "memoria encendida",
+                ],
+            ),
+            (
+                settings(true, false),
+                local,
+                true,
+                vec![
+                    "(local)",
+                    "allow_remote=true",
+                    "share_memory_with_remote=false",
+                    "memoria encendida",
+                ],
+            ),
+        ] {
+            let line = startup_summary(&settings, &info, memory);
+            assert!(
+                line.starts_with(&format!(
+                    "arrancando vasak-assistant {}",
+                    env!("CARGO_PKG_VERSION")
+                )),
+                "{line}"
+            );
+            for piece in pieces {
+                assert!(line.contains(piece), "{piece}: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn el_arranque_no_repite_la_direccion_ni_el_usuario_ni_la_clave_ni_la_ruta_ni_el_modelo() {
+        for share in [false, true] {
+            let line = startup_summary(&settings(true, share), &model_info("modelo-canario"), true);
+            for secret in [
+                "usuariocanario",
+                "clavecanaria",
+                "cuentacanaria",
+                "consultacanaria",
+                "api.ejemplo.com",
+                "modelo-canario",
+                "https://",
+                "/v1",
+            ] {
+                assert!(!line.contains(secret), "{secret}: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn el_backend_elegido_dice_proveedor_origen_local_o_remoto_y_modelo() {
+        let server = "http://127.0.0.1:11434/";
+        let local = local_selection("ollama", server, Some("llama3.2"));
+        let line = backend_summary(&local);
+        assert_eq!(
+            line,
+            "backend elegido: ollama en http://127.0.0.1:11434 (local), modelo llama3.2"
+        );
+
+        let no_model = local_selection("ollama", server, None);
+        assert!(backend_summary(&no_model).contains("modelo (el primero que ofrezca)"));
+
+        let mut remote = local_selection("openai", server, Some("gpt"));
+        remote.local = false;
+        remote.url = reqwest::Url::parse("https://api.ejemplo.com/v1/").unwrap();
+        let line = backend_summary(&remote);
+        assert_eq!(
+            line,
+            "backend elegido: openai en https://api.ejemplo.com (remoto), modelo gpt"
+        );
+    }
+
+    #[test]
+    fn el_backend_elegido_no_repite_usuario_clave_ruta_ni_consulta() {
+        let mut selection = local_selection("openai", "http://127.0.0.1:8080/v1/", Some("gpt"));
+        selection.url = reqwest::Url::parse(
+            "https://usuariocanario:clavecanaria@api.ejemplo.com:8443/v1/cuentacanaria?token=consultacanaria#frag",
+        )
+        .unwrap();
+        selection.local = false;
+
+        let line = backend_summary(&selection);
+
+        assert!(line.contains("https://api.ejemplo.com:8443"), "{line}");
+        for secret in [
+            "usuariocanario",
+            "clavecanaria",
+            "cuentacanaria",
+            "consultacanaria",
+            "frag",
+            "/v1",
+            "@",
+        ] {
+            assert!(!line.contains(secret), "{secret}: {line}");
+        }
+    }
+}

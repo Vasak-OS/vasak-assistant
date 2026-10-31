@@ -631,7 +631,7 @@ mod log_tests {
     }
 
     #[tokio::test]
-    async fn openai_registra_la_ruta_sin_consulta_y_nunca_la_clave() {
+    async fn openai_registra_la_operacion_sin_ruta_ni_consulta_y_nunca_la_clave() {
         let server = FakeServer::start(|pedido| match pedido.path.as_str() {
             "/v1/models" => Reply::json(MODELS),
             "/v1/chat/completions" => Reply::json(COMPLETION),
@@ -713,6 +713,40 @@ mod log_tests {
         assert!(text.contains("respuesta HTTP"), "{text}");
         for secret in ["usuariocanario", "clavecanaria", "consultacanaria"] {
             assert!(!text.contains(secret), "{secret}:\n{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn un_401_sin_clave_el_motivo_y_el_registro_dicen_solo_el_origen_y_donde_guardarla() {
+        let server = FakeServer::start(|_| Reply::status(401)).await;
+        let backend = Limited::new(Arc::new(OpenAiBackend::new(
+            client(),
+            local_selection(
+                "openai",
+                &server.url("/v1/cuentacanaria/tokencanario"),
+                Some("modelo-a"),
+            ),
+            FixedKey::new(None),
+        )));
+        let (log, _guard) = capture_logs();
+
+        let error = backend.chat(&user("hola")).await.unwrap_err();
+
+        let BackendError::Unavailable(text) = error else {
+            panic!("tenía que ser Unavailable");
+        };
+        assert!(text.contains(&format!("http://{}", server.addr)), "{text}");
+        assert!(text.contains("Configuración"), "{text}");
+        for part in ["cuentacanaria", "tokencanario", "/v1", "service=", "url="] {
+            assert!(!text.contains(part), "{part}: {text}");
+        }
+        let l = line(
+            &log,
+            &["el modelo no está disponible", "operation=\"chat\""],
+        );
+        assert!(l.contains("WARN"), "{l}");
+        for part in ["cuentacanaria", "tokencanario", "/v1/"] {
+            assert!(!log.text().contains(part), "{part}: {}", log.text());
         }
     }
 }
