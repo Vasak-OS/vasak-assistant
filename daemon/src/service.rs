@@ -1476,9 +1476,10 @@ mod memory_tests {
             }
         }
 
-        /// Da tiempo a que una extracción que no tendría que ocurrir ocurra.
-        async fn settle() {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        /// Espera a que termine cualquier extracción lanzada por el último chat
+        /// (el permiso se toma antes de que `chat_as` vuelva).
+        async fn settle(&self) {
+            self.service.memory.wait_until_idle().await;
         }
 
         fn first_of_call(&self, n: usize) -> Message {
@@ -1550,7 +1551,7 @@ mod memory_tests {
 
         world.service.memory.set_enabled(false).await.unwrap();
         world.say("prefiero el mate amargo").await;
-        World::settle().await;
+        world.settle().await;
 
         // Sólo la llamada del chat: ni notas ni una extracción.
         assert_eq!(world.backend.seen.lock().len(), 3);
@@ -1598,7 +1599,7 @@ mod memory_tests {
             .chat_as(OWNER, &id, "prefiero el mate amargo")
             .await
             .unwrap();
-        World::settle().await;
+        world.settle().await;
 
         let seen = backend.seen.lock().clone();
         assert_eq!(seen.len(), 1, "ni una extracción");
@@ -1655,7 +1656,7 @@ mod memory_tests {
         world
             .say("escribime a ana@ejemplo.com, prefiero el mate")
             .await;
-        World::settle().await;
+        world.settle().await;
 
         // La ventana quedó vacía: no hay nada que pedirle al modelo.
         assert_eq!(world.backend.seen.lock().len(), 1, "sólo el chat");
@@ -1667,7 +1668,7 @@ mod memory_tests {
 
         world.say("mi contraseña es hunter2").await;
         world.say("prefiero usar sk-abcdefgh12345678 siempre").await;
-        World::settle().await;
+        world.settle().await;
 
         assert_eq!(world.backend.seen.lock().len(), 2, "sólo los dos chats");
     }
@@ -1678,7 +1679,7 @@ mod memory_tests {
 
         world.say("prefiero respuestas cortas").await;
         world.backend.wait_for_calls(2).await;
-        World::settle().await;
+        world.settle().await;
         let (_, reply) = world.say("hola, ¿qué tal?").await;
 
         assert_eq!(reply, "Sigue.");
@@ -1989,7 +1990,7 @@ mod gate_tests {
                 .chat(&id, "prefiero respuestas cortas, ¿qué tal?")
                 .await
                 .unwrap();
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            gate.memory.wait_until_idle().await;
 
             assert_eq!(reply, "Hola.", "{name}");
             let seen = gate.backend.seen.lock().clone();
@@ -2125,8 +2126,8 @@ mod effective_model_tests {
     async fn chat(rig: &Rig, text: &str) {
         let id = rig.service.open(OWNER).unwrap();
         rig.service.chat_as(OWNER, &id, text).await.unwrap();
-        // Una extracción que no tendría que ocurrir tendría tiempo de ocurrir.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Una extracción que no tendría que ocurrir ya estaría tomando el permiso.
+        rig.service.memory.wait_until_idle().await;
     }
 
     async fn remembers(rig: &Rig, needle: &str) -> bool {
@@ -2258,7 +2259,7 @@ mod effective_model_tests {
             .chat_as(OWNER, &id, "prefiero el mate amargo, ¿qué tal?")
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        rig.service.memory.wait_until_idle().await;
 
         // La persona recibe su respuesta.
         assert_eq!(reply, "Hola.");
@@ -2309,7 +2310,7 @@ mod effective_model_tests {
         rig.service
             .memory
             .learn_after(backend.clone(), "c1", conversation);
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        rig.service.memory.wait_until_idle().await;
 
         assert!(backend.inner.seen.lock().is_empty(), "nada salió a la nube");
         assert_eq!(
@@ -2934,7 +2935,7 @@ mod delete_conversation_tests {
 
         service.delete_conversation_as(OWNER, &id).await.unwrap();
         gate.notify_one();
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        service.memory.wait_until_idle().await;
 
         assert_eq!(service.memory.recall("mate", true).await, None);
     }
@@ -2966,7 +2967,7 @@ mod delete_conversation_tests {
         gate.notify_one();
         // La persona igual recibe la respuesta.
         chat.await.unwrap().unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        service.memory.wait_until_idle().await;
 
         assert_eq!(backend.seen.lock().len(), 1, "sin extracción");
         assert_eq!(service.memory.recall("mate", true).await, None);

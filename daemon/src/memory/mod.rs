@@ -471,6 +471,21 @@ impl Memory {
         }
     }
 
+    /// Espera a que no haya una extracción en curso: `learn_after` toma el
+    /// permiso antes de volver, así que después de él esto es determinista.
+    /// Falla a los 5 segundos.
+    #[cfg(test)]
+    pub async fn wait_until_idle(&self) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.learning.available_permits() != 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "la extracción no terminó"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
     /// La época actual (sube con cada encender, apagar y borrar). Sólo la
     /// usan las pruebas de `store_at`.
     #[cfg(test)]
@@ -1489,7 +1504,7 @@ mod tests {
         fixture
             .memory
             .learn_after(backend.clone(), "c1", conversation.clone());
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Con el permiso tomado no se lanza nada: no hay nada que esperar.
         assert!(backend.seen.lock().is_empty());
         drop(held);
 
@@ -2182,7 +2197,7 @@ mod forget_tests {
         memory.forget_conversation("a").await;
 
         memory.learn_after(backend.clone(), "a", turn());
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        memory.wait_until_idle().await;
 
         assert!(backend.seen.lock().is_empty());
         assert_eq!(memory.recall("mate", true).await, None);
