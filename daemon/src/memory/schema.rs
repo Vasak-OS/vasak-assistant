@@ -1026,6 +1026,7 @@ mod delete_summaries_tests {
             "Hablaron de gatos",
             "a",
         );
+        let first = entries(&db, MemoryKind::ConversationSummary)[0].weight;
         add(
             &db,
             MemoryKind::ConversationSummary,
@@ -1033,7 +1034,11 @@ mod delete_summaries_tests {
             "a",
         );
 
-        assert_eq!(entries(&db, MemoryKind::ConversationSummary).len(), 1);
+        let all = entries(&db, MemoryKind::ConversationSummary);
+        assert_eq!(all.len(), 1);
+        // Reforzar sube el peso: `weight + 0.2 * (1 - weight)`.
+        assert!(all[0].weight > first, "{first} -> {}", all[0].weight);
+        assert!((all[0].weight - reinforced(first)).abs() < 1e-9);
     }
 
     #[test]

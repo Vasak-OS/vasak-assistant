@@ -183,3 +183,156 @@ impl Call {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::capture_logs;
+
+    #[test]
+    fn redact_url_deja_solo_esquema_host_y_puerto() {
+        for (raw, esperado) in [
+            ("https://api.openai.com/v1", "https://api.openai.com"),
+            ("https://api.openai.com/v1/", "https://api.openai.com"),
+            ("http://127.0.0.1:11434/", "http://127.0.0.1:11434"),
+            ("http://localhost:8080/v1?x=1#frag", "http://localhost:8080"),
+            (
+                "https://usuario:clavesecreta@api.ejemplo.com/ruta/privada?token=abc#f",
+                "https://api.ejemplo.com",
+            ),
+            ("https://solo@api.ejemplo.com", "https://api.ejemplo.com"),
+            ("  https://api.ejemplo.com/v1  ", "https://api.ejemplo.com"),
+            ("https://[::1]:8443/v1", "https://[::1]:8443"),
+            ("HTTPS://API.Ejemplo.COM/V1", "https://api.ejemplo.com"),
+        ] {
+            let redacted = redact_url(raw);
+            assert_eq!(redacted, esperado, "{raw}");
+            for secret in [
+                "usuario",
+                "clavesecreta",
+                "privada",
+                "token",
+                "abc",
+                "frag",
+                "solo@",
+            ] {
+                assert!(!redacted.contains(secret), "{raw}: {redacted}");
+            }
+        }
+    }
+
+    #[test]
+    fn redact_url_con_algo_ilegible_o_sin_host_no_muestra_nada_de_lo_que_vino() {
+        for raw in [
+            "",
+            "   ",
+            "no es una dirección",
+            "usuario:clavesecreta@ejemplo.com",
+            "file:///etc/passwd",
+            "mailto:ana@ejemplo.com?subject=secreto",
+            "https://",
+            "http://:clavesecreta@/?token=abc",
+            "data:text/plain,clavesecreta",
+        ] {
+            let redacted = redact_url(raw);
+            assert_eq!(redacted, "(dirección ilegible)", "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn short_id_deja_ocho_caracteres_seguros_de_lo_que_llegue() {
+        assert_eq!(short_id("123e4567-e89b-12d3-a456-426614174000"), "123e4567");
+        assert_eq!(short_id("abc"), "abc");
+        assert_eq!(short_id(""), "");
+        // Lo que llega por el bus puede ser cualquier cosa: nada de saltos ni comillas.
+        assert_eq!(short_id("a\nb\"c d\u{202e}e"), "abcde");
+        assert_eq!(short_id("\n\n\n"), "");
+        assert_eq!(short_id("ñandú-12345678901"), "and-1234");
+    }
+
+    #[test]
+    fn error_kind_nombra_cada_error_sin_su_texto() {
+        for (error, nombre) in [
+            (Error::Unavailable("secreto".into()), "Unavailable"),
+            (Error::Backend("secreto".into()), "Backend"),
+            (Error::InvalidArgs("secreto".into()), "InvalidArgs"),
+            (Error::NotFound("secreto".into()), "NotFound"),
+            (Error::LimitExceeded("secreto".into()), "LimitExceeded"),
+            (Error::Busy("secreto".into()), "Busy"),
+            (Error::AccessDenied("secreto".into()), "AccessDenied"),
+        ] {
+            assert_eq!(error_kind(&error), nombre);
+        }
+        assert_eq!(
+            error_kind(&Error::ZBus(zbus::Error::Failure("x".into()))),
+            "ZBus"
+        );
+    }
+
+    #[test]
+    fn el_filtro_de_bibliotecas_corta_en_info_lo_que_ven_los_cuerpos_y_deja_pasar_lo_propio() {
+        let (log, _guard) = capture_logs();
+
+        tracing::trace!(target: "zbus::connection", "cuerpo-del-bus-trace");
+        tracing::debug!(target: "zbus::connection", "cuerpo-del-bus-debug");
+        tracing::debug!(target: "hyper_util::client", "cabecera-con-la-clave");
+        tracing::trace!(target: "reqwest::connect", "url-con-clave");
+        tracing::debug!(target: "rustls::client", "handshake");
+        tracing::info!(target: "zbus::connection", "aviso-del-bus-info");
+        tracing::trace!(target: "vasak_assistant", "propio-trace");
+        tracing::debug!(target: "otra_biblioteca", "otra-debug");
+
+        let text = log.text();
+        for hidden in [
+            "cuerpo-del-bus-trace",
+            "cuerpo-del-bus-debug",
+            "cabecera-con-la-clave",
+            "url-con-clave",
+            "handshake",
+        ] {
+            assert!(!text.contains(hidden), "{hidden}\n{text}");
+        }
+        for shown in ["aviso-del-bus-info", "propio-trace", "otra-debug"] {
+            assert!(text.contains(shown), "{shown}\n{text}");
+        }
+    }
+
+    #[test]
+    fn una_llamada_atendida_va_en_debug_y_un_rechazo_en_warn_con_sus_campos() {
+        let (log, _guard) = capture_logs();
+
+        let ok = Call::method("Models").finish(Ok(1));
+        let denied: Result<(), Error> = Call::method("ClearMemory")
+            .conversation("123e4567-e89b-12d3-a456-426614174000")
+            .finish(Err(Error::AccessDenied("no se puede".into())));
+        let bus: Result<(), Error> =
+            Call::method("Chat").finish(Err(Error::ZBus(zbus::Error::Failure("roto".into()))));
+
+        assert_eq!(ok.unwrap(), 1);
+        assert!(denied.is_err() && bus.is_err());
+        let text = log.text();
+        let line = |needle: &str| {
+            text.lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("falta «{needle}»:\n{text}"))
+                .to_owned()
+        };
+        let attended = line("llamada atendida");
+        assert!(
+            attended.contains("DEBUG") && attended.contains("method=\"Models\""),
+            "{attended}"
+        );
+        let rejected = line("la llamada se rechazó");
+        assert!(rejected.contains("WARN"), "{rejected}");
+        assert!(rejected.contains("method=\"ClearMemory\""), "{rejected}");
+        assert!(rejected.contains("conversation=\"123e4567\""), "{rejected}");
+        assert!(rejected.contains("error=\"AccessDenied\""), "{rejected}");
+        assert!(rejected.contains("no se puede"), "{rejected}");
+        assert!(!rejected.contains("123e4567-e89b"), "{rejected}");
+        let failed = line("la llamada falló en el bus");
+        assert!(
+            failed.contains("ERROR") && failed.contains("error=\"ZBus\""),
+            "{failed}"
+        );
+    }
+}

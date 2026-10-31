@@ -3079,3 +3079,572 @@ mod delete_conversation_tests {
         }
     }
 }
+
+/// El registro de las llamadas D-Bus: una línea por error, con el método, el
+/// remitente y la conversación en corto, y nunca el contenido.
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+    use crate::memory::{learn::Extraction, learn::Item, schema::MemoryKind};
+    use crate::test_support::{
+        capture_logs, p2p_pair, p2p_pair_as, FakeBackend, FixedKey, FixedLabel, TempDir,
+    };
+    use vasak_assistant_protocol::{AssistantProxy, MAX_CONVERSATIONS_PER_OWNER, SERVICE_PATH};
+
+    const SENDER: &str = ":1.42";
+    const CONFINED: &[u8] = b"vasak-appimage (enforce)\0";
+
+    struct Rig {
+        _tmp: TempDir,
+        proxy: AssistantProxy<'static>,
+        memory: Arc<Memory>,
+        backend: Arc<FakeBackend>,
+        _server: Connection,
+    }
+
+    async fn rig_with(
+        labels: Arc<dyn CallerLabels>,
+        backend: FakeBackend,
+        sender: Option<&str>,
+    ) -> Rig {
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
+        let backend = Arc::new(backend);
+        let service = AssistantService {
+            backend: backend.clone(),
+            conversations: Arc::default(),
+            remote_allowed: false,
+            secrets: keys,
+            memory: memory.clone(),
+            labels,
+        };
+        let (server, client) = match sender {
+            Some(sender) => p2p_pair_as(sender, |b| b.serve_at(SERVICE_PATH, service)).await,
+            None => p2p_pair(|b| b.serve_at(SERVICE_PATH, service)).await,
+        }
+        .unwrap();
+        let proxy = AssistantProxy::builder(&client)
+            .path(SERVICE_PATH)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        Rig {
+            _tmp: tmp,
+            proxy,
+            memory,
+            backend,
+            _server: server,
+        }
+    }
+
+    async fn rig() -> Rig {
+        rig_with(
+            FixedLabel::none(),
+            FakeBackend::replying("hola"),
+            Some(SENDER),
+        )
+        .await
+    }
+
+    /// La línea del registro que tiene todos esos pedazos, o falla con todo el texto.
+    fn line(log: &crate::test_support::LogCapture, pieces: &[&str]) -> String {
+        let text = log.text();
+        text.lines()
+            .find(|l| pieces.iter().all(|piece| l.contains(piece)))
+            .unwrap_or_else(|| panic!("falta una línea con {pieces:?}:\n{text}"))
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn un_limit_exceeded_deja_su_linea_con_el_metodo_el_remitente_y_el_error() {
+        let rig = rig().await;
+        for _ in 0..MAX_CONVERSATIONS_PER_OWNER {
+            rig.proxy.new_conversation().await.unwrap();
+        }
+        let (log, _guard) = capture_logs();
+
+        let result = rig.proxy.new_conversation().await;
+
+        assert!(matches!(result, Err(Error::LimitExceeded(_))));
+        let line = line(&log, &["la llamada se rechazó", "LimitExceeded"]);
+        assert!(line.contains("WARN"), "{line}");
+        assert!(line.contains("method=\"NewConversation\""), "{line}");
+        assert!(line.contains(&format!("sender=\"{SENDER}\"")), "{line}");
+        assert!(line.contains("error=\"LimitExceeded\""), "{line}");
+    }
+
+    #[tokio::test]
+    async fn un_busy_deja_su_linea_con_la_conversacion_en_corto() {
+        let (backend, gate) = FakeBackend::gated("hola");
+        let rig = rig_with(FixedLabel::none(), backend, Some(SENDER)).await;
+        let id = rig.proxy.new_conversation().await.unwrap();
+        let (log, _guard) = capture_logs();
+
+        let first = {
+            let proxy = rig.proxy.clone();
+            let id = id.clone();
+            tokio::spawn(async move { proxy.chat(&id, "primero").await })
+        };
+        rig.backend.entered.notified().await;
+        let busy = rig.proxy.chat(&id, "segundo").await;
+        gate.notify_one();
+        first.await.unwrap().unwrap();
+
+        assert!(matches!(busy, Err(Error::Busy(_))), "{busy:?}");
+        let line = line(&log, &["la llamada se rechazó", "Busy"]);
+        assert!(line.contains("WARN"), "{line}");
+        assert!(line.contains("method=\"Chat\""), "{line}");
+        assert!(
+            line.contains(&format!("conversation=\"{}\"", &id[..8])),
+            "{line}"
+        );
+        assert!(line.contains(&format!("sender=\"{SENDER}\"")), "{line}");
+        // El id entero no se registra, y tampoco el texto del mensaje.
+        assert!(!log.text().contains(&id), "{}", log.text());
+        assert!(!log.text().contains("segundo"));
+    }
+
+    #[tokio::test]
+    async fn un_llamador_confinado_deja_la_linea_de_acceso_denegado_y_la_de_la_puerta() {
+        let rig = rig_with(
+            FixedLabel::of(CONFINED),
+            FakeBackend::replying("hola"),
+            Some(SENDER),
+        )
+        .await;
+        let (log, _guard) = capture_logs();
+
+        let result = rig.proxy.set_memory_enabled(true).await;
+
+        assert!(matches!(result, Err(Error::AccessDenied(_))));
+        let denied = line(&log, &["la llamada se rechazó", "SetMemoryEnabled"]);
+        assert!(denied.contains("WARN"), "{denied}");
+        assert!(denied.contains("error=\"AccessDenied\""), "{denied}");
+        assert!(denied.contains(&format!("sender=\"{SENDER}\"")), "{denied}");
+        let gate = line(&log, &["puerta de AppArmor"]);
+        assert!(gate.contains("DEBUG"), "{gate}");
+        assert!(gate.contains("vasak-appimage (enforce)"), "{gate}");
+        assert!(gate.contains("confined=true"), "{gate}");
+    }
+
+    #[tokio::test]
+    async fn los_cuatro_metodos_protegidos_dejan_su_linea_de_acceso_denegado() {
+        let rig = rig_with(
+            FixedLabel::of(CONFINED),
+            FakeBackend::replying("hola"),
+            Some(SENDER),
+        )
+        .await;
+        let (log, _guard) = capture_logs();
+
+        let _ = rig.proxy.set_memory_enabled(true).await;
+        let _ = rig.proxy.clear_memory().await;
+        let _ = rig
+            .proxy
+            .set_provider_key("https://api.openai.com/v1", "sk-canario")
+            .await;
+        let _ = rig
+            .proxy
+            .has_provider_key("https://api.openai.com/v1")
+            .await;
+
+        for method in [
+            "SetMemoryEnabled",
+            "ClearMemory",
+            "SetProviderKey",
+            "HasProviderKey",
+        ] {
+            let l = line(&log, &["la llamada se rechazó", method]);
+            assert!(l.contains("error=\"AccessDenied\""), "{l}");
+        }
+        assert!(!log.text().contains("sk-canario"));
+    }
+
+    #[tokio::test]
+    async fn el_chat_de_un_confinado_deja_una_linea_info_de_que_va_sin_memoria() {
+        let rig = rig_with(
+            FixedLabel::of(CONFINED),
+            FakeBackend::replying("hola"),
+            Some(SENDER),
+        )
+        .await;
+        let id = rig.proxy.new_conversation().await.unwrap();
+        let (log, _guard) = capture_logs();
+
+        rig.proxy
+            .chat(&id, "mensaje-canario-confinado")
+            .await
+            .unwrap();
+
+        let l = line(&log, &["llamador confinado: el chat va sin memoria"]);
+        assert!(l.contains("INFO"), "{l}");
+        assert!(l.contains("method=\"Chat\""), "{l}");
+        assert!(l.contains(&format!("sender=\"{SENDER}\"")), "{l}");
+        // Esta línea escribe el id corto con `%` (sin comillas).
+        assert!(l.contains(&format!("conversation={}", &id[..8])), "{l}");
+        assert!(!l.contains(&id), "{l}");
+        assert!(!log.text().contains("mensaje-canario-confinado"));
+    }
+
+    #[tokio::test]
+    async fn una_llamada_sin_remitente_deja_su_linea_con_el_remitente_ausente() {
+        let rig = rig_with(FixedLabel::none(), FakeBackend::replying("hola"), None).await;
+        let (log, _guard) = capture_logs();
+
+        let result = rig.proxy.status().await;
+
+        assert!(matches!(result, Err(Error::AccessDenied(_))));
+        let l = line(&log, &["la llamada se rechazó", "Status"]);
+        assert!(l.contains("WARN"), "{l}");
+        assert!(l.contains("sender=\"(sin remitente)\""), "{l}");
+        assert!(l.contains("error=\"AccessDenied\""), "{l}");
+        assert!(l.contains("remitente"), "{l}");
+    }
+
+    #[tokio::test]
+    async fn lo_que_sale_bien_va_en_debug_con_el_metodo_y_nada_en_info() {
+        let rig = rig().await;
+        let (log, _guard) = capture_logs();
+
+        let id = rig.proxy.new_conversation().await.unwrap();
+        rig.proxy.chat(&id, "hola").await.unwrap();
+
+        let l = line(&log, &["llamada atendida", "NewConversation"]);
+        assert!(
+            l.contains("DEBUG") && l.contains(&format!("sender=\"{SENDER}\"")),
+            "{l}"
+        );
+        assert!(l.contains(&format!("conversation=\"{}\"", &id[..8])), "{l}");
+        line(&log, &["llamada atendida", "Chat"]);
+        assert!(
+            !log.text()
+                .lines()
+                .any(|l| l.contains(" WARN ") || l.contains(" ERROR ")),
+            "{}",
+            log.text()
+        );
+    }
+
+    #[tokio::test]
+    async fn encender_apagar_y_borrar_la_memoria_dejan_su_linea_info() {
+        let rig = rig().await;
+        let (log, _guard) = capture_logs();
+
+        rig.proxy.set_memory_enabled(true).await.unwrap();
+        let on = line(&log, &["memoria encendida"]);
+        assert!(on.contains("INFO") && on.contains("created=true"), "{on}");
+        // Encender otra vez no cambia nada y no escribe otra línea.
+        rig.proxy.set_memory_enabled(true).await.unwrap();
+        assert_eq!(log.text().matches("memoria encendida").count(), 1);
+
+        rig.proxy.clear_memory().await.unwrap();
+        let cleared = line(&log, &["memoria borrada"]);
+        assert!(
+            cleared.contains("INFO") && cleared.contains("recreated=true"),
+            "{cleared}"
+        );
+
+        rig.proxy.set_memory_enabled(false).await.unwrap();
+        let off = line(&log, &["memoria apagada"]);
+        assert!(off.contains("INFO"), "{off}");
+
+        rig.proxy.clear_memory().await.unwrap();
+        assert!(log.text().contains("recreated=false"), "{}", log.text());
+    }
+
+    #[tokio::test]
+    async fn guardar_la_clave_registra_solo_el_origen_sin_usuario_ruta_ni_consulta() {
+        let rig = rig().await;
+        let (log, _guard) = capture_logs();
+
+        rig.proxy
+            .set_provider_key("https://api.openai.com/v1", "sk-canarioclaveqzx")
+            .await
+            .unwrap();
+
+        let l = line(&log, &["se guardó la clave del proveedor"]);
+        assert!(l.contains("INFO"), "{l}");
+        assert!(l.contains("origin=https://api.openai.com"), "{l}");
+        assert!(!l.contains("/v1"), "{l}");
+        assert!(!log.text().contains("canarioclaveqzx"));
+    }
+
+    #[tokio::test]
+    async fn una_clave_con_una_direccion_con_usuario_y_consulta_no_las_repite_en_ningun_nivel() {
+        let rig = rig().await;
+        let (log, _guard) = capture_logs();
+
+        for url in [
+            "https://usuariocanario:clavecanario@api.ejemplo.com/v1?token=consultacanaria",
+            "http://usuariocanario:clavecanario@api.ejemplo.com/v1?token=consultacanaria",
+            "usuariocanario:clavecanario@api.ejemplo.com/v1?token=consultacanaria",
+        ] {
+            let _ = rig.proxy.set_provider_key(url, "sk-canarioclaveqzx").await;
+            let _ = rig.proxy.has_provider_key(url).await;
+        }
+
+        let text = log.text();
+        for secret in [
+            "usuariocanario",
+            "clavecanario",
+            "consultacanaria",
+            "canarioclaveqzx",
+        ] {
+            assert!(!text.contains(secret), "{secret}:\n{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn un_extra_de_memoria_con_recuerdos_no_se_vuelca_al_registro_al_leerlos() {
+        // Recordar y borrar la memoria no deja el texto de los recuerdos.
+        let rig = rig().await;
+        rig.memory.set_enabled(true).await.unwrap();
+        let (log, _guard) = capture_logs();
+        rig.memory
+            .store(
+                Extraction {
+                    items: vec![Item {
+                        kind: MemoryKind::Preference,
+                        text: "Prefiere notacanariaqzx".into(),
+                        phrase: None,
+                        topics: Vec::new(),
+                    }],
+                    summary: Some("resumencanarioqzx".into()),
+                },
+                "c1",
+            )
+            .await
+            .unwrap();
+
+        rig.memory.recall("notacanariaqzx", true).await.unwrap();
+        rig.memory.forget_conversation("c1").await;
+        rig.proxy.clear_memory().await.unwrap();
+
+        let text = log.text();
+        assert!(
+            !text.contains("notacanariaqzx") && !text.contains("resumencanarioqzx"),
+            "{text}"
+        );
+    }
+}
+
+/// Privacidad del registro: un chat completo con memoria, aprendizaje,
+/// extracción y errores no deja en ningún nivel (hasta `trace`) el texto de los
+/// mensajes, las respuestas, las notas, los recuerdos, los resúmenes, las
+/// claves ni las direcciones con usuario o consulta.
+#[cfg(test)]
+mod privacy_tests {
+    use super::*;
+    use crate::backend::Limited;
+    use crate::memory::{learn::Extraction, learn::Item, schema::MemoryKind};
+    use crate::ollama::OllamaBackend;
+    use crate::openai::OpenAiBackend;
+    use crate::test_support::{
+        capture_logs, client, local_selection, FakeServer, FixedKey, FixedLabel, Reply, TempDir,
+    };
+
+    const OWNER: &str = ":1.7";
+    const TAGS: &str = r#"{"models":[{"name":"llama3.2:latest"}]}"#;
+
+    /// Cada texto de la persona o de la memoria lleva su propio canario.
+    const CANARIES: [&str; 8] = [
+        "mensajecanarioqzx",
+        "respuestacanariaqzx",
+        "notacanariaqzx",
+        "resumencanarioqzx",
+        "recuerdocanarioqzx",
+        "segundocanarioqzx",
+        "cuerpocanarioqzx",
+        "clavecanariaqzx",
+    ];
+
+    fn extraction_reply() -> &'static str {
+        r#"{"message":{"role":"assistant","content":"{\"items\":[{\"kind\":\"preference\",\"text\":\"Prefiere recuerdocanarioqzx\"}],\"summary\":null}"}}"#
+    }
+
+    async fn seeded(memory: &Memory) {
+        memory.set_enabled(true).await.unwrap();
+        memory
+            .store(
+                Extraction {
+                    items: vec![Item {
+                        kind: MemoryKind::Preference,
+                        text: "Prefiere notacanariaqzx".into(),
+                        phrase: None,
+                        topics: Vec::new(),
+                    }],
+                    summary: Some("resumencanarioqzx".into()),
+                },
+                "vieja",
+            )
+            .await
+            .unwrap();
+    }
+
+    fn assert_clean(text: &str) {
+        for canary in CANARIES {
+            assert!(!text.contains(canary), "{canary} en el registro:\n{text}");
+        }
+        for secret in ["Bearer", "usuariocanario", "consultacanaria"] {
+            assert!(!text.contains(secret), "{secret} en el registro:\n{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn un_chat_completo_con_ollama_memoria_extraccion_y_errores_no_deja_ningun_contenido() {
+        let status = Arc::new(parking_lot::Mutex::new(200u16));
+        let current = status.clone();
+        let server = FakeServer::start(move |pedido| match pedido.path.as_str() {
+            "/api/tags" => Reply::json(TAGS),
+            "/api/chat" if *current.lock() != 200 => {
+                Reply::new(*current.lock(), "cuerpocanarioqzx clavecanariaqzx")
+            }
+            "/api/chat" => {
+                if String::from_utf8_lossy(&pedido.body).contains("Extraés recuerdos") {
+                    Reply::json(extraction_reply())
+                } else {
+                    Reply::json(
+                        r#"{"message":{"role":"assistant","content":"respuestacanariaqzx"}}"#,
+                    )
+                }
+            }
+            _ => Reply::status(404),
+        })
+        .await;
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(Some("clavecanariaqzx"));
+        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
+        seeded(&memory).await;
+        let service = AssistantService {
+            backend: Arc::new(Limited::new(Arc::new(OllamaBackend::new(
+                client(),
+                local_selection("ollama", &server.url(""), None),
+                false,
+            )))),
+            conversations: Arc::default(),
+            remote_allowed: false,
+            secrets: keys,
+            memory: memory.clone(),
+            labels: FixedLabel::none(),
+        };
+        let (log, _guard) = capture_logs();
+
+        let id = service.open(OWNER).unwrap();
+        service
+            .chat_as(OWNER, &id, "prefiero mensajecanarioqzx")
+            .await
+            .unwrap();
+        memory.wait_until_idle().await;
+        service
+            .chat_as(OWNER, &id, "además segundocanarioqzx")
+            .await
+            .unwrap();
+        memory.wait_until_idle().await;
+        // Errores: el servidor falla, una conversación que no existe, el borrado.
+        *status.lock() = 500;
+        service
+            .chat_as(OWNER, &id, "prefiero mensajecanarioqzx otra vez")
+            .await
+            .unwrap_err();
+        service
+            .chat_as(
+                OWNER,
+                "00000000-0000-4000-8000-000000000000",
+                "mensajecanarioqzx",
+            )
+            .await
+            .unwrap_err();
+        service.delete_conversation_as(OWNER, &id).await.unwrap();
+        service.memory_status_now().await;
+
+        let text = log.text();
+        // Hay registro de verdad (de debug para arriba), y está limpio.
+        assert!(text.contains("DEBUG") && text.contains("WARN"), "{text}");
+        assert!(
+            text.contains("respuesta HTTP") && text.contains("se guardaron recuerdos"),
+            "{text}"
+        );
+        assert_clean(&text);
+    }
+
+    #[tokio::test]
+    async fn un_chat_con_openai_y_clave_no_deja_la_clave_ni_la_cabecera_en_ningun_nivel() {
+        let server = FakeServer::start(|pedido| match pedido.path.as_str() {
+            "/v1/models" => Reply::json(r#"{"data":[{"id":"modelo-a"}]}"#),
+            "/v1/chat/completions" => Reply::json(
+                r#"{"choices":[{"message":{"role":"assistant","content":"respuestacanariaqzx"}}]}"#,
+            ),
+            _ => Reply::status(404),
+        })
+        .await;
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(Some("sk-clavecanariaqzx"));
+        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
+        seeded(&memory).await;
+        let service = AssistantService {
+            backend: Arc::new(Limited::new(Arc::new(OpenAiBackend::new(
+                client(),
+                local_selection("openai", &server.url("/v1"), Some("modelo-a")),
+                keys.clone(),
+            )))),
+            conversations: Arc::default(),
+            remote_allowed: false,
+            secrets: keys,
+            memory: memory.clone(),
+            labels: FixedLabel::none(),
+        };
+        let (log, _guard) = capture_logs();
+
+        let id = service.open(OWNER).unwrap();
+        service
+            .chat_as(OWNER, &id, "prefiero mensajecanarioqzx")
+            .await
+            .unwrap();
+        memory.wait_until_idle().await;
+        service.status_for(OWNER).await;
+
+        let text = log.text();
+        assert!(text.contains("respuesta HTTP"), "{text}");
+        assert_clean(&text);
+    }
+
+    #[tokio::test]
+    async fn los_errores_del_servicio_con_texto_de_la_persona_no_lo_repiten() {
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
+        let service = AssistantService {
+            backend: Arc::new(crate::test_support::FakeBackend::replying(
+                "respuestacanariaqzx",
+            )),
+            conversations: Arc::default(),
+            remote_allowed: false,
+            secrets: keys,
+            memory,
+            labels: FixedLabel::none(),
+        };
+        let (log, _guard) = capture_logs();
+
+        // Un mensaje demasiado largo, vacío, un id que no es un uuid y una dirección inválida.
+        let id = service.open(OWNER).unwrap();
+        let _ = service
+            .chat_as(
+                OWNER,
+                &id,
+                &format!("mensajecanarioqzx{}", "x".repeat(40_000)),
+            )
+            .await;
+        let _ = service.chat_as(OWNER, &id, "").await;
+        let _ = service.chat_as(OWNER, "mensajecanarioqzx", "hola").await;
+        let _ = service
+            .store_provider_key(
+                "https://usuariocanario:clavecanariaqzx@x.com/?q=consultacanaria",
+                "clavecanariaqzx",
+            )
+            .await;
+
+        assert_clean(&log.text());
+    }
+}

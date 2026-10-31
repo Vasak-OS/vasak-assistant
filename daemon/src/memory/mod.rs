@@ -2407,3 +2407,264 @@ mod forget_tests {
         assert!(memory.in_flight.lock().is_none());
     }
 }
+
+/// El registro de la memoria: cada camino de error deja su línea, con el nivel
+/// que corresponde, y nunca el texto de un recuerdo.
+#[cfg(test)]
+mod log_tests {
+    use super::learn::Item;
+    use super::*;
+    use crate::test_support::{
+        capture_logs, FakeBackend, FixedKey, LogCapture, ScriptedBackend, TempDir,
+    };
+
+    fn line(log: &LogCapture, pieces: &[&str]) -> String {
+        let text = log.text();
+        text.lines()
+            .find(|l| pieces.iter().all(|piece| l.contains(piece)))
+            .unwrap_or_else(|| panic!("falta una línea con {pieces:?}:\n{text}"))
+            .to_owned()
+    }
+
+    async fn enabled() -> (TempDir, Arc<FixedKey>, Arc<Memory>) {
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
+        memory.set_enabled(true).await.unwrap();
+        (tmp, keys, memory)
+    }
+
+    fn preference(text: &str) -> Extraction {
+        Extraction {
+            items: vec![Item {
+                kind: MemoryKind::Preference,
+                text: text.into(),
+                phrase: None,
+                topics: Vec::new(),
+            }],
+            summary: None,
+        }
+    }
+
+    fn turn() -> Vec<Message> {
+        vec![
+            Message {
+                role: Role::User,
+                content: "prefiero mensajecanarioqzx".into(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: "respuestacanariaqzx".into(),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn una_cabecera_invalida_deja_la_linea_warn_de_que_no_se_pudo_abrir() {
+        let (tmp, keys, memory) = enabled().await;
+        memory.close().await;
+        std::fs::write(tmp.memory_dir().join(DB_FILE), b"esto no es una base").unwrap();
+        let broken = Memory::new(Some(tmp.memory_dir()), keys);
+        let (log, _guard) = capture_logs();
+
+        let status = broken.status().await;
+
+        assert_eq!(status.reason, REASON_NOT_OPENED);
+        let l = line(&log, &["no se pudo abrir la memoria"]);
+        assert!(l.contains("WARN"), "{l}");
+    }
+
+    // Falla hoy: con la llave ausente (o bloqueada, duplicada o inválida) la
+    // memoria queda no disponible y el motivo sólo llega a quien pregunta el
+    // estado; el journal no dice nada. Se quita el `ignore` al arreglarlo.
+    #[tokio::test]
+    #[ignore = "bug: la llave ausente no deja ninguna línea en el registro"]
+    async fn una_llave_ausente_deja_su_linea_al_intentar_abrir_la_memoria() {
+        let (tmp, keys, memory) = enabled().await;
+        memory.close().await;
+        *keys.memory_key.lock() = None;
+        let broken = Memory::new(Some(tmp.memory_dir()), keys);
+        let (log, _guard) = capture_logs();
+
+        let status = broken.status().await;
+
+        assert_eq!(status.reason, REASON_MISSING_KEY);
+        let l = line(&log, &["WARN"]);
+        assert!(l.contains("llave"), "{l}");
+    }
+
+    #[tokio::test]
+    async fn una_extraccion_que_falla_deja_su_linea_warn_con_la_conversacion_en_corto() {
+        let (_tmp, _keys, memory) = enabled().await;
+        let backend = Arc::new(FakeBackend::failing(
+            crate::backend::BackendError::Unavailable("el modelo se cayó".into()),
+        ));
+        let (log, _guard) = capture_logs();
+
+        memory.learn_after(
+            backend.clone(),
+            "123e4567-e89b-12d3-a456-426614174000",
+            turn(),
+        );
+        memory.wait_until_idle().await;
+
+        let l = line(&log, &["la extracción de recuerdos no respondió"]);
+        assert!(
+            l.contains("WARN") && l.contains("conversation=123e4567"),
+            "{l}"
+        );
+        assert!(!l.contains("e89b"), "{l}");
+        let text = log.text();
+        assert!(!text.contains("mensajecanarioqzx") && !text.contains("respuestacanariaqzx"));
+    }
+
+    #[tokio::test]
+    async fn una_extraccion_que_guarda_o_que_no_trae_nada_va_en_debug_sin_el_contenido() {
+        let (_tmp, _keys, memory) = enabled().await;
+        let saved = ScriptedBackend::new([
+            r#"{"items":[{"kind":"preference","text":"Prefiere recuerdocanarioqzx"}],"summary":null}"#,
+        ]);
+        let (log, _guard) = capture_logs();
+
+        memory.learn_after(saved.clone(), "c1", turn());
+        memory.wait_until_idle().await;
+        let l = line(&log, &["se guardaron recuerdos"]);
+        assert!(
+            l.contains("DEBUG") && l.contains("items=1") && l.contains("summary=false"),
+            "{l}"
+        );
+
+        let empty = ScriptedBackend::new([r#"{"items":[],"summary":null}"#]);
+        memory.learn_after(empty.clone(), "c2", turn());
+        memory.wait_until_idle().await;
+        let l = line(&log, &["la extracción no trajo nada que recordar"]);
+        assert!(l.contains("DEBUG"), "{l}");
+        assert!(!log.text().contains("recuerdocanarioqzx"));
+    }
+
+    #[tokio::test]
+    async fn un_descarte_esperable_va_en_debug_y_no_en_warn() {
+        let (_tmp, _keys, memory) = enabled().await;
+        let backend = ScriptedBackend::new([
+            r#"{"items":[{"kind":"preference","text":"Prefiere el mate"}],"summary":null}"#,
+        ]);
+        memory.forget_conversation("c1").await;
+        let (log, _guard) = capture_logs();
+
+        memory
+            .store_at(preference("Prefiere el mate"), "c1", memory.epoch())
+            .await
+            .unwrap_err();
+        memory.learn_after(backend, "c1", turn());
+        memory.wait_until_idle().await;
+
+        assert!(!log.text().contains(" WARN "), "{}", log.text());
+    }
+
+    #[tokio::test]
+    async fn pasado_el_tope_se_poda_y_se_dice_en_info_y_despues_en_warn_y_en_debug() {
+        let (tmp, _keys, memory) = enabled().await;
+        for n in 0..10 {
+            memory
+                .store(preference(&format!("Prefiere la cosa número {n}")), "c")
+                .await
+                .unwrap();
+        }
+        std::fs::write(
+            tmp.memory_dir().join("relleno"),
+            vec![0u8; MAX_MEMORY_DISK_BYTES as usize + 1],
+        )
+        .unwrap();
+        let db = memory.database().await.unwrap();
+        let pruned = AtomicBool::new(false);
+        let (log, _guard) = capture_logs();
+
+        // `write` corre acá, en el hilo de la prueba, donde se captura el registro.
+        write(
+            &db,
+            &tmp.memory_dir(),
+            &preference("Prefiere lo nuevo"),
+            "c",
+            &pruned,
+        )
+        .unwrap();
+        write(
+            &db,
+            &tmp.memory_dir(),
+            &preference("Prefiere lo otro"),
+            "c",
+            &pruned,
+        )
+        .unwrap();
+
+        let pruning = line(&log, &["la memoria pasó su tope de espacio"]);
+        assert!(
+            pruning.contains("INFO") && pruning.contains("max=4194304"),
+            "{pruning}"
+        );
+        assert!(pruning.contains("bytes="), "{pruning}");
+        let full = line(&log, &["la memoria llegó a su tope de espacio"]);
+        assert!(full.contains("WARN"), "{full}");
+        let still = line(&log, &["la memoria sigue pasada de su tope"]);
+        assert!(still.contains("DEBUG"), "{still}");
+        // Una sola poda por episodio.
+        assert_eq!(log.text().matches("la memoria pasó su tope").count(), 1);
+        assert!(!log.text().contains("Prefiere lo nuevo"));
+    }
+
+    #[tokio::test]
+    async fn olvidar_una_conversacion_con_la_memoria_que_no_abre_deja_una_linea_warn() {
+        let (tmp, _keys, memory) = enabled().await;
+        memory.close().await;
+        let keys = FixedKey::new(None);
+        let broken = Memory::new(Some(tmp.memory_dir()), keys);
+        let (log, _guard) = capture_logs();
+
+        broken.forget_conversation("c1").await;
+
+        let l = line(&log, &["no se borraron los resúmenes de la conversación"]);
+        assert!(l.contains("WARN"), "{l}");
+    }
+
+    #[tokio::test]
+    async fn borrar_los_resumenes_deja_una_linea_debug_con_cuantos() {
+        let (_tmp, _keys, memory) = enabled().await;
+        memory
+            .store(
+                Extraction {
+                    items: Vec::new(),
+                    summary: Some("Resumen canario qzx".into()),
+                },
+                "123e4567-e89b-12d3-a456-426614174000",
+            )
+            .await
+            .unwrap();
+        let (log, _guard) = capture_logs();
+
+        memory
+            .forget_conversation("123e4567-e89b-12d3-a456-426614174000")
+            .await;
+
+        let l = line(&log, &["se borraron los resúmenes de la conversación"]);
+        assert!(
+            l.contains("DEBUG") && l.contains("deleted=1") && l.contains("conversation=123e4567"),
+            "{l}"
+        );
+        assert!(!log.text().contains("canario qzx"));
+    }
+
+    #[tokio::test]
+    async fn encender_con_el_llavero_caido_y_crear_con_una_llave_que_no_se_relee_dejan_su_warn() {
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        *keys.duplicated.lock() = true;
+        let memory = Memory::new(Some(tmp.memory_dir()), keys);
+        let (log, _guard) = capture_logs();
+
+        let result = memory.set_enabled(true).await;
+
+        assert!(result.is_err());
+        let l = line(&log, &["la llave de la memoria no se pudo releer"]);
+        assert!(l.contains("WARN"), "{l}");
+    }
+}

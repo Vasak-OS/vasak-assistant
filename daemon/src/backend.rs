@@ -450,3 +450,243 @@ mod tests {
         assert_eq!(local.seen.lock().len(), 1);
     }
 }
+
+/// El registro de los pedidos a los backends: el proveedor, la operación, la
+/// duración y el motivo, nunca los mensajes ni la dirección entera.
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+    use crate::ollama::OllamaBackend;
+    use crate::openai::OpenAiBackend;
+    use crate::test_support::{
+        capture_logs, client, closed_port_url, local_selection, FakeServer, FixedKey, LogCapture,
+        Reply, ScriptedBackend,
+    };
+    use vasak_assistant_protocol::Role;
+
+    const TAGS: &str = r#"{"models":[{"name":"llama3.2:latest"}]}"#;
+    const CHAT: &str = r#"{"message":{"role":"assistant","content":"respuesta-canario-qzx"}}"#;
+    const MODELS: &str = r#"{"data":[{"id":"modelo-a"}]}"#;
+    const COMPLETION: &str =
+        r#"{"choices":[{"message":{"role":"assistant","content":"respuesta-canario-qzx"}}]}"#;
+
+    fn user(text: &str) -> Vec<Message> {
+        vec![Message {
+            role: Role::User,
+            content: text.into(),
+        }]
+    }
+
+    fn line(log: &LogCapture, pieces: &[&str]) -> String {
+        let text = log.text();
+        text.lines()
+            .find(|l| pieces.iter().all(|piece| l.contains(piece)))
+            .unwrap_or_else(|| panic!("falta una línea con {pieces:?}:\n{text}"))
+            .to_owned()
+    }
+
+    fn limited_ollama(server: &FakeServer, model: Option<&str>) -> Limited {
+        Limited::new(Arc::new(OllamaBackend::new(
+            client(),
+            local_selection("ollama", &server.url(""), model),
+            false,
+        )))
+    }
+
+    async fn ollama(chat: impl Fn() -> Reply + Send + Sync + 'static) -> FakeServer {
+        FakeServer::start(move |pedido| match pedido.path.as_str() {
+            "/api/tags" => Reply::json(TAGS),
+            "/api/chat" => chat(),
+            _ => Reply::status(404),
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn un_pedido_que_sale_bien_deja_proveedor_operacion_status_y_duracion_en_debug() {
+        let server = ollama(|| Reply::json(CHAT)).await;
+        let backend = limited_ollama(&server, None);
+        let (log, _guard) = capture_logs();
+
+        backend.chat(&user("mensaje-canario-qzx")).await.unwrap();
+
+        let l = line(&log, &["pedido al modelo", "operation=\"chat\""]);
+        assert!(
+            l.contains("DEBUG") && l.contains("backend=\"ollama\""),
+            "{l}"
+        );
+        assert!(l.contains(" ms="), "{l}");
+        let http = line(&log, &["respuesta HTTP", "api/chat"]);
+        assert!(
+            http.contains("status=200") && http.contains("model=\"llama3.2:latest\""),
+            "{http}"
+        );
+        let text = log.text();
+        assert!(!text.contains("mensaje-canario-qzx") && !text.contains("respuesta-canario-qzx"));
+    }
+
+    #[tokio::test]
+    async fn un_error_http_deja_su_linea_warn_con_el_status() {
+        for status in [500u16, 503, 401] {
+            let server = ollama(move || {
+                let mut reply = Reply::new(status, "cuerpo-canario-qzx con clave-canario-qzx");
+                reply
+                    .headers
+                    .push(("content-type".into(), "text/plain".into()));
+                reply
+            })
+            .await;
+            let backend = limited_ollama(&server, None);
+            let (log, _guard) = capture_logs();
+
+            let error = backend
+                .chat(&user("mensaje-canario-qzx"))
+                .await
+                .unwrap_err();
+
+            assert!(matches!(error, BackendError::Failed(_)), "{error:?}");
+            let l = line(&log, &["el pedido al modelo falló", "operation=\"chat\""]);
+            assert!(l.contains("WARN") && l.contains("error=\"Failed\""), "{l}");
+            assert!(l.contains(&status.to_string()), "{l}");
+            assert!(l.contains("backend=\"ollama\""), "{l}");
+            let http = line(&log, &["respuesta HTTP", "api/chat"]);
+            assert!(http.contains(&format!("status={status}")), "{http}");
+            let text = log.text();
+            for secret in [
+                "cuerpo-canario-qzx",
+                "clave-canario-qzx",
+                "mensaje-canario-qzx",
+            ] {
+                assert!(!text.contains(secret), "{secret}:\n{text}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn un_backend_que_no_responde_deja_su_linea_warn_sin_la_direccion_entera() {
+        let url = closed_port_url();
+        let backend = Limited::new(Arc::new(OllamaBackend::new(
+            client(),
+            local_selection("ollama", &url, None),
+            false,
+        )));
+        let (log, _guard) = capture_logs();
+
+        let error = backend.models().await.unwrap_err();
+
+        assert!(matches!(error, BackendError::Unavailable(_)), "{error:?}");
+        let l = line(
+            &log,
+            &["el modelo no está disponible", "operation=\"models\""],
+        );
+        assert!(
+            l.contains("WARN") && l.contains("error=\"Unavailable\""),
+            "{l}"
+        );
+        assert!(l.contains("backend=\"ollama\""), "{l}");
+        // Nunca una ruta ni una consulta.
+        assert!(!l.contains("/api/"), "{l}");
+    }
+
+    #[tokio::test]
+    async fn la_resolucion_del_modelo_deja_su_linea_aunque_falle() {
+        let server = ollama(|| Reply::json(CHAT)).await;
+        // El modelo configurado no está instalado.
+        let backend = limited_ollama(&server, Some("no-esta:1b"));
+        let (log, _guard) = capture_logs();
+
+        let error = backend.active_model().await.unwrap_err();
+
+        assert!(matches!(error, BackendError::Unavailable(_)), "{error:?}");
+        let l = line(
+            &log,
+            &["el modelo no está disponible", "operation=\"active_model\""],
+        );
+        assert!(l.contains("WARN") && l.contains("no-esta:1b"), "{l}");
+
+        let ok = limited_ollama(&server, None);
+        let (log, _guard) = capture_logs();
+        ok.active_model().await.unwrap();
+        let l = line(&log, &["pedido al modelo", "operation=\"active_model\""]);
+        assert!(l.contains("DEBUG"), "{l}");
+    }
+
+    #[tokio::test]
+    async fn el_rechazo_de_chat_local_only_va_en_debug_y_no_es_una_advertencia() {
+        let backend = Limited::new(ScriptedBackend::cloud_by_default(["no"]));
+        let (log, _guard) = capture_logs();
+
+        let error = backend.chat_local_only(&user("hola")).await.unwrap_err();
+
+        assert!(is_not_local(&error));
+        let l = line(
+            &log,
+            &[
+                "el modelo no es local: no se mandó",
+                "operation=\"chat_local_only\"",
+            ],
+        );
+        assert!(l.contains("DEBUG"), "{l}");
+        assert!(!log.text().contains(" WARN "), "{}", log.text());
+    }
+
+    #[tokio::test]
+    async fn openai_registra_la_ruta_sin_consulta_y_nunca_la_clave() {
+        let server = FakeServer::start(|pedido| match pedido.path.as_str() {
+            "/v1/models" => Reply::json(MODELS),
+            "/v1/chat/completions" => Reply::json(COMPLETION),
+            _ => Reply::status(404),
+        })
+        .await;
+        let backend = Limited::new(Arc::new(OpenAiBackend::new(
+            client(),
+            local_selection("openai", &server.url("/v1"), Some("modelo-a")),
+            FixedKey::new(Some("sk-clave-canario-qzx")),
+        )));
+        let (log, _guard) = capture_logs();
+
+        backend.chat(&user("mensaje-canario-qzx")).await.unwrap();
+
+        let http = line(&log, &["respuesta HTTP", "backend=\"openai\""]);
+        assert!(
+            http.contains("path=\"/v1/chat/completions\"") && http.contains("status=200"),
+            "{http}"
+        );
+        let text = log.text();
+        for secret in [
+            "clave-canario-qzx",
+            "mensaje-canario-qzx",
+            "respuesta-canario-qzx",
+            "Bearer",
+        ] {
+            assert!(!text.contains(secret), "{secret}:\n{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn una_direccion_con_usuario_clave_y_consulta_no_se_repite_en_un_error_de_conexion() {
+        let port_url = closed_port_url();
+        let mut selection = local_selection("ollama", &port_url, None);
+        selection.url = reqwest::Url::parse(&format!(
+            "{}",
+            port_url.replacen("http://", "http://usuariocanario:clavecanaria@", 1)
+        ))
+        .unwrap();
+        selection.url.set_query(Some("token=consultacanaria"));
+        let backend = Limited::new(Arc::new(OllamaBackend::new(client(), selection, false)));
+        let (log, _guard) = capture_logs();
+
+        let _ = backend.models().await;
+        let _ = backend.chat(&user("hola")).await;
+        let _ = backend.active_model().await;
+
+        let text = log.text();
+        for secret in ["usuariocanario", "clavecanaria", "consultacanaria"] {
+            assert!(!text.contains(secret), "{secret}:\n{text}");
+        }
+        assert!(
+            text.contains(" WARN "),
+            "tiene que haber dejado sus líneas:\n{text}"
+        );
+    }
+}
