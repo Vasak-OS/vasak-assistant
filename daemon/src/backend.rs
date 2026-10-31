@@ -689,4 +689,25 @@ mod log_tests {
             "tiene que haber dejado sus líneas:\n{text}"
         );
     }
+
+    #[tokio::test]
+    async fn una_direccion_con_usuario_clave_y_consulta_no_se_repite_en_un_pedido_que_si_sale() {
+        let server = ollama(|| Reply::json(CHAT)).await;
+        let mut selection = local_selection("ollama", &server.url(""), None);
+        selection.url.set_username("usuariocanario").unwrap();
+        selection.url.set_password(Some("clavecanaria")).unwrap();
+        selection.url.set_query(Some("token=consultacanaria"));
+        let backend = Limited::new(Arc::new(OllamaBackend::new(client(), selection, false)));
+        let (log, _guard) = capture_logs();
+
+        backend.models().await.unwrap();
+        backend.chat(&user("hola")).await.unwrap();
+        backend.active_model().await.unwrap();
+
+        let text = log.text();
+        assert!(text.contains("respuesta HTTP"), "{text}");
+        for secret in ["usuariocanario", "clavecanaria", "consultacanaria"] {
+            assert!(!text.contains(secret), "{secret}:\n{text}");
+        }
+    }
 }
