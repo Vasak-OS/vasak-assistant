@@ -52,7 +52,6 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::fmt::Display;
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
@@ -147,6 +146,9 @@ pub struct Memory {
     /// Si ya se podó en el episodio actual sobre [`MAX_MEMORY_DISK_BYTES`].
     /// Se limpia cuando la base vuelve a estar dentro del tope.
     pruned_over_limit: Arc<AtomicBool>,
+    /// El último motivo por el que no se pudo abrir la base, para registrarlo
+    /// sólo cuando cambia.
+    last_open_problem: parking_lot::Mutex<Option<&'static str>>,
     /// Las conversaciones borradas hace poco (`DeleteConversation`): lo que
     /// llegue de una extracción de alguna de ellas se descarta en
     /// [`Self::store_at`], bajo el candado. Hace de época por conversación:
@@ -197,6 +199,7 @@ impl Memory {
             epoch: AtomicU64::new(0),
             windows: parking_lot::Mutex::default(),
             pruned_over_limit: Arc::default(),
+            last_open_problem: parking_lot::Mutex::default(),
             forgotten: parking_lot::Mutex::default(),
         }
     }
@@ -451,7 +454,7 @@ impl Memory {
         let db = self.usable(dir, &mut guard).await?;
         let (dir, conversation_id) = (dir.clone(), conversation_id.to_owned());
         let pruned = self.pruned_over_limit.clone();
-        blocking(move || write(&db, &dir, &extraction, &conversation_id, &pruned).map_err(text))
+        blocking(move || write(&db, &dir, &extraction, &conversation_id, &pruned).map_err(db_error))
             .await
             .inspect_err(|error| tracing::warn!("no se pudo escribir en la memoria: {error}"))
     }
@@ -496,7 +499,7 @@ impl Memory {
         let Some(db) = db.clone() else { return };
         let id = conversation_id.to_owned();
         let short = short_id(conversation_id);
-        match blocking(move || schema::delete_summaries(&db, &id).map_err(text)).await {
+        match blocking(move || schema::delete_summaries(&db, &id).map_err(db_error)).await {
             Ok(deleted) => tracing::debug!(
                 conversation = %short,
                 deleted,
@@ -611,7 +614,8 @@ impl Memory {
         self.secrets.delete_memory_key().await?;
         close(db.take()).await;
         let target = dir.to_owned();
-        blocking(move || remove_files(&target).map_err(text))
+        let shown = target.clone();
+        blocking(move || remove_files(&target).map_err(io_error(&shown)))
             .await
             .map_err(|error| {
                 Error::Unavailable(format!("No se pudo borrar la memoria: {error}"))
@@ -626,6 +630,31 @@ impl Memory {
 
     /// Abre la base si no lo está. Nunca crea ni borra nada.
     async fn ensure_open(
+        &self,
+        dir: &Path,
+        db: &mut Option<Arc<GrafeoDB>>,
+    ) -> Result<(), &'static str> {
+        let result = self.open_now(dir, db).await;
+        // Una línea la primera vez y cada vez que cambia el motivo: el estado y
+        // cada `recall` vuelven a intentarlo, y no hace falta repetirla. El
+        // motivo es un texto fijo, sin la llave.
+        let mut last = self.last_open_problem.lock();
+        match result {
+            Err(reason) if *last != Some(reason) => {
+                tracing::warn!("la memoria no se puede abrir: {reason}");
+                *last = Some(reason);
+            }
+            Ok(()) if last.is_some() => {
+                tracing::info!("la memoria se abrió");
+                *last = None;
+            }
+            _ => {}
+        }
+        result
+    }
+
+    /// Abre la base si no lo está, sin registrar el motivo de no poder.
+    async fn open_now(
         &self,
         dir: &Path,
         db: &mut Option<Arc<GrafeoDB>>,
@@ -736,8 +765,17 @@ fn locked() -> Error {
     ))
 }
 
-fn text(error: impl Display) -> String {
-    error.to_string()
+/// Lo que se cuenta de un error de Grafeo: sólo su código (`GRAFEO-X002`).
+/// El texto de algunas variantes es libre y podría traer un valor guardado, y
+/// eso quedaría en claro en el registro o en un mensaje, fuera del cifrado.
+fn db_error(error: grafeo::Error) -> String {
+    error.error_code().to_string()
+}
+
+/// Lo que se cuenta de un error de E/S: la ruta (dentro de la carpeta de
+/// estado) y la clase del error, nunca el texto libre que pueda traer.
+fn io_error(path: &Path) -> impl FnOnce(io::Error) -> String + '_ {
+    move |error| format!("{}: {}", path.display(), error.kind())
 }
 
 /// La configuración de la base: cifrada, con WAL y con el tope de memoria. Los
@@ -766,12 +804,12 @@ fn open_existing(path: &Path, key: &[u8; MEMORY_KEY_BYTES]) -> Result<GrafeoDB, 
     let mut header = [0u8; HEADER_PREFIX_BYTES];
     std::fs::File::open(path)
         .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header))
-        .map_err(|error| format!("no se pudo leer {}: {error}", path.display()))?;
+        .map_err(io_error(path))?;
     if !is_encrypted_header(&header) {
         return Err(format!("{} no es una base 0.6 cifrada", path.display()));
     }
-    let db = GrafeoDB::with_config(config(path, key)).map_err(text)?;
-    schema::ensure_indexes(&db).map_err(text)?;
+    let db = GrafeoDB::with_config(config(path, key)).map_err(db_error)?;
+    schema::ensure_indexes(&db).map_err(db_error)?;
     Ok(db)
 }
 
@@ -806,26 +844,26 @@ fn create_files(dir: &Path, key: &[u8; MEMORY_KEY_BYTES]) -> Result<GrafeoDB, St
         .recursive(true)
         .mode(0o700)
         .create(parent)
-        .map_err(text)?;
-    remove_dir_if_exists(&tmp).map_err(text)?;
+        .map_err(io_error(parent))?;
+    remove_dir_if_exists(&tmp).map_err(io_error(&tmp))?;
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(&tmp)
-        .map_err(text)?;
+        .map_err(io_error(&tmp))?;
     let built = (|| {
-        let db = GrafeoDB::with_config(config(&tmp.join(DB_FILE), key)).map_err(text)?;
+        let db = GrafeoDB::with_config(config(&tmp.join(DB_FILE), key)).map_err(db_error)?;
         db.create_node_with_props(&["LinceMeta"], [("format", FORMAT_VERSION)])
-            .map_err(text)?;
-        schema::ensure_indexes(&db).map_err(text)?;
-        db.close().map_err(text)?;
+            .map_err(db_error)?;
+        schema::ensure_indexes(&db).map_err(db_error)?;
+        db.close().map_err(db_error)?;
         drop(db);
-        std::fs::rename(&tmp, dir).map_err(text)
+        std::fs::rename(&tmp, dir).map_err(io_error(&tmp))
     })();
     if let Err(error) = built {
         let _ = remove_dir_if_exists(&tmp);
         return Err(error);
     }
-    GrafeoDB::with_config(config(&dir.join(DB_FILE), key)).map_err(text)
+    GrafeoDB::with_config(config(&dir.join(DB_FILE), key)).map_err(db_error)
 }
 
 /// Borra `memory/` por `memory.deleting/`, y lo que haya quedado de un corte
@@ -940,7 +978,7 @@ fn write(
 
 async fn close(db: Option<Arc<GrafeoDB>>) {
     let Some(db) = db else { return };
-    if let Err(error) = blocking(move || db.close().map_err(text)).await {
+    if let Err(error) = blocking(move || db.close().map_err(db_error)).await {
         tracing::warn!("no se pudo cerrar la memoria: {error}");
     }
 }
@@ -2474,11 +2512,10 @@ mod log_tests {
         assert!(l.contains("WARN"), "{l}");
     }
 
-    // Falla hoy: con la llave ausente (o bloqueada, duplicada o inválida) la
-    // memoria queda no disponible y el motivo sólo llega a quien pregunta el
-    // estado; el journal no dice nada. Se quita el `ignore` al arreglarlo.
+    // Con la llave ausente (o bloqueada, duplicada o inválida) la memoria
+    // quedaba no disponible y el motivo sólo llegaba a quien preguntaba el
+    // estado; el journal no decía nada.
     #[tokio::test]
-    #[ignore = "bug: la llave ausente no deja ninguna línea en el registro"]
     async fn una_llave_ausente_deja_su_linea_al_intentar_abrir_la_memoria() {
         let (tmp, keys, memory) = enabled().await;
         memory.close().await;

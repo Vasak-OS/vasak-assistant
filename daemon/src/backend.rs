@@ -649,7 +649,11 @@ mod log_tests {
 
         let http = line(&log, &["respuesta HTTP", "backend=\"openai\""]);
         assert!(
-            http.contains("path=\"/v1/chat/completions\"") && http.contains("status=200"),
+            // La operación y no la ruta: una pasarela puede llevar en la ruta
+            // un id de cuenta o un token.
+            http.contains("operation=\"chat/completions\"")
+                && !http.contains("/v1")
+                && http.contains("status=200"),
             "{http}"
         );
         let text = log.text();

@@ -58,13 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let backend: Arc<dyn ModelBackend> = match config::select_backend(&settings) {
         Ok(selection) => {
-            info!(
-                backend = config::provider_name(selection.kind),
-                origin = %http::origin(&selection.url),
-                local = selection.local,
-                model = selection.model.as_deref().unwrap_or("(el primero que ofrezca)"),
-                "backend elegido"
-            );
+            info!("{}", logging::backend_summary(&selection));
             let backend: Arc<dyn ModelBackend> = match selection.kind {
                 BackendKind::Ollama => {
                     Arc::new(OllamaBackend::new(client, selection, settings.allow_remote))
@@ -99,17 +93,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_share_with_remote(settings.share_memory_with_remote),
     );
     info!(
-        version = env!("CARGO_PKG_VERSION"),
-        backend = backend.info().provider.as_str(),
-        local = backend.info().local,
-        allow_remote = settings.allow_remote,
-        share_memory_with_remote = settings.share_memory_with_remote,
-        memory = if memory.is_enabled().await {
-            "encendida"
-        } else {
-            "apagada"
-        },
-        "arrancando vasak-assistant"
+        "{}",
+        logging::startup_summary(&settings, &backend.info(), memory.is_enabled().await)
     );
     let service = AssistantService {
         backend,

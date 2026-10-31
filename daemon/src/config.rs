@@ -262,12 +262,37 @@ fn clean(value: Option<&str>) -> Option<&str> {
 /// la sección o con tipos que no cuadran da lo de siempre (local), que es lo
 /// seguro; `Err` lleva el motivo para el registro.
 pub fn settings_from_json(content: &str) -> Result<Settings, String> {
-    let config: serde_json::Value =
-        serde_json::from_str(content).map_err(|error| format!("vasak.conf ilegible: {error}"))?;
+    let config: serde_json::Value = serde_json::from_str(content)
+        .map_err(|error| format!("vasak.conf ilegible ({})", where_and_what(&error)))?;
     match config.get("assistant") {
         None => Ok(Settings::default()),
-        Some(section) => Settings::deserialize(section)
-            .map_err(|error| format!("la sección «assistant» de vasak.conf no cuadra: {error}")),
+        Some(section) => Settings::deserialize(section).map_err(|error| {
+            format!(
+                "la sección «assistant» de vasak.conf no cuadra ({})",
+                where_and_what(&error)
+            )
+        }),
+    }
+}
+
+/// Lo que se cuenta de un error de serde: la línea, la columna y la clase. El
+/// texto puede repetir el valor (una clave pegada por error en un campo
+/// booleano, por ejemplo), y este motivo se registra.
+fn where_and_what(error: &serde_json::Error) -> String {
+    let class = match error.classify() {
+        serde_json::error::Category::Io => "E/S",
+        serde_json::error::Category::Syntax => "sintaxis",
+        serde_json::error::Category::Data => "tipo o valor que no cuadra",
+        serde_json::error::Category::Eof => "termina antes de tiempo",
+    };
+    if error.line() == 0 {
+        class.to_owned()
+    } else {
+        format!(
+            "línea {}, columna {}: {class}",
+            error.line(),
+            error.column()
+        )
     }
 }
 

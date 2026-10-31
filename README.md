@@ -228,13 +228,17 @@ systemctl --user restart vasak-assistant
 
 Cada línea lleva campos: `method` (el método D-Bus), `sender` (quién llama en el
 bus), `conversation` (los primeros 8 caracteres del id), `error` (el tipo),
-`backend`, `status` y `ms`.
+`backend`, `operation` (lo que se le pidió: `models`, `chat/completions`,
+`api/chat`…, nunca la ruta), `status` y `ms`.
 
 **Nunca se registra**: el contenido de los mensajes ni de las respuestas, las
 notas, los recuerdos ni los resúmenes, las claves ni los tokens, ni una
 dirección con usuario, contraseña, ruta o consulta (se muestra sólo esquema,
-host y puerto). Las bibliotecas que ven los cuerpos (el bus, HTTP, TLS) no pasan
-de `info` aunque `RUST_LOG` pida más.
+host y puerto). De un error de la base de la memoria se registra sólo su código
+(`GRAFEO-…`), de uno de archivos la ruta y la clase, y de un `vasak.conf` que no
+se puede leer, la línea, la columna y la clase del error, nunca el valor. Las
+bibliotecas que ven los cuerpos (el bus, HTTP, TLS) no pasan de `info` aunque
+`RUST_LOG` pida más.
 
 ## Correrlo
 

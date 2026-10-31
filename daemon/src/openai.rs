@@ -49,18 +49,23 @@ impl OpenAiBackend {
         }
     }
 
-    async fn send(&self, request: RequestBuilder) -> Result<Response, BackendError> {
+    /// `operation` es el nombre de lo que se pide (`models`,
+    /// `chat/completions`): es lo que va al registro, y no la ruta, que en una
+    /// pasarela puede llevar un id de cuenta o un token.
+    async fn send(
+        &self,
+        request: RequestBuilder,
+        operation: &'static str,
+    ) -> Result<Response, BackendError> {
         let response = self
             .authorize(request)
             .await
             .send()
             .await
             .map_err(|error| http::map_error(self.base(), error))?;
-        // La ruta sin consulta: es lo único de la dirección que no está en el
-        // origen.
         tracing::debug!(
             backend = "openai",
-            path = response.url().path(),
+            operation,
             status = response.status().as_u16(),
             "respuesta HTTP"
         );
@@ -75,11 +80,11 @@ impl OpenAiBackend {
     }
 
     fn key_missing(&self) -> BackendError {
+        // Sólo el origen: la ruta de una pasarela puede llevar un id de cuenta
+        // o un token, y este texto se registra.
         BackendError::Unavailable(format!(
-            "{} pide una clave y en el llavero no hay ninguna válida para «{}» (service={ITEM_SERVICE}, url={}).",
+            "{} pide una clave y en el llavero no hay ninguna válida para esa dirección: guardala desde Configuración → Asistente (llavero de {ITEM_SERVICE}).",
             http::origin(self.base()),
-            self.base(),
-            self.base(),
         ))
     }
 
@@ -88,7 +93,7 @@ impl OpenAiBackend {
             .client
             .get(http::endpoint(self.base(), "models")?)
             .timeout(LIST_TIMEOUT);
-        let response = self.send(request).await?;
+        let response = self.send(request, "models").await?;
         parse_models(&http::read_capped(self.base(), response).await?)
     }
 
@@ -118,7 +123,7 @@ impl OpenAiBackend {
                 messages,
                 stream: false,
             });
-        let response = self.send(request).await?;
+        let response = self.send(request, "chat/completions").await?;
         parse_chat(&http::read_capped(self.base(), response).await?)
     }
 }

@@ -43,7 +43,7 @@ impl OllamaBackend {
             .map_err(|error| http::map_error(self.base(), error))?;
         tracing::debug!(
             backend = "ollama",
-            path = "api/tags",
+            operation = "api/tags",
             status = response.status().as_u16(),
             "respuesta HTTP"
         );
@@ -96,7 +96,7 @@ impl OllamaBackend {
             .map_err(|error| http::map_error(self.base(), error))?;
         tracing::debug!(
             backend = "ollama",
-            path = "api/chat",
+            operation = "api/chat",
             model = model.as_str(),
             status = response.status().as_u16(),
             "respuesta HTTP"

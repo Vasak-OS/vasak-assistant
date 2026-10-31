@@ -10,10 +10,14 @@
 //! **Qué no se registra nunca**: el contenido de los mensajes ni de las
 //! respuestas, las notas, los recuerdos ni los resúmenes, las claves ni los
 //! tokens, ni una dirección con usuario, contraseña, ruta o consulta. Las
-//! direcciones pasan por [`redact_url`] (o `http::origin`); los textos de los
-//! errores del contrato ya están escritos para mostrarse y no llevan nada de
-//! eso; y las bibliotecas que ven los cuerpos (el bus, HTTP, TLS) no pasan de
-//! `info` aunque `RUST_LOG` pida más.
+//! direcciones pasan por [`redact_url`] (o `http::origin`), y de un pedido a un
+//! backend se registra la operación (`chat/completions`, `api/chat`), no la
+//! ruta. Los textos de los errores del contrato ya están escritos para
+//! mostrarse y no llevan nada de eso. De un error de Grafeo se cuenta sólo su
+//! código, de uno de E/S la ruta y la clase (`memory`), y de un error de serde
+//! en `vasak.conf` la línea, la columna y la clase (`config`). Las bibliotecas
+//! que ven los cuerpos (el bus, HTTP, TLS) no pasan de `info` aunque `RUST_LOG`
+//! pida más.
 
 use std::io::IsTerminal;
 use std::time::Instant;
@@ -182,6 +186,40 @@ impl Call {
         }
         result
     }
+}
+
+/// La línea de arranque: la versión y un resumen de la configuración. Nunca
+/// una dirección, una clave ni el modelo de un remoto con su ruta: sólo el
+/// proveedor, si es local, los dos permisos y si la memoria está encendida.
+pub fn startup_summary(
+    settings: &crate::config::Settings,
+    backend: &vasak_assistant_protocol::ModelInfo,
+    memory_enabled: bool,
+) -> String {
+    format!(
+        "arrancando vasak-assistant {}: backend {} ({}), allow_remote={}, share_memory_with_remote={}, memoria {}",
+        env!("CARGO_PKG_VERSION"),
+        backend.provider,
+        if backend.local { "local" } else { "remoto" },
+        settings.allow_remote,
+        settings.share_memory_with_remote,
+        if memory_enabled { "encendida" } else { "apagada" },
+    )
+}
+
+/// La línea del backend elegido: proveedor, origen (esquema, host y puerto,
+/// sin credenciales ni ruta), si es local y el modelo configurado.
+pub fn backend_summary(selection: &crate::config::Selection) -> String {
+    format!(
+        "backend elegido: {} en {} ({}), modelo {}",
+        crate::config::provider_name(selection.kind),
+        crate::http::origin(&selection.url),
+        if selection.local { "local" } else { "remoto" },
+        selection
+            .model
+            .as_deref()
+            .unwrap_or("(el primero que ofrezca)")
+    )
 }
 
 #[cfg(test)]
