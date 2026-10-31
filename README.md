@@ -175,6 +175,9 @@ systemd, `$STATE_DIRECTORY`). No va en el almacén de cuentas.
   vigente, y borrar del todo es `ClearMemory`, que destruye la llave.
   - Con la memoria apagada no se toca la base, así que el resumen de una
     conversación borrada mientras estaba apagada queda.
+  - Si la memoria está encendida pero no se puede abrir (llavero bloqueado o
+    llave que falta), tampoco se borra y no se reintenta después: para eso,
+    `ClearMemory` (#28).
   - Los resúmenes de conversaciones de antes de reiniciar el servicio (las
     conversaciones no sobreviven al reinicio, así que ya no se pueden borrar
     una por una) se van sólo con `ClearMemory`.
