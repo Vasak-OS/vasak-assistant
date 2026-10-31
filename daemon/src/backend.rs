@@ -156,7 +156,10 @@ impl ModelBackend for Limited {
     fn models(&self) -> BoxFuture<'_, Result<Vec<String>, BackendError>> {
         Box::pin(async move {
             let _permit = self.permit().await?;
-            self.inner.models().await
+            let started = Instant::now();
+            let result = self.inner.models().await;
+            log_request(&self.inner, "models", started, &result);
+            result
         })
     }
 
@@ -169,7 +172,10 @@ impl ModelBackend for Limited {
             }
             let result = {
                 let _permit = self.permit().await?;
-                self.inner.active_model().await
+                let started = Instant::now();
+                let result = self.inner.active_model().await;
+                log_request(&self.inner, "active_model", started, &result);
+                result
             };
             *self.active.lock() = Some((Instant::now(), result.clone()));
             result
@@ -179,7 +185,10 @@ impl ModelBackend for Limited {
     fn chat<'a>(&'a self, messages: &'a [Message]) -> BoxFuture<'a, Result<String, BackendError>> {
         Box::pin(async move {
             let _permit = self.permit().await?;
-            self.inner.chat(messages).await
+            let started = Instant::now();
+            let result = self.inner.chat(messages).await;
+            log_request(&self.inner, "chat", started, &result);
+            result
         })
     }
 
@@ -189,8 +198,54 @@ impl ModelBackend for Limited {
     ) -> BoxFuture<'a, Result<String, BackendError>> {
         Box::pin(async move {
             let _permit = self.permit().await?;
-            self.inner.chat_local_only(messages).await
+            let started = Instant::now();
+            let result = self.inner.chat_local_only(messages).await;
+            log_request(&self.inner, "chat_local_only", started, &result);
+            result
         })
+    }
+}
+
+/// Una línea por pedido a un backend: el proveedor, la operación y cuánto
+/// tardó (`debug`), y el motivo si falló (`warn`; el rechazo de
+/// `chat_local_only` es esperable y va en `debug`). Nunca los mensajes ni la
+/// respuesta: los textos de [`BackendError`] están escritos para mostrarse y
+/// la dirección va recortada a su origen.
+fn log_request<T>(
+    backend: &Arc<dyn ModelBackend>,
+    operation: &'static str,
+    started: Instant,
+    result: &Result<T, BackendError>,
+) {
+    let provider = backend.info().provider;
+    let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match result {
+        Ok(_) => tracing::debug!(
+            backend = provider.as_str(),
+            operation,
+            ms,
+            "pedido al modelo"
+        ),
+        Err(error) if is_not_local(error) => tracing::debug!(
+            backend = provider.as_str(),
+            operation,
+            ms,
+            "el modelo no es local: no se mandó"
+        ),
+        Err(BackendError::Unavailable(text)) => tracing::warn!(
+            backend = provider.as_str(),
+            operation,
+            ms,
+            error = "Unavailable",
+            "el modelo no está disponible: {text}"
+        ),
+        Err(BackendError::Failed(text)) => tracing::warn!(
+            backend = provider.as_str(),
+            operation,
+            ms,
+            error = "Failed",
+            "el pedido al modelo falló: {text}"
+        ),
     }
 }
 

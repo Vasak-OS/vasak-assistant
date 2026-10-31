@@ -41,6 +41,12 @@ impl OllamaBackend {
             .send()
             .await
             .map_err(|error| http::map_error(self.base(), error))?;
+        tracing::debug!(
+            backend = "ollama",
+            path = "api/tags",
+            status = response.status().as_u16(),
+            "respuesta HTTP"
+        );
         if !response.status().is_success() {
             return Err(BackendError::Failed(format!(
                 "Ollama respondió {} a la lista de modelos",
@@ -88,6 +94,13 @@ impl OllamaBackend {
             .send()
             .await
             .map_err(|error| http::map_error(self.base(), error))?;
+        tracing::debug!(
+            backend = "ollama",
+            path = "api/chat",
+            model = model.as_str(),
+            status = response.status().as_u16(),
+            "respuesta HTTP"
+        );
         match response.status() {
             status if status.is_success() => {}
             // Ollama contesta 404 cuando el modelo no está: se pudo borrar entre

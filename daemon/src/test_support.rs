@@ -838,3 +838,65 @@ impl PrivateBus {
         bus
     }
 }
+
+// ── Captura del registro ──────────────────────────────────────────────────────
+
+/// Lo que se escribió en el registro mientras dura la captura, de cualquier
+/// módulo y en cualquier nivel (hasta `trace`), sin colores.
+#[derive(Clone, Default)]
+pub struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+#[allow(dead_code)]
+impl LogCapture {
+    /// Todo el texto capturado hasta ahora.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock()).into_owned()
+    }
+}
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = LogCapture;
+
+    fn make_writer(&'a self) -> LogCapture {
+        self.clone()
+    }
+}
+
+/// Captura el registro del hilo actual hasta que se suelta el guardián, con
+/// el mismo filtro de bibliotecas que el servicio
+/// ([`crate::logging::library_filter`]) y todo lo del servicio hasta `trace`. Con
+/// `#[tokio::test]` (un solo hilo) cubre también las tareas lanzadas; con un
+/// runtime de varios hilos, sólo lo del hilo que llama.
+///
+/// ```ignore
+/// let (log, _guard) = capture_logs();
+/// // …
+/// assert!(!log.text().contains("secreto"));
+/// ```
+// Infraestructura para las pruebas del registro, que escribe qa.
+#[allow(dead_code)]
+pub fn capture_logs() -> (LogCapture, tracing::subscriber::DefaultGuard) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::Layer;
+    let log = LogCapture::default();
+    let guard = tracing::subscriber::set_default(
+        tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(log.clone())
+                .with_ansi(false)
+                .with_filter(crate::logging::library_filter()),
+        ),
+    );
+    (log, guard)
+}

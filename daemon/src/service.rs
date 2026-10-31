@@ -34,6 +34,7 @@ use crate::backend::{is_not_local, BackendError, BoxFuture, ModelBackend};
 use crate::config::{is_local, normalize_url};
 use crate::conversations::Conversations;
 use crate::keyring::{ApiKey, SecretSource};
+use crate::logging::Call;
 use crate::memory::Memory;
 
 pub struct AssistantService {
@@ -117,7 +118,9 @@ fn access_denied() -> Error {
 impl AssistantService {
     /// Cómo está el servicio: si hay modelo, cuál, y por qué no si no.
     async fn status(&self, #[zbus(header)] header: Header<'_>) -> Result<ServiceStatus, Error> {
-        Ok(self.status_for(owner(&header)?).await)
+        let call = Call::new("Status", &header);
+        let result = async { Ok(self.status_for(owner(&header)?).await) }.await;
+        call.finish(result)
     }
 
     /// Las capacidades sobre cada dominio. Las de datos del usuario no están
@@ -129,7 +132,8 @@ impl AssistantService {
 
     /// Los modelos instalados en el backend.
     async fn models(&self) -> Result<Vec<String>, Error> {
-        self.backend.models().await.map_err(to_dbus)
+        let call = Call::method("Models");
+        call.finish(self.backend.models().await.map_err(to_dbus))
     }
 
     /// Abre una conversación nueva, de quien llama, y devuelve su id.
@@ -143,6 +147,158 @@ impl AssistantService {
         &self,
         #[zbus(header)] header: Header<'_>,
         #[zbus(connection)] connection: &Connection,
+    ) -> Result<String, Error> {
+        let call = Call::new("NewConversation", &header);
+        let result = self.new_conversation_for(&header, connection).await;
+        let call = match &result {
+            Ok(id) => call.conversation(id),
+            Err(_) => call,
+        };
+        call.finish(result)
+    }
+
+    /// Las conversaciones abiertas de quien llama.
+    fn conversations(&self, #[zbus(header)] header: Header<'_>) -> Result<Vec<String>, Error> {
+        let call = Call::new("Conversations", &header);
+        call.finish(owner(&header).map(|owner| self.list(owner)))
+    }
+
+    /// Los mensajes de una conversación de quien llama.
+    fn history(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        conversation_id: &str,
+    ) -> Result<Vec<Message>, Error> {
+        let call = Call::new("History", &header).conversation(conversation_id);
+        call.finish(owner(&header).and_then(|owner| self.history_of(owner, conversation_id)))
+    }
+
+    /// Manda un mensaje y devuelve la respuesta del modelo. Un llamador
+    /// confinado chatea sin memoria.
+    async fn chat(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        conversation_id: &str,
+        content: &str,
+    ) -> Result<String, Error> {
+        let call = Call::new("Chat", &header).conversation(conversation_id);
+        let result = async {
+            let owner = owner(&header)?;
+            let use_memory = !self.confined(connection, &header).await;
+            if !use_memory {
+                tracing::info!(
+                    method = "Chat",
+                    sender = owner,
+                    conversation = %crate::logging::short_id(conversation_id),
+                    "llamador confinado: el chat va sin memoria"
+                );
+            }
+            self.chat_with(owner, conversation_id, content, use_memory)
+                .await
+        }
+        .await;
+        call.finish(result)
+    }
+
+    /// Cierra una conversación de quien llama y olvida sus mensajes.
+    async fn delete_conversation(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        conversation_id: &str,
+    ) -> Result<(), Error> {
+        let call = Call::new("DeleteConversation", &header).conversation(conversation_id);
+        let result = async {
+            self.delete_conversation_as(owner(&header)?, conversation_id)
+                .await
+        }
+        .await;
+        call.finish(result)
+    }
+
+    /// Guarda en el llavero la clave del proveedor de esa dirección.
+    /// `AccessDenied` para un llamador confinado.
+    async fn set_provider_key(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        url: &str,
+        key: &str,
+    ) -> Result<(), Error> {
+        let call = Call::new("SetProviderKey", &header);
+        let result = async {
+            self.deny_confined(connection, &header).await?;
+            self.store_provider_key(url, key).await
+        }
+        .await;
+        call.finish(result)
+    }
+
+    /// Si hay una clave guardada para esa dirección. `AccessDenied` para un
+    /// llamador confinado.
+    async fn has_provider_key(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        url: &str,
+    ) -> Result<bool, Error> {
+        let call = Call::new("HasProviderKey", &header);
+        let result = async {
+            self.deny_confined(connection, &header).await?;
+            self.has_provider_key_for(url).await
+        }
+        .await;
+        call.finish(result)
+    }
+
+    /// Cómo está la memoria. Nunca falla: el problema va en el motivo.
+    async fn memory_status(&self) -> MemoryStatus {
+        self.memory_status_now().await
+    }
+
+    /// Enciende o apaga la memoria. Encender reabre la base que haya (o la
+    /// crea vacía con una llave nueva); apagar deja de usarla y de escribirla,
+    /// sin borrar nada: borrar es sólo `ClearMemory`. `AccessDenied` para un
+    /// llamador confinado.
+    async fn set_memory_enabled(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        let call = Call::new("SetMemoryEnabled", &header);
+        let result = async {
+            self.deny_confined(connection, &header).await?;
+            self.memory.set_enabled(enabled).await
+        }
+        .await;
+        call.finish(result)
+    }
+
+    /// Borra la memoria (la llave y los archivos) y, si estaba encendida, la
+    /// recrea vacía. `AccessDenied` para un llamador confinado.
+    async fn clear_memory(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> Result<(), Error> {
+        let call = Call::new("ClearMemory", &header);
+        let result = async {
+            self.deny_confined(connection, &header).await?;
+            self.memory.clear().await
+        }
+        .await;
+        call.finish(result)
+    }
+}
+
+impl AssistantService {
+    /// El cuerpo de `NewConversation`, para que la interfaz registre cómo
+    /// terminó.
+    async fn new_conversation_for(
+        &self,
+        header: &Header<'_>,
+        connection: &Connection,
     ) -> Result<String, Error> {
         let Some(sender) = header.sender() else {
             return Err(no_sender());
@@ -162,100 +318,6 @@ impl AssistantService {
             Err(error) => Err(error),
         };
         settle_new_conversation(&self.conversations, sender.as_str(), id, still_connected)
-    }
-
-    /// Las conversaciones abiertas de quien llama.
-    fn conversations(&self, #[zbus(header)] header: Header<'_>) -> Result<Vec<String>, Error> {
-        Ok(self.list(owner(&header)?))
-    }
-
-    /// Los mensajes de una conversación de quien llama.
-    fn history(
-        &self,
-        #[zbus(header)] header: Header<'_>,
-        conversation_id: &str,
-    ) -> Result<Vec<Message>, Error> {
-        self.history_of(owner(&header)?, conversation_id)
-    }
-
-    /// Manda un mensaje y devuelve la respuesta del modelo. Un llamador
-    /// confinado chatea sin memoria.
-    async fn chat(
-        &self,
-        #[zbus(header)] header: Header<'_>,
-        #[zbus(connection)] connection: &Connection,
-        conversation_id: &str,
-        content: &str,
-    ) -> Result<String, Error> {
-        let owner = owner(&header)?;
-        let use_memory = !self.confined(connection, &header).await;
-        self.chat_with(owner, conversation_id, content, use_memory)
-            .await
-    }
-
-    /// Cierra una conversación de quien llama y olvida sus mensajes.
-    async fn delete_conversation(
-        &self,
-        #[zbus(header)] header: Header<'_>,
-        conversation_id: &str,
-    ) -> Result<(), Error> {
-        self.delete_conversation_as(owner(&header)?, conversation_id)
-            .await
-    }
-
-    /// Guarda en el llavero la clave del proveedor de esa dirección.
-    /// `AccessDenied` para un llamador confinado.
-    async fn set_provider_key(
-        &self,
-        #[zbus(header)] header: Header<'_>,
-        #[zbus(connection)] connection: &Connection,
-        url: &str,
-        key: &str,
-    ) -> Result<(), Error> {
-        self.deny_confined(connection, &header).await?;
-        self.store_provider_key(url, key).await
-    }
-
-    /// Si hay una clave guardada para esa dirección. `AccessDenied` para un
-    /// llamador confinado.
-    async fn has_provider_key(
-        &self,
-        #[zbus(header)] header: Header<'_>,
-        #[zbus(connection)] connection: &Connection,
-        url: &str,
-    ) -> Result<bool, Error> {
-        self.deny_confined(connection, &header).await?;
-        self.has_provider_key_for(url).await
-    }
-
-    /// Cómo está la memoria. Nunca falla: el problema va en el motivo.
-    async fn memory_status(&self) -> MemoryStatus {
-        self.memory_status_now().await
-    }
-
-    /// Enciende o apaga la memoria. Encender reabre la base que haya (o la
-    /// crea vacía con una llave nueva); apagar deja de usarla y de escribirla,
-    /// sin borrar nada: borrar es sólo `ClearMemory`. `AccessDenied` para un
-    /// llamador confinado.
-    async fn set_memory_enabled(
-        &self,
-        #[zbus(header)] header: Header<'_>,
-        #[zbus(connection)] connection: &Connection,
-        enabled: bool,
-    ) -> Result<(), Error> {
-        self.deny_confined(connection, &header).await?;
-        self.memory.set_enabled(enabled).await
-    }
-
-    /// Borra la memoria (la llave y los archivos) y, si estaba encendida, la
-    /// recrea vacía. `AccessDenied` para un llamador confinado.
-    async fn clear_memory(
-        &self,
-        #[zbus(header)] header: Header<'_>,
-        #[zbus(connection)] connection: &Connection,
-    ) -> Result<(), Error> {
-        self.deny_confined(connection, &header).await?;
-        self.memory.clear().await
     }
 }
 
@@ -284,10 +346,24 @@ impl AssistantService {
     /// Si quien manda el pedido está confinado. Si el bus no contesta, sí.
     async fn confined(&self, connection: &Connection, header: &Header<'_>) -> bool {
         let sender = header.sender().map(|sender| sender.as_str());
-        match self.labels.label(connection, sender).await {
+        let label = self.labels.label(connection, sender).await;
+        let confined = match &label {
             Ok(label) => is_confined(label.as_deref()),
             Err(()) => true,
-        }
+        };
+        // La etiqueta es el nombre de un perfil de AppArmor: no es un secreto,
+        // y es lo que hace falta para entender por qué se rechazó.
+        tracing::debug!(
+            sender = sender.unwrap_or("(sin remitente)"),
+            label = %match &label {
+                Ok(Some(label)) => String::from_utf8_lossy(label).trim_end_matches('\0').to_owned(),
+                Ok(None) => "(sin etiqueta)".to_owned(),
+                Err(()) => "(no se pudo leer)".to_owned(),
+            },
+            confined,
+            "puerta de AppArmor"
+        );
+        confined
     }
 
     async fn deny_confined(
@@ -462,7 +538,12 @@ impl AssistantService {
                     .into(),
             )
         })?;
-        self.secrets.store_key(url.as_str(), &key).await
+        self.secrets.store_key(url.as_str(), &key).await?;
+        tracing::info!(
+            origin = %crate::logging::redact_url(url.as_str()),
+            "se guardó la clave del proveedor"
+        );
+        Ok(())
     }
 
     pub async fn has_provider_key_for(&self, url: &str) -> Result<bool, Error> {

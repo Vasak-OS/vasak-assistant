@@ -56,6 +56,14 @@ impl OpenAiBackend {
             .send()
             .await
             .map_err(|error| http::map_error(self.base(), error))?;
+        // La ruta sin consulta: es lo único de la dirección que no está en el
+        // origen.
+        tracing::debug!(
+            backend = "openai",
+            path = response.url().path(),
+            status = response.status().as_u16(),
+            "respuesta HTTP"
+        );
         match response.status() {
             status if status.is_success() => Ok(response),
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(self.key_missing()),

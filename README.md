@@ -203,6 +203,39 @@ systemd, `$STATE_DIRECTORY`). No va en el almacén de cuentas.
 `Capabilities` informa `memory` como disponible cuando está encendida y
 abierta.
 
+## Ver los errores
+
+El servicio escribe su registro en el journal:
+
+```bash
+journalctl --user -u vasak-assistant -f
+```
+
+Por omisión registra el nivel `info`: el arranque (versión y un resumen de la
+configuración: backend, local o remoto, memoria encendida o apagada), la
+parada, encender, apagar o borrar la memoria, y cada llamada que termina en
+error o cada falla en segundo plano (con `warn` o `error`). Para ver también el
+detalle (cada llamada que sale bien, los pedidos a los backends con su status y
+su duración, la puerta de AppArmor):
+
+```bash
+systemctl --user edit vasak-assistant
+# en el editor:
+# [Service]
+# Environment=RUST_LOG=debug
+systemctl --user restart vasak-assistant
+```
+
+Cada línea lleva campos: `method` (el método D-Bus), `sender` (quién llama en el
+bus), `conversation` (los primeros 8 caracteres del id), `error` (el tipo),
+`backend`, `status` y `ms`.
+
+**Nunca se registra**: el contenido de los mensajes ni de las respuestas, las
+notas, los recuerdos ni los resúmenes, las claves ni los tokens, ni una
+dirección con usuario, contraseña, ruta o consulta (se muestra sólo esquema,
+host y puerto). Las bibliotecas que ven los cuerpos (el bus, HTTP, TLS) no pasan
+de `info` aunque `RUST_LOG` pida más.
+
 ## Correrlo
 
 ```bash

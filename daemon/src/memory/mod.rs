@@ -66,6 +66,7 @@ use zeroize::Zeroizing;
 
 use crate::backend::ModelBackend;
 use crate::keyring::{MemoryKey, SecretSource, MEMORY_KEY_BYTES};
+use crate::logging::short_id;
 
 pub mod filter;
 pub mod learn;
@@ -235,6 +236,15 @@ impl Memory {
         Self::new(dir, secrets)
     }
 
+    /// Si la persona la encendió (el indicador existe), sin abrirla ni leer la
+    /// llave. Para el resumen del arranque.
+    pub async fn is_enabled(&self) -> bool {
+        match &self.dir {
+            Some(dir) => is_file(&flag(dir)).await,
+            None => false,
+        }
+    }
+
     /// Nunca falla: cualquier problema va como `available: false` y el motivo.
     /// `bytes` se informa también con la memoria apagada.
     pub async fn status(&self) -> MemoryStatus {
@@ -376,16 +386,35 @@ impl Memory {
             let reply = match sent {
                 Ok(reply) => reply,
                 Err(error) => {
-                    tracing::info!("la extracción de recuerdos no respondió: {error:?}");
+                    tracing::warn!(
+                        conversation = %short_id(&conversation_id),
+                        "la extracción de recuerdos no respondió: {error:?}"
+                    );
                     return;
                 }
             };
             let extraction = learn::parse_extraction(&reply);
             if extraction.items.is_empty() && extraction.summary.is_none() {
+                tracing::debug!(
+                    conversation = %short_id(&conversation_id),
+                    "la extracción no trajo nada que recordar"
+                );
                 return;
             }
-            if let Err(reason) = memory.store_at(extraction, &conversation_id, epoch).await {
-                tracing::info!("no se guardaron los recuerdos: {reason}");
+            let (items, summary) = (extraction.items.len(), extraction.summary.is_some());
+            match memory.store_at(extraction, &conversation_id, epoch).await {
+                Ok(()) => tracing::debug!(
+                    conversation = %short_id(&conversation_id),
+                    items,
+                    summary,
+                    "se guardaron recuerdos"
+                ),
+                // Descartes esperables: se apagó, se borró la memoria o la
+                // conversación. Un fallo al escribir lo registra `store_at`.
+                Err(reason) => tracing::debug!(
+                    conversation = %short_id(&conversation_id),
+                    "no se guardaron los recuerdos: {reason}"
+                ),
             }
         });
     }
@@ -424,6 +453,7 @@ impl Memory {
         let pruned = self.pruned_over_limit.clone();
         blocking(move || write(&db, &dir, &extraction, &conversation_id, &pruned).map_err(text))
             .await
+            .inspect_err(|error| tracing::warn!("no se pudo escribir en la memoria: {error}"))
     }
 
     /// Una conversación borrada (`DeleteConversation`): se descarta lo que
@@ -460,14 +490,21 @@ impl Memory {
         // Borrar no le manda nada a ningún modelo: la puerta del remoto no
         // aplica, sólo que esté encendida y abierta.
         if let Err(reason) = self.ensure_open(dir, &mut db).await {
-            tracing::info!("no se borraron los resúmenes de la conversación: {reason}");
+            tracing::warn!("no se borraron los resúmenes de la conversación: {reason}");
             return;
         }
         let Some(db) = db.clone() else { return };
         let id = conversation_id.to_owned();
-        if let Err(error) = blocking(move || schema::delete_summaries(&db, &id).map_err(text)).await
-        {
-            tracing::warn!("no se borraron los resúmenes de la conversación: {error}");
+        let short = short_id(conversation_id);
+        match blocking(move || schema::delete_summaries(&db, &id).map_err(text)).await {
+            Ok(deleted) => tracing::debug!(
+                conversation = %short,
+                deleted,
+                "se borraron los resúmenes de la conversación"
+            ),
+            Err(error) => {
+                tracing::warn!("no se borraron los resúmenes de la conversación: {error}")
+            }
         }
     }
 
@@ -542,16 +579,21 @@ impl Memory {
         if !enabled {
             // Apagar no borra nada: deja de usarla y de escribirla.
             close(db.take()).await;
-            return remove_flag(dir).await;
+            remove_flag(dir).await?;
+            tracing::info!("memoria apagada");
+            return Ok(());
         }
-        if is_dir(dir).await {
+        let created = !is_dir(dir).await;
+        if created {
+            self.create(dir, &mut db).await?;
+        } else {
             self.ensure_open(dir, &mut db)
                 .await
                 .map_err(|reason| Error::Unavailable(reason.into()))?;
-        } else {
-            self.create(dir, &mut db).await?;
         }
-        write_flag(dir).await
+        write_flag(dir).await?;
+        tracing::info!(created, "memoria encendida");
+        Ok(())
     }
 
     /// Borra la llave y los archivos; si estaba encendida, la recrea vacía con
@@ -574,9 +616,11 @@ impl Memory {
             .map_err(|error| {
                 Error::Unavailable(format!("No se pudo borrar la memoria: {error}"))
             })?;
-        if is_file(&flag(dir)).await {
+        let recreated = is_file(&flag(dir)).await;
+        if recreated {
             self.create(dir, &mut db).await?;
         }
+        tracing::info!(recreated, "memoria borrada");
         Ok(())
     }
 
@@ -849,8 +893,14 @@ fn write(
         // pasado por otra causa, podar en cada escritura terminaría borrando
         // toda la memoria. Mientras siga pasado, no se escribe.
         if pruned.swap(true, Ordering::SeqCst) {
+            tracing::debug!("la memoria sigue pasada de su tope: no se escribe");
             return Ok(());
         }
+        tracing::info!(
+            bytes = dir_size(dir),
+            max = MAX_MEMORY_DISK_BYTES,
+            "la memoria pasó su tope de espacio: se poda el 10 % de cada clase"
+        );
         schema::prune_tenth(db, now)?;
         if dir_size(dir) > MAX_MEMORY_DISK_BYTES {
             tracing::warn!("la memoria llegó a su tope de espacio: no se guarda nada más");
