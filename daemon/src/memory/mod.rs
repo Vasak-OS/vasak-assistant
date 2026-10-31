@@ -131,7 +131,12 @@ pub struct Memory {
     share_with_remote: bool,
     /// Una sola extracción a la vez, con `try_acquire`: si hay una en curso,
     /// el turno no se aprende. Propio, aparte de los permisos del chat.
-    learning: Semaphore,
+    learning: Arc<Semaphore>,
+    /// La extracción en vuelo (hay una sola a la vez, por `learning`): de qué
+    /// conversación es y su marca de cancelada. `forget_conversation` la marca
+    /// si el id coincide, y `store_at` la mira bajo el candado. No tiene tope
+    /// que se pueda vaciar borrando otras conversaciones.
+    in_flight: parking_lot::Mutex<Option<(String, Arc<AtomicBool>)>>,
     /// La época: sube con cada `set_enabled` y cada `clear`, bajo el candado.
     /// Una extracción lanzada en una época no se guarda en otra.
     epoch: AtomicU64,
@@ -141,6 +146,37 @@ pub struct Memory {
     /// Si ya se podó en el episodio actual sobre [`MAX_MEMORY_DISK_BYTES`].
     /// Se limpia cuando la base vuelve a estar dentro del tope.
     pruned_over_limit: Arc<AtomicBool>,
+    /// Las conversaciones borradas hace poco (`DeleteConversation`): lo que
+    /// llegue de una extracción de alguna de ellas se descarta en
+    /// [`Self::store_at`], bajo el candado. Hace de época por conversación:
+    /// los ids son uuid y no vuelven, así que basta con recordar que se borró.
+    forgotten: parking_lot::Mutex<std::collections::VecDeque<String>>,
+}
+
+/// Cuántas conversaciones borradas se recuerdan en `forgotten`. Vaciarlo no
+/// deja pasar nada: la extracción en vuelo se cancela por `in_flight`, y el
+/// servicio no lanza aprendizajes de una conversación que ya no existe
+/// (`chat_with` lo mira con el candado de las conversaciones). `forgotten`
+/// queda para quien llame a `learn_after` o `store_at` directamente.
+const MAX_FORGOTTEN_CONVERSATIONS: usize = 256;
+
+/// Al terminar la tarea de extracción, de cualquier forma, saca la marca de en
+/// vuelo si sigue siendo la suya.
+struct InFlight<'a> {
+    memory: &'a Memory,
+    cancelled: &'a Arc<AtomicBool>,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        let mut in_flight = self.memory.in_flight.lock();
+        if in_flight
+            .as_ref()
+            .is_some_and(|(_, cancelled)| Arc::ptr_eq(cancelled, self.cancelled))
+        {
+            *in_flight = None;
+        }
+    }
 }
 
 /// Cuántas conversaciones se recuerdan en `windows` antes de olvidar las de
@@ -155,10 +191,12 @@ impl Memory {
             db: Mutex::new(None),
             remote_blocked: false,
             share_with_remote: false,
-            learning: Semaphore::new(1),
+            learning: Arc::new(Semaphore::new(1)),
+            in_flight: parking_lot::Mutex::default(),
             epoch: AtomicU64::new(0),
             windows: parking_lot::Mutex::default(),
             pruned_over_limit: Arc::default(),
+            forgotten: parking_lot::Mutex::default(),
         }
     }
 
@@ -297,15 +335,34 @@ impl Memory {
         let Some((conversation, gate)) = learn::extraction_window(&conversation, gate) else {
             return;
         };
+        // El permiso y la marca de en vuelo se toman acá, antes de lanzar la
+        // tarea: un borrado que llegue después de esta llamada ya la encuentra.
+        let Ok(permit) = self.learning.clone().try_acquire_owned() else {
+            return;
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        *self.in_flight.lock() = Some((conversation_id.to_owned(), cancelled.clone()));
         let memory = self.clone();
         let conversation_id = conversation_id.to_owned();
         tokio::spawn(async move {
-            let Ok(_permit) = memory.learning.try_acquire() else {
-                return;
+            let _permit = permit;
+            let _in_flight = InFlight {
+                memory: &memory,
+                cancelled: &cancelled,
             };
             // Antes de mandarle nada al modelo: que la memoria se pueda usar
             // y que el modelo que va a extraer pueda verla.
             if memory.database().await.is_err() || !memory.allowed_for(&*backend).await {
+                return;
+            }
+            // Si ya se borró, ni se le pide nada al modelo (`store_at` igual lo
+            // descartaría).
+            if memory
+                .forgotten
+                .lock()
+                .iter()
+                .any(|id| *id == conversation_id)
+            {
                 return;
             }
             let request = learn::extraction_request(&conversation, gate);
@@ -355,11 +412,78 @@ impl Memory {
         if self.epoch.load(Ordering::SeqCst) != epoch {
             return Err("la memoria cambió mientras se extraían los recuerdos".into());
         }
+        let cancelled = matches!(
+            &*self.in_flight.lock(),
+            Some((id, cancelled)) if id == conversation_id && cancelled.load(Ordering::SeqCst)
+        );
+        if cancelled || self.forgotten.lock().iter().any(|id| id == conversation_id) {
+            return Err("la conversación se borró mientras se extraían los recuerdos".into());
+        }
         let db = self.usable(dir, &mut guard).await?;
         let (dir, conversation_id) = (dir.clone(), conversation_id.to_owned());
         let pruned = self.pruned_over_limit.clone();
         blocking(move || write(&db, &dir, &extraction, &conversation_id, &pruned).map_err(text))
             .await
+    }
+
+    /// Una conversación borrada (`DeleteConversation`): se descarta lo que
+    /// esté extrayéndose de ella y se borran sus resúmenes. Nunca falla: si la
+    /// memoria no se puede usar, sólo queda la cancelación.
+    ///
+    /// Con la memoria apagada no se toca la base (apagar no lee ni escribe,
+    /// decisión 10), y el resumen de una conversación borrada mientras estaba
+    /// apagada queda: no se anota en ningún lado para borrarlo al encender,
+    /// porque eso sería escribir con la memoria apagada. La salida para eso es
+    /// `ClearMemory`. Lo mismo si la memoria no se pudo abrir (llavero
+    /// bloqueado, llave que falta): no se reintenta después.
+    pub async fn forget_conversation(&self, conversation_id: &str) {
+        if let Some((id, cancelled)) = &*self.in_flight.lock() {
+            if id == conversation_id {
+                cancelled.store(true, Ordering::SeqCst);
+            }
+        }
+        {
+            let mut forgotten = self.forgotten.lock();
+            if forgotten.len() >= MAX_FORGOTTEN_CONVERSATIONS {
+                forgotten.pop_front();
+            }
+            forgotten.push_back(conversation_id.to_owned());
+        }
+        self.windows.lock().remove(conversation_id);
+        let Some(dir) = &self.dir else {
+            return;
+        };
+        let mut db = self.db.lock().await;
+        if !is_file(&flag(dir)).await {
+            return;
+        }
+        // Borrar no le manda nada a ningún modelo: la puerta del remoto no
+        // aplica, sólo que esté encendida y abierta.
+        if let Err(reason) = self.ensure_open(dir, &mut db).await {
+            tracing::info!("no se borraron los resúmenes de la conversación: {reason}");
+            return;
+        }
+        let Some(db) = db.clone() else { return };
+        let id = conversation_id.to_owned();
+        if let Err(error) = blocking(move || schema::delete_summaries(&db, &id).map_err(text)).await
+        {
+            tracing::warn!("no se borraron los resúmenes de la conversación: {error}");
+        }
+    }
+
+    /// Espera a que no haya una extracción en curso: `learn_after` toma el
+    /// permiso antes de volver, así que después de él esto es determinista.
+    /// Falla a los 5 segundos.
+    #[cfg(test)]
+    pub async fn wait_until_idle(&self) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.learning.available_permits() != 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "la extracción no terminó"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 
     /// La época actual (sube con cada encender, apagar y borrar). Sólo la
@@ -1380,7 +1504,7 @@ mod tests {
         fixture
             .memory
             .learn_after(backend.clone(), "c1", conversation.clone());
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Con el permiso tomado no se lanza nada: no hay nada que esperar.
         assert!(backend.seen.lock().is_empty());
         drop(held);
 
@@ -1949,5 +2073,287 @@ mod review_tests {
             .await
             .unwrap();
         assert_eq!(preferences(&memory).await, 9);
+    }
+}
+
+/// Olvidar una conversación borrada.
+#[cfg(test)]
+mod forget_tests {
+    use super::learn::Item;
+    use super::*;
+    use crate::test_support::{FakeBackend, FixedKey, ScriptedBackend, TempDir};
+
+    async fn enabled() -> (TempDir, Arc<Memory>) {
+        let tmp = TempDir::new();
+        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), FixedKey::new(None)));
+        memory.set_enabled(true).await.unwrap();
+        (tmp, memory)
+    }
+
+    fn summary(text: &str) -> Extraction {
+        Extraction {
+            items: Vec::new(),
+            summary: Some(text.into()),
+        }
+    }
+
+    fn preference(text: &str) -> Extraction {
+        Extraction {
+            items: vec![Item {
+                kind: MemoryKind::Preference,
+                text: text.into(),
+                phrase: None,
+                topics: Vec::new(),
+            }],
+            summary: None,
+        }
+    }
+
+    async fn summaries(memory: &Memory) -> Vec<String> {
+        let db = memory.database().await.unwrap();
+        let mut all = blocking(move || {
+            Ok(schema::entries(&db, MemoryKind::ConversationSummary)
+                .into_iter()
+                .map(|e| e.text)
+                .collect::<Vec<_>>())
+        })
+        .await
+        .unwrap();
+        all.sort();
+        all
+    }
+
+    fn turn() -> Vec<Message> {
+        vec![
+            Message {
+                role: Role::User,
+                content: "prefiero el mate amargo".into(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: "Anotado.".into(),
+            },
+        ]
+    }
+
+    const EXTRACTION: &str =
+        r#"{"items":[{"kind":"preference","text":"Prefiere el mate amargo"}],"summary":null}"#;
+
+    #[tokio::test]
+    async fn olvidar_una_conversacion_borra_su_resumen_y_deja_el_de_las_otras() {
+        let (_tmp, memory) = enabled().await;
+        memory.store(summary("Resumen de A"), "a").await.unwrap();
+        memory.store(summary("Resumen de B"), "b").await.unwrap();
+
+        memory.forget_conversation("a").await;
+
+        assert_eq!(summaries(&memory).await, ["Resumen de B"]);
+        let block = memory.recall("hola", true).await.unwrap();
+        assert!(block.contains("Resumen de B") && !block.contains("Resumen de A"));
+    }
+
+    #[tokio::test]
+    async fn lo_que_llega_de_una_extraccion_de_una_conversacion_borrada_se_descarta() {
+        let (_tmp, memory) = enabled().await;
+        let epoch = memory.epoch();
+        memory.forget_conversation("a").await;
+
+        let late = memory.store_at(summary("Resumen tardío"), "a", epoch).await;
+
+        assert!(late.is_err());
+        assert!(summaries(&memory).await.is_empty());
+        // Las demás conversaciones siguen guardando.
+        memory
+            .store_at(summary("Resumen de B"), "b", epoch)
+            .await
+            .unwrap();
+        assert_eq!(summaries(&memory).await, ["Resumen de B"]);
+    }
+
+    #[tokio::test]
+    async fn borrar_la_conversacion_en_medio_de_una_extraccion_no_guarda_nada() {
+        let (_tmp, memory) = enabled().await;
+        let (backend, gate) = FakeBackend::gated(EXTRACTION);
+        let backend = Arc::new(backend);
+
+        memory.learn_after(backend.clone(), "a", turn());
+        backend.entered.notified().await;
+        memory.forget_conversation("a").await;
+        gate.notify_one();
+        // Espera a que la extracción termine (suelta el permiso).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while memory.learning.available_permits() != 1 {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(memory.recall("mate", true).await, None);
+    }
+
+    #[tokio::test]
+    async fn si_la_conversacion_ya_se_borro_la_extraccion_no_llama_al_modelo() {
+        let (_tmp, memory) = enabled().await;
+        let backend = ScriptedBackend::new([EXTRACTION]);
+        memory.forget_conversation("a").await;
+
+        memory.learn_after(backend.clone(), "a", turn());
+        memory.wait_until_idle().await;
+
+        assert!(backend.seen.lock().is_empty());
+        assert_eq!(memory.recall("mate", true).await, None);
+        // Otra conversación sí aprende.
+        memory.learn_after(backend.clone(), "b", turn());
+        backend.wait_for_calls(1).await;
+    }
+
+    #[tokio::test]
+    async fn con_la_memoria_apagada_no_se_toca_la_base_y_el_resumen_queda() {
+        let (tmp, memory) = enabled().await;
+        memory.store(summary("Resumen de A"), "a").await.unwrap();
+        memory.set_enabled(false).await.unwrap();
+        let files = |dir: &Path| -> Vec<(PathBuf, Vec<u8>)> {
+            fn walk(path: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+                for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        walk(&p, out);
+                    } else {
+                        out.push((p.clone(), std::fs::read(&p).unwrap()));
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            walk(dir, &mut out);
+            out.sort();
+            out
+        };
+        let before = files(&tmp.memory_dir());
+
+        memory.forget_conversation("a").await;
+
+        assert_eq!(files(&tmp.memory_dir()), before);
+        memory.set_enabled(true).await.unwrap();
+        assert_eq!(summaries(&memory).await, ["Resumen de A"]);
+    }
+
+    #[tokio::test]
+    async fn sin_carpeta_de_estado_olvidar_solo_cancela_y_no_falla() {
+        let memory = Memory::new(None, FixedKey::new(None));
+        memory.forget_conversation("a").await;
+        assert!(memory
+            .store_at(preference("x"), "a", memory.epoch())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn con_la_llave_ausente_olvidar_no_falla_ni_borra_nada() {
+        let (tmp, memory) = enabled().await;
+        memory.store(summary("Resumen de A"), "a").await.unwrap();
+        memory.close().await;
+        let keys = FixedKey::new(None);
+        let broken = Memory::new(Some(tmp.memory_dir()), keys);
+
+        broken.forget_conversation("a").await;
+
+        assert!(!broken.status().await.available);
+        assert!(tmp.memory_dir().join(DB_FILE).is_file());
+    }
+
+    #[tokio::test]
+    async fn solo_se_recuerdan_las_ultimas_conversaciones_borradas_y_olvidar_libera_su_ventana() {
+        let (_tmp, memory) = enabled().await;
+        memory.window_start("primera", memory.epoch(), 4);
+
+        for n in 0..(MAX_FORGOTTEN_CONVERSATIONS + 10) {
+            memory.forget_conversation(&format!("c{n}")).await;
+        }
+
+        assert!(memory.forgotten.lock().len() <= MAX_FORGOTTEN_CONVERSATIONS);
+        // La más vieja ya se olvidó del todo; la última sigue anotada.
+        let last = format!("c{}", MAX_FORGOTTEN_CONVERSATIONS + 9);
+        assert!(memory.forgotten.lock().iter().any(|id| *id == last));
+        assert!(!memory.forgotten.lock().iter().any(|id| id == "c0"));
+        memory.forget_conversation("primera").await;
+        assert!(!memory.windows.lock().contains_key("primera"));
+    }
+
+    async fn until_idle(memory: &Memory) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while memory.learning.available_permits() != 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "la extracción no terminó"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn borrar_cientos_de_otras_conversaciones_no_deja_pasar_la_extraccion_de_la_borrada() {
+        let (_tmp, memory) = enabled().await;
+        let (backend, gate) = FakeBackend::gated(EXTRACTION);
+        let backend = Arc::new(backend);
+
+        memory.learn_after(backend.clone(), "a", turn());
+        backend.entered.notified().await;
+        memory.forget_conversation("a").await;
+        // Más que el tope de `forgotten`: «a» ya no está en esa lista.
+        for n in 0..(MAX_FORGOTTEN_CONVERSATIONS + 44) {
+            memory.forget_conversation(&format!("otra-{n}")).await;
+        }
+        assert!(!memory.forgotten.lock().iter().any(|id| id == "a"));
+        gate.notify_one();
+        until_idle(&memory).await;
+
+        assert_eq!(memory.recall("mate", true).await, None);
+    }
+
+    #[tokio::test]
+    async fn borrar_otra_conversacion_no_cancela_la_extraccion_en_vuelo() {
+        let (_tmp, memory) = enabled().await;
+        let (backend, gate) = FakeBackend::gated(EXTRACTION);
+        let backend = Arc::new(backend);
+
+        memory.learn_after(backend.clone(), "a", turn());
+        backend.entered.notified().await;
+        memory.forget_conversation("b").await;
+        gate.notify_one();
+        until_idle(&memory).await;
+
+        assert!(memory
+            .recall("mate", true)
+            .await
+            .unwrap()
+            .contains("mate amargo"));
+    }
+
+    #[tokio::test]
+    async fn al_terminar_la_extraccion_la_marca_de_en_vuelo_se_saca() {
+        let (_tmp, memory) = enabled().await;
+        let backend = ScriptedBackend::new([EXTRACTION]);
+
+        memory.learn_after(backend.clone(), "a", turn());
+        backend.wait_for_calls(1).await;
+        until_idle(&memory).await;
+
+        assert!(memory.in_flight.lock().is_none());
+        // Y una extracción que ni empezó (otra en curso) no deja marca de más.
+        let held = memory.learning.clone().try_acquire_owned().unwrap();
+        memory.learn_after(backend.clone(), "b", turn());
+        assert!(memory.in_flight.lock().is_none());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn una_extraccion_que_falla_o_no_aprende_nada_tambien_saca_la_marca() {
+        let (_tmp, memory) = enabled().await;
+        let backend = ScriptedBackend::new(["no es json"]);
+
+        memory.learn_after(backend.clone(), "a", turn());
+        backend.wait_for_calls(1).await;
+        until_idle(&memory).await;
+
+        assert!(memory.in_flight.lock().is_none());
     }
 }

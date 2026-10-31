@@ -157,6 +157,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let Ok(args) = change.args() else { continue };
                 // Una conexión que se cerró: su nombre único se queda sin dueño.
                 if let (BusName::Unique(name), None) = (args.name(), args.new_owner().as_ref()) {
+                    // Olvidarlas al irse el dueño no es borrarlas: sus
+                    // resúmenes en la memoria quedan, que para eso están
+                    // (recordar conversaciones pasadas). Sólo
+                    // `DeleteConversation`, que es pedirlo, los borra.
                     let released = conversations.lock().release_owner(name.as_str());
                     if released > 0 {
                         info!("{name} se fue: se liberan {released} conversaciones");

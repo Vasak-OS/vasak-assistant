@@ -194,12 +194,13 @@ impl AssistantService {
     }
 
     /// Cierra una conversación de quien llama y olvida sus mensajes.
-    fn delete_conversation(
+    async fn delete_conversation(
         &self,
         #[zbus(header)] header: Header<'_>,
         conversation_id: &str,
     ) -> Result<(), Error> {
-        self.delete_as(owner(&header)?, conversation_id)
+        self.delete_conversation_as(owner(&header)?, conversation_id)
+            .await
     }
 
     /// Guarda en el llavero la clave del proveedor de esa dirección.
@@ -414,14 +415,33 @@ impl AssistantService {
             content: reply.clone(),
         });
         if use_memory {
-            self.memory
-                .learn_after(self.backend.clone(), conversation_id, context);
+            // Con el candado de las conversaciones: o el aprendizaje queda
+            // anotado en vuelo antes de que un borrado lo busque, o la
+            // conversación ya se borró y no se aprende.
+            let conversations = self.conversations.lock();
+            if conversations.contains(owner, conversation_id) {
+                self.memory
+                    .learn_after(self.backend.clone(), conversation_id, context);
+            }
         }
         Ok(reply)
     }
 
     pub fn delete_as(&self, owner: &str, conversation_id: &str) -> Result<(), Error> {
         self.conversations.lock().delete(owner, conversation_id)
+    }
+
+    /// `DeleteConversation`: la cierra y, en la memoria, cancela lo que se
+    /// esté extrayendo de ella y borra sus resúmenes. Lo de la memoria nunca
+    /// hace fallar el borrado ([`Memory::forget_conversation`]).
+    pub async fn delete_conversation_as(
+        &self,
+        owner: &str,
+        conversation_id: &str,
+    ) -> Result<(), Error> {
+        self.delete_as(owner, conversation_id)?;
+        self.memory.forget_conversation(conversation_id).await;
+        Ok(())
     }
 
     /// La dirección se normaliza igual que al elegir el backend, así el ítem
@@ -1456,9 +1476,10 @@ mod memory_tests {
             }
         }
 
-        /// Da tiempo a que una extracción que no tendría que ocurrir ocurra.
-        async fn settle() {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        /// Espera a que termine cualquier extracción lanzada por el último chat
+        /// (el permiso se toma antes de que `chat_as` vuelva).
+        async fn settle(&self) {
+            self.service.memory.wait_until_idle().await;
         }
 
         fn first_of_call(&self, n: usize) -> Message {
@@ -1530,7 +1551,7 @@ mod memory_tests {
 
         world.service.memory.set_enabled(false).await.unwrap();
         world.say("prefiero el mate amargo").await;
-        World::settle().await;
+        world.settle().await;
 
         // Sólo la llamada del chat: ni notas ni una extracción.
         assert_eq!(world.backend.seen.lock().len(), 3);
@@ -1578,7 +1599,7 @@ mod memory_tests {
             .chat_as(OWNER, &id, "prefiero el mate amargo")
             .await
             .unwrap();
-        World::settle().await;
+        world.settle().await;
 
         let seen = backend.seen.lock().clone();
         assert_eq!(seen.len(), 1, "ni una extracción");
@@ -1635,7 +1656,7 @@ mod memory_tests {
         world
             .say("escribime a ana@ejemplo.com, prefiero el mate")
             .await;
-        World::settle().await;
+        world.settle().await;
 
         // La ventana quedó vacía: no hay nada que pedirle al modelo.
         assert_eq!(world.backend.seen.lock().len(), 1, "sólo el chat");
@@ -1647,7 +1668,7 @@ mod memory_tests {
 
         world.say("mi contraseña es hunter2").await;
         world.say("prefiero usar sk-abcdefgh12345678 siempre").await;
-        World::settle().await;
+        world.settle().await;
 
         assert_eq!(world.backend.seen.lock().len(), 2, "sólo los dos chats");
     }
@@ -1658,7 +1679,7 @@ mod memory_tests {
 
         world.say("prefiero respuestas cortas").await;
         world.backend.wait_for_calls(2).await;
-        World::settle().await;
+        world.settle().await;
         let (_, reply) = world.say("hola, ¿qué tal?").await;
 
         assert_eq!(reply, "Sigue.");
@@ -1737,7 +1758,6 @@ mod memory_tests {
 /// una etiqueta de mentira.
 #[cfg(test)]
 mod gate_tests {
-    use std::time::Duration;
 
     use super::*;
     use crate::memory::learn::{Extraction, Item};
@@ -1969,7 +1989,7 @@ mod gate_tests {
                 .chat(&id, "prefiero respuestas cortas, ¿qué tal?")
                 .await
                 .unwrap();
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            gate.memory.wait_until_idle().await;
 
             assert_eq!(reply, "Hola.", "{name}");
             let seen = gate.backend.seen.lock().clone();
@@ -2047,7 +2067,6 @@ mod bus_label_tests {
 /// La puerta del remoto se decide con el modelo efectivo de cada pedido.
 #[cfg(test)]
 mod effective_model_tests {
-    use std::time::Duration;
 
     use super::*;
     use crate::memory::schema::MemoryKind;
@@ -2105,8 +2124,8 @@ mod effective_model_tests {
     async fn chat(rig: &Rig, text: &str) {
         let id = rig.service.open(OWNER).unwrap();
         rig.service.chat_as(OWNER, &id, text).await.unwrap();
-        // Una extracción que no tendría que ocurrir tendría tiempo de ocurrir.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Una extracción que no tendría que ocurrir ya estaría tomando el permiso.
+        rig.service.memory.wait_until_idle().await;
     }
 
     async fn remembers(rig: &Rig, needle: &str) -> bool {
@@ -2238,7 +2257,7 @@ mod effective_model_tests {
             .chat_as(OWNER, &id, "prefiero el mate amargo, ¿qué tal?")
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        rig.service.memory.wait_until_idle().await;
 
         // La persona recibe su respuesta.
         assert_eq!(reply, "Hola.");
@@ -2289,7 +2308,7 @@ mod effective_model_tests {
         rig.service
             .memory
             .learn_after(backend.clone(), "c1", conversation);
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        rig.service.memory.wait_until_idle().await;
 
         assert!(backend.inner.seen.lock().is_empty(), "nada salió a la nube");
         assert_eq!(
@@ -2656,5 +2675,326 @@ mod no_sender_tests {
         let id = quickly(proxy.new_conversation()).await.unwrap();
 
         assert_eq!(quickly(proxy.conversations()).await.unwrap(), [id]);
+    }
+}
+
+/// `DeleteConversation` también borra el resumen de la conversación (#12).
+#[cfg(test)]
+mod delete_conversation_tests {
+    use super::*;
+    use crate::memory::learn::{Extraction, Item};
+    use crate::memory::schema::{entries, MemoryKind};
+    use crate::test_support::{p2p_pair_as, FakeBackend, FixedKey, FixedLabel, TempDir};
+    use vasak_assistant_protocol::{AssistantProxy, SERVICE_PATH};
+
+    const OWNER: &str = ":1.1";
+    const OTHER: &str = ":1.2";
+
+    struct Rig {
+        tmp: TempDir,
+        service: AssistantService,
+    }
+
+    async fn rig() -> Rig {
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
+        memory.set_enabled(true).await.unwrap();
+        let service = AssistantService {
+            backend: Arc::new(FakeBackend::replying("hola")),
+            conversations: Arc::default(),
+            remote_allowed: false,
+            secrets: keys,
+            memory,
+            labels: FixedLabel::none(),
+        };
+        Rig { tmp, service }
+    }
+
+    fn summary(text: &str) -> Extraction {
+        Extraction {
+            items: Vec::<Item>::new(),
+            summary: Some(text.into()),
+        }
+    }
+
+    /// Los textos de los resúmenes guardados, en orden.
+    async fn summaries(memory: &Memory) -> Vec<String> {
+        let db = memory.database().await.unwrap();
+        let mut all: Vec<String> = tokio::task::spawn_blocking(move || {
+            entries(&db, MemoryKind::ConversationSummary)
+                .into_iter()
+                .map(|e| e.text)
+                .collect()
+        })
+        .await
+        .unwrap();
+        all.sort();
+        all
+    }
+
+    /// Dos conversaciones del mismo dueño, cada una con su resumen.
+    async fn two_with_summaries(rig: &Rig) -> (String, String) {
+        let (a, b) = (
+            rig.service.open(OWNER).unwrap(),
+            rig.service.open(OWNER).unwrap(),
+        );
+        rig.service
+            .memory
+            .store(summary("Resumen de A"), &a)
+            .await
+            .unwrap();
+        rig.service
+            .memory
+            .store(summary("Resumen de B"), &b)
+            .await
+            .unwrap();
+        (a, b)
+    }
+
+    #[tokio::test]
+    async fn borrar_una_conversacion_borra_su_resumen_y_queda_solo_el_de_la_otra() {
+        let rig = rig().await;
+        let (a, b) = two_with_summaries(&rig).await;
+
+        rig.service.delete_conversation_as(OWNER, &a).await.unwrap();
+
+        assert_eq!(summaries(&rig.service.memory).await, ["Resumen de B"]);
+        assert_eq!(rig.service.list(OWNER), [b]);
+        // En la próxima conversación, la memoria ya no menciona la borrada.
+        let block = rig.service.memory.recall("hola", true).await.unwrap();
+        assert!(block.contains("Resumen de B") && !block.contains("Resumen de A"));
+    }
+
+    #[tokio::test]
+    async fn por_dbus_delete_conversation_borra_el_resumen_de_esa_conversacion() {
+        let rig = rig().await;
+        let (a, b) = two_with_summaries(&rig).await;
+        let memory = rig.service.memory.clone();
+        let (_server, client) =
+            p2p_pair_as(OWNER, |builder| builder.serve_at(SERVICE_PATH, rig.service))
+                .await
+                .unwrap();
+        let proxy = AssistantProxy::builder(&client)
+            .path(SERVICE_PATH)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        proxy.delete_conversation(&a).await.unwrap();
+
+        assert_eq!(summaries(&memory).await, ["Resumen de B"]);
+        assert_eq!(
+            proxy.conversations().await.unwrap(),
+            std::slice::from_ref(&b)
+        );
+        // Borrar la otra deja la memoria sin resúmenes.
+        proxy.delete_conversation(&b).await.unwrap();
+        assert!(summaries(&memory).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn con_la_memoria_apagada_borrar_la_conversacion_no_toca_la_base_y_el_resumen_queda() {
+        let rig = rig().await;
+        let (a, _b) = two_with_summaries(&rig).await;
+        rig.service.memory.set_enabled(false).await.unwrap();
+
+        rig.service.delete_conversation_as(OWNER, &a).await.unwrap();
+
+        // La conversación se cerró; la memoria apagada no se leyó ni se escribió.
+        assert!(rig.service.history_of(OWNER, &a).is_err());
+        rig.service.memory.set_enabled(true).await.unwrap();
+        assert_eq!(
+            summaries(&rig.service.memory).await,
+            ["Resumen de A", "Resumen de B"]
+        );
+        assert!(rig.tmp.memory_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn si_la_conexion_del_duenio_se_cierra_los_resumenes_quedan() {
+        let rig = rig().await;
+        let (_a, _b) = two_with_summaries(&rig).await;
+
+        let released = rig.service.conversations.lock().release_owner(OWNER);
+
+        assert_eq!(released, 2);
+        assert!(rig.service.list(OWNER).is_empty());
+        assert_eq!(
+            summaries(&rig.service.memory).await,
+            ["Resumen de A", "Resumen de B"]
+        );
+    }
+
+    #[tokio::test]
+    async fn borrar_una_que_no_existe_o_de_otro_duenio_no_borra_resumenes_ajenos() {
+        let rig = rig().await;
+        let (a, _b) = two_with_summaries(&rig).await;
+        let unknown = "00000000-0000-4000-8000-000000000000";
+        // Un resumen de una conversación que nadie tiene abierta.
+        rig.service
+            .memory
+            .store(summary("Resumen de una vieja"), unknown)
+            .await
+            .unwrap();
+
+        // Inexistente.
+        assert!(matches!(
+            rig.service.delete_conversation_as(OWNER, unknown).await,
+            Err(Error::NotFound(_))
+        ));
+        // De otro dueño: el mismo NotFound, y la conversación sigue abierta.
+        assert!(matches!(
+            rig.service.delete_conversation_as(OTHER, &a).await,
+            Err(Error::NotFound(_))
+        ));
+
+        assert_eq!(
+            summaries(&rig.service.memory).await,
+            ["Resumen de A", "Resumen de B", "Resumen de una vieja"]
+        );
+        assert_eq!(rig.service.list(OWNER).len(), 2);
+        // Y la extracción de esa conversación sigue pudiendo guardar: no se anotó como borrada.
+        rig.service
+            .memory
+            .store(summary("Otro de A"), &a)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn borrar_dos_veces_la_misma_da_not_found_la_segunda_y_no_rompe_nada() {
+        let rig = rig().await;
+        let (a, _b) = two_with_summaries(&rig).await;
+
+        rig.service.delete_conversation_as(OWNER, &a).await.unwrap();
+        let second = rig.service.delete_conversation_as(OWNER, &a).await;
+
+        assert!(matches!(second, Err(Error::NotFound(_))));
+        assert_eq!(summaries(&rig.service.memory).await, ["Resumen de B"]);
+    }
+
+    #[tokio::test]
+    async fn dos_resumenes_iguales_de_conversaciones_distintas_borrar_una_deja_el_de_la_otra() {
+        let rig = rig().await;
+        let (a, b) = (
+            rig.service.open(OWNER).unwrap(),
+            rig.service.open(OWNER).unwrap(),
+        );
+        for id in [&a, &b] {
+            rig.service
+                .memory
+                .store(summary("Hablaron de gatos"), id)
+                .await
+                .unwrap();
+        }
+        assert_eq!(summaries(&rig.service.memory).await.len(), 2);
+
+        rig.service.delete_conversation_as(OWNER, &a).await.unwrap();
+
+        assert_eq!(summaries(&rig.service.memory).await, ["Hablaron de gatos"]);
+        rig.service.delete_conversation_as(OWNER, &b).await.unwrap();
+        assert!(summaries(&rig.service.memory).await.is_empty());
+    }
+
+    const EXTRACTION: &str =
+        r#"{"items":[{"kind":"preference","text":"Prefiere el mate amargo"}],"summary":null}"#;
+
+    /// Un servicio cuyo backend (el chat y la extracción) espera la compuerta.
+    async fn gated_rig() -> (Rig, Arc<FakeBackend>, Arc<tokio::sync::Notify>) {
+        let (fake, gate) = FakeBackend::gated(EXTRACTION);
+        let backend = Arc::new(fake);
+        let mut rig = rig().await;
+        rig.service.backend = backend.clone();
+        (rig, backend, gate)
+    }
+
+    #[tokio::test]
+    async fn borrar_la_conversacion_mientras_su_extraccion_esta_en_vuelo_no_guarda_nada() {
+        let (rig, backend, gate) = gated_rig().await;
+        let service = Arc::new(rig.service);
+        let id = service.open(OWNER).unwrap();
+
+        let chat = {
+            let (service, id) = (service.clone(), id.clone());
+            tokio::spawn(async move {
+                service
+                    .chat_as(OWNER, &id, "prefiero el mate amargo, ¿qué tal?")
+                    .await
+            })
+        };
+        // El chat sale al modelo; se lo libera y arranca la extracción.
+        backend.entered.notified().await;
+        gate.notify_one();
+        chat.await.unwrap().unwrap();
+        backend.entered.notified().await;
+        assert_eq!(backend.seen.lock().len(), 2, "el chat y la extracción");
+
+        service.delete_conversation_as(OWNER, &id).await.unwrap();
+        gate.notify_one();
+        service.memory.wait_until_idle().await;
+
+        assert_eq!(service.memory.recall("mate", true).await, None);
+    }
+
+    #[tokio::test]
+    async fn borrar_la_conversacion_mientras_el_chat_espera_la_respuesta_no_aprende_nada() {
+        let (rig, backend, gate) = gated_rig().await;
+        let service = Arc::new(rig.service);
+        let id = service.open(OWNER).unwrap();
+
+        let chat = {
+            let (service, id) = (service.clone(), id.clone());
+            tokio::spawn(async move {
+                service
+                    .chat_as(OWNER, &id, "prefiero el mate amargo, ¿qué tal?")
+                    .await
+            })
+        };
+        backend.entered.notified().await;
+        service.delete_conversation_as(OWNER, &id).await.unwrap();
+        // Con otros cientos de borrados, «id» ya no está en la lista de borradas:
+        // lo que frena el aprendizaje es que la conversación ya no existe.
+        for n in 0..300 {
+            service
+                .memory
+                .forget_conversation(&format!("otra-{n}"))
+                .await;
+        }
+        gate.notify_one();
+        // La persona igual recibe la respuesta.
+        chat.await.unwrap().unwrap();
+        service.memory.wait_until_idle().await;
+
+        assert_eq!(backend.seen.lock().len(), 1, "sin extracción");
+        assert_eq!(service.memory.recall("mate", true).await, None);
+        assert!(service.list(OWNER).is_empty());
+    }
+
+    #[tokio::test]
+    async fn sin_borrar_nada_la_misma_secuencia_si_aprende() {
+        let (rig, backend, gate) = gated_rig().await;
+        let service = Arc::new(rig.service);
+        let id = service.open(OWNER).unwrap();
+
+        let chat = {
+            let (service, id) = (service.clone(), id.clone());
+            tokio::spawn(async move {
+                service
+                    .chat_as(OWNER, &id, "prefiero el mate amargo, ¿qué tal?")
+                    .await
+            })
+        };
+        backend.entered.notified().await;
+        gate.notify_one();
+        chat.await.unwrap().unwrap();
+        backend.entered.notified().await;
+        gate.notify_one();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while service.memory.recall("mate", true).await.is_none() {
+            assert!(tokio::time::Instant::now() < deadline, "no se aprendió");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 }
