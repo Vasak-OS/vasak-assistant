@@ -52,7 +52,6 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::fmt::Display;
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
@@ -66,6 +65,7 @@ use zeroize::Zeroizing;
 
 use crate::backend::ModelBackend;
 use crate::keyring::{MemoryKey, SecretSource, MEMORY_KEY_BYTES};
+use crate::logging::short_id;
 
 pub mod filter;
 pub mod learn;
@@ -146,6 +146,9 @@ pub struct Memory {
     /// Si ya se podó en el episodio actual sobre [`MAX_MEMORY_DISK_BYTES`].
     /// Se limpia cuando la base vuelve a estar dentro del tope.
     pruned_over_limit: Arc<AtomicBool>,
+    /// El último motivo por el que no se pudo abrir la base, para registrarlo
+    /// sólo cuando cambia.
+    last_open_problem: parking_lot::Mutex<Option<&'static str>>,
     /// Las conversaciones borradas hace poco (`DeleteConversation`): lo que
     /// llegue de una extracción de alguna de ellas se descarta en
     /// [`Self::store_at`], bajo el candado. Hace de época por conversación:
@@ -196,6 +199,7 @@ impl Memory {
             epoch: AtomicU64::new(0),
             windows: parking_lot::Mutex::default(),
             pruned_over_limit: Arc::default(),
+            last_open_problem: parking_lot::Mutex::default(),
             forgotten: parking_lot::Mutex::default(),
         }
     }
@@ -233,6 +237,15 @@ impl Memory {
             tracing::warn!("no hay carpeta de estado absoluta: la memoria no se podrá encender");
         }
         Self::new(dir, secrets)
+    }
+
+    /// Si la persona la encendió (el indicador existe), sin abrirla ni leer la
+    /// llave. Para el resumen del arranque.
+    pub async fn is_enabled(&self) -> bool {
+        match &self.dir {
+            Some(dir) => is_file(&flag(dir)).await,
+            None => false,
+        }
     }
 
     /// Nunca falla: cualquier problema va como `available: false` y el motivo.
@@ -376,16 +389,35 @@ impl Memory {
             let reply = match sent {
                 Ok(reply) => reply,
                 Err(error) => {
-                    tracing::info!("la extracción de recuerdos no respondió: {error:?}");
+                    tracing::warn!(
+                        conversation = %short_id(&conversation_id),
+                        "la extracción de recuerdos no respondió: {error:?}"
+                    );
                     return;
                 }
             };
             let extraction = learn::parse_extraction(&reply);
             if extraction.items.is_empty() && extraction.summary.is_none() {
+                tracing::debug!(
+                    conversation = %short_id(&conversation_id),
+                    "la extracción no trajo nada que recordar"
+                );
                 return;
             }
-            if let Err(reason) = memory.store_at(extraction, &conversation_id, epoch).await {
-                tracing::info!("no se guardaron los recuerdos: {reason}");
+            let (items, summary) = (extraction.items.len(), extraction.summary.is_some());
+            match memory.store_at(extraction, &conversation_id, epoch).await {
+                Ok(()) => tracing::debug!(
+                    conversation = %short_id(&conversation_id),
+                    items,
+                    summary,
+                    "se guardaron recuerdos"
+                ),
+                // Descartes esperables: se apagó, se borró la memoria o la
+                // conversación. Un fallo al escribir lo registra `store_at`.
+                Err(reason) => tracing::debug!(
+                    conversation = %short_id(&conversation_id),
+                    "no se guardaron los recuerdos: {reason}"
+                ),
             }
         });
     }
@@ -422,8 +454,9 @@ impl Memory {
         let db = self.usable(dir, &mut guard).await?;
         let (dir, conversation_id) = (dir.clone(), conversation_id.to_owned());
         let pruned = self.pruned_over_limit.clone();
-        blocking(move || write(&db, &dir, &extraction, &conversation_id, &pruned).map_err(text))
+        blocking(move || write(&db, &dir, &extraction, &conversation_id, &pruned).map_err(db_error))
             .await
+            .inspect_err(|error| tracing::warn!("no se pudo escribir en la memoria: {error}"))
     }
 
     /// Una conversación borrada (`DeleteConversation`): se descarta lo que
@@ -460,14 +493,21 @@ impl Memory {
         // Borrar no le manda nada a ningún modelo: la puerta del remoto no
         // aplica, sólo que esté encendida y abierta.
         if let Err(reason) = self.ensure_open(dir, &mut db).await {
-            tracing::info!("no se borraron los resúmenes de la conversación: {reason}");
+            tracing::warn!("no se borraron los resúmenes de la conversación: {reason}");
             return;
         }
         let Some(db) = db.clone() else { return };
         let id = conversation_id.to_owned();
-        if let Err(error) = blocking(move || schema::delete_summaries(&db, &id).map_err(text)).await
-        {
-            tracing::warn!("no se borraron los resúmenes de la conversación: {error}");
+        let short = short_id(conversation_id);
+        match blocking(move || schema::delete_summaries(&db, &id).map_err(db_error)).await {
+            Ok(deleted) => tracing::debug!(
+                conversation = %short,
+                deleted,
+                "se borraron los resúmenes de la conversación"
+            ),
+            Err(error) => {
+                tracing::warn!("no se borraron los resúmenes de la conversación: {error}")
+            }
         }
     }
 
@@ -542,16 +582,21 @@ impl Memory {
         if !enabled {
             // Apagar no borra nada: deja de usarla y de escribirla.
             close(db.take()).await;
-            return remove_flag(dir).await;
+            remove_flag(dir).await?;
+            tracing::info!("memoria apagada");
+            return Ok(());
         }
-        if is_dir(dir).await {
+        let created = !is_dir(dir).await;
+        if created {
+            self.create(dir, &mut db).await?;
+        } else {
             self.ensure_open(dir, &mut db)
                 .await
                 .map_err(|reason| Error::Unavailable(reason.into()))?;
-        } else {
-            self.create(dir, &mut db).await?;
         }
-        write_flag(dir).await
+        write_flag(dir).await?;
+        tracing::info!(created, "memoria encendida");
+        Ok(())
     }
 
     /// Borra la llave y los archivos; si estaba encendida, la recrea vacía con
@@ -569,19 +614,47 @@ impl Memory {
         self.secrets.delete_memory_key().await?;
         close(db.take()).await;
         let target = dir.to_owned();
-        blocking(move || remove_files(&target).map_err(text))
+        let shown = target.clone();
+        blocking(move || remove_files(&target).map_err(io_error(&shown)))
             .await
             .map_err(|error| {
                 Error::Unavailable(format!("No se pudo borrar la memoria: {error}"))
             })?;
-        if is_file(&flag(dir)).await {
+        let recreated = is_file(&flag(dir)).await;
+        if recreated {
             self.create(dir, &mut db).await?;
         }
+        tracing::info!(recreated, "memoria borrada");
         Ok(())
     }
 
     /// Abre la base si no lo está. Nunca crea ni borra nada.
     async fn ensure_open(
+        &self,
+        dir: &Path,
+        db: &mut Option<Arc<GrafeoDB>>,
+    ) -> Result<(), &'static str> {
+        let result = self.open_now(dir, db).await;
+        // Una línea la primera vez y cada vez que cambia el motivo: el estado y
+        // cada `recall` vuelven a intentarlo, y no hace falta repetirla. El
+        // motivo es un texto fijo, sin la llave.
+        let mut last = self.last_open_problem.lock();
+        match result {
+            Err(reason) if *last != Some(reason) => {
+                tracing::warn!("la memoria no se puede abrir: {reason}");
+                *last = Some(reason);
+            }
+            Ok(()) if last.is_some() => {
+                tracing::info!("la memoria se abrió");
+                *last = None;
+            }
+            _ => {}
+        }
+        result
+    }
+
+    /// Abre la base si no lo está, sin registrar el motivo de no poder.
+    async fn open_now(
         &self,
         dir: &Path,
         db: &mut Option<Arc<GrafeoDB>>,
@@ -660,21 +733,29 @@ fn flag(dir: &Path) -> PathBuf {
 }
 
 async fn write_flag(dir: &Path) -> Result<(), Error> {
+    let path = flag(dir);
     tokio::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(flag(dir))
+        .open(&path)
         .await
         .map(drop)
-        .map_err(|error| Error::Unavailable(format!("No se pudo encender la memoria: {error}")))
+        .map_err(|error| {
+            Error::Unavailable(format!(
+                "No se pudo encender la memoria: {}",
+                io_error(&path)(error)
+            ))
+        })
 }
 
 async fn remove_flag(dir: &Path) -> Result<(), Error> {
-    match tokio::fs::remove_file(flag(dir)).await {
+    let path = flag(dir);
+    match tokio::fs::remove_file(&path).await {
         Err(error) if error.kind() != io::ErrorKind::NotFound => Err(Error::Unavailable(format!(
-            "No se pudo apagar la memoria: {error}"
+            "No se pudo apagar la memoria: {}",
+            io_error(&path)(error)
         ))),
         _ => Ok(()),
     }
@@ -692,8 +773,17 @@ fn locked() -> Error {
     ))
 }
 
-fn text(error: impl Display) -> String {
-    error.to_string()
+/// Lo que se cuenta de un error de Grafeo: sólo su código (`GRAFEO-X002`).
+/// El texto de algunas variantes es libre y podría traer un valor guardado, y
+/// eso quedaría en claro en el registro o en un mensaje, fuera del cifrado.
+fn db_error(error: grafeo::Error) -> String {
+    error.error_code().to_string()
+}
+
+/// Lo que se cuenta de un error de E/S: la ruta (dentro de la carpeta de
+/// estado) y la clase del error, nunca el texto libre que pueda traer.
+fn io_error(path: &Path) -> impl FnOnce(io::Error) -> String + '_ {
+    move |error| format!("{}: {}", path.display(), error.kind())
 }
 
 /// La configuración de la base: cifrada, con WAL y con el tope de memoria. Los
@@ -722,12 +812,12 @@ fn open_existing(path: &Path, key: &[u8; MEMORY_KEY_BYTES]) -> Result<GrafeoDB, 
     let mut header = [0u8; HEADER_PREFIX_BYTES];
     std::fs::File::open(path)
         .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header))
-        .map_err(|error| format!("no se pudo leer {}: {error}", path.display()))?;
+        .map_err(io_error(path))?;
     if !is_encrypted_header(&header) {
         return Err(format!("{} no es una base 0.6 cifrada", path.display()));
     }
-    let db = GrafeoDB::with_config(config(path, key)).map_err(text)?;
-    schema::ensure_indexes(&db).map_err(text)?;
+    let db = GrafeoDB::with_config(config(path, key)).map_err(db_error)?;
+    schema::ensure_indexes(&db).map_err(db_error)?;
     Ok(db)
 }
 
@@ -762,26 +852,26 @@ fn create_files(dir: &Path, key: &[u8; MEMORY_KEY_BYTES]) -> Result<GrafeoDB, St
         .recursive(true)
         .mode(0o700)
         .create(parent)
-        .map_err(text)?;
-    remove_dir_if_exists(&tmp).map_err(text)?;
+        .map_err(io_error(parent))?;
+    remove_dir_if_exists(&tmp).map_err(io_error(&tmp))?;
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(&tmp)
-        .map_err(text)?;
+        .map_err(io_error(&tmp))?;
     let built = (|| {
-        let db = GrafeoDB::with_config(config(&tmp.join(DB_FILE), key)).map_err(text)?;
+        let db = GrafeoDB::with_config(config(&tmp.join(DB_FILE), key)).map_err(db_error)?;
         db.create_node_with_props(&["LinceMeta"], [("format", FORMAT_VERSION)])
-            .map_err(text)?;
-        schema::ensure_indexes(&db).map_err(text)?;
-        db.close().map_err(text)?;
+            .map_err(db_error)?;
+        schema::ensure_indexes(&db).map_err(db_error)?;
+        db.close().map_err(db_error)?;
         drop(db);
-        std::fs::rename(&tmp, dir).map_err(text)
+        std::fs::rename(&tmp, dir).map_err(io_error(&tmp))
     })();
     if let Err(error) = built {
         let _ = remove_dir_if_exists(&tmp);
         return Err(error);
     }
-    GrafeoDB::with_config(config(&dir.join(DB_FILE), key)).map_err(text)
+    GrafeoDB::with_config(config(&dir.join(DB_FILE), key)).map_err(db_error)
 }
 
 /// Borra `memory/` por `memory.deleting/`, y lo que haya quedado de un corte
@@ -849,8 +939,14 @@ fn write(
         // pasado por otra causa, podar en cada escritura terminaría borrando
         // toda la memoria. Mientras siga pasado, no se escribe.
         if pruned.swap(true, Ordering::SeqCst) {
+            tracing::debug!("la memoria sigue pasada de su tope: no se escribe");
             return Ok(());
         }
+        tracing::info!(
+            bytes = dir_size(dir),
+            max = MAX_MEMORY_DISK_BYTES,
+            "la memoria pasó su tope de espacio: se poda el 10 % de cada clase"
+        );
         schema::prune_tenth(db, now)?;
         if dir_size(dir) > MAX_MEMORY_DISK_BYTES {
             tracing::warn!("la memoria llegó a su tope de espacio: no se guarda nada más");
@@ -890,7 +986,7 @@ fn write(
 
 async fn close(db: Option<Arc<GrafeoDB>>) {
     let Some(db) = db else { return };
-    if let Err(error) = blocking(move || db.close().map_err(text)).await {
+    if let Err(error) = blocking(move || db.close().map_err(db_error)).await {
         tracing::warn!("no se pudo cerrar la memoria: {error}");
     }
 }
@@ -901,7 +997,15 @@ async fn blocking<T: Send + 'static>(
 ) -> Result<T, String> {
     tokio::task::spawn_blocking(work)
         .await
-        .unwrap_or_else(|error| Err(error.to_string()))
+        // Un texto fijo: el de un `JoinError` trae el mensaje del pánico de lo
+        // que corría adentro, y eso puede llevar un valor.
+        .unwrap_or_else(|error| {
+            Err(if error.is_panic() {
+                "la tarea de la memoria falló (pánico)".to_owned()
+            } else {
+                "la tarea de la memoria se canceló".to_owned()
+            })
+        })
 }
 
 #[cfg(test)]
@@ -2355,5 +2459,492 @@ mod forget_tests {
         until_idle(&memory).await;
 
         assert!(memory.in_flight.lock().is_none());
+    }
+}
+
+/// El registro de la memoria: cada camino de error deja su línea, con el nivel
+/// que corresponde, y nunca el texto de un recuerdo.
+#[cfg(test)]
+mod log_tests {
+    use super::learn::Item;
+    use super::*;
+    use crate::test_support::{
+        capture_logs, FakeBackend, FixedKey, LogCapture, ScriptedBackend, TempDir,
+    };
+
+    fn line(log: &LogCapture, pieces: &[&str]) -> String {
+        let text = log.text();
+        text.lines()
+            .find(|l| pieces.iter().all(|piece| l.contains(piece)))
+            .unwrap_or_else(|| panic!("falta una línea con {pieces:?}:\n{text}"))
+            .to_owned()
+    }
+
+    async fn enabled() -> (TempDir, Arc<FixedKey>, Arc<Memory>) {
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
+        memory.set_enabled(true).await.unwrap();
+        (tmp, keys, memory)
+    }
+
+    fn preference(text: &str) -> Extraction {
+        Extraction {
+            items: vec![Item {
+                kind: MemoryKind::Preference,
+                text: text.into(),
+                phrase: None,
+                topics: Vec::new(),
+            }],
+            summary: None,
+        }
+    }
+
+    fn turn() -> Vec<Message> {
+        vec![
+            Message {
+                role: Role::User,
+                content: "prefiero mensajecanarioqzx".into(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: "respuestacanariaqzx".into(),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn una_cabecera_invalida_deja_la_linea_warn_de_que_no_se_pudo_abrir() {
+        let (tmp, keys, memory) = enabled().await;
+        memory.close().await;
+        std::fs::write(tmp.memory_dir().join(DB_FILE), b"esto no es una base").unwrap();
+        let broken = Memory::new(Some(tmp.memory_dir()), keys);
+        let (log, _guard) = capture_logs();
+
+        let status = broken.status().await;
+
+        assert_eq!(status.reason, REASON_NOT_OPENED);
+        let l = line(&log, &["no se pudo abrir la memoria"]);
+        assert!(l.contains("WARN"), "{l}");
+    }
+
+    // Con la llave ausente (o bloqueada, duplicada o inválida) la memoria
+    // quedaba no disponible y el motivo sólo llegaba a quien preguntaba el
+    // estado; el journal no decía nada.
+    #[tokio::test]
+    async fn una_llave_ausente_deja_su_linea_al_intentar_abrir_la_memoria() {
+        let (tmp, keys, memory) = enabled().await;
+        memory.close().await;
+        *keys.memory_key.lock() = None;
+        let broken = Memory::new(Some(tmp.memory_dir()), keys);
+        let (log, _guard) = capture_logs();
+
+        let status = broken.status().await;
+
+        assert_eq!(status.reason, REASON_MISSING_KEY);
+        let l = line(&log, &["WARN"]);
+        assert!(l.contains("llave"), "{l}");
+    }
+
+    #[tokio::test]
+    async fn una_extraccion_que_falla_deja_su_linea_warn_con_la_conversacion_en_corto() {
+        let (_tmp, _keys, memory) = enabled().await;
+        let backend = Arc::new(FakeBackend::failing(
+            crate::backend::BackendError::Unavailable("el modelo se cayó".into()),
+        ));
+        let (log, _guard) = capture_logs();
+
+        memory.learn_after(
+            backend.clone(),
+            "123e4567-e89b-12d3-a456-426614174000",
+            turn(),
+        );
+        memory.wait_until_idle().await;
+
+        let l = line(&log, &["la extracción de recuerdos no respondió"]);
+        assert!(
+            l.contains("WARN") && l.contains("conversation=123e4567"),
+            "{l}"
+        );
+        assert!(!l.contains("e89b"), "{l}");
+        let text = log.text();
+        assert!(!text.contains("mensajecanarioqzx") && !text.contains("respuestacanariaqzx"));
+    }
+
+    #[tokio::test]
+    async fn una_extraccion_que_guarda_o_que_no_trae_nada_va_en_debug_sin_el_contenido() {
+        let (_tmp, _keys, memory) = enabled().await;
+        let saved = ScriptedBackend::new([
+            r#"{"items":[{"kind":"preference","text":"Prefiere recuerdocanarioqzx"}],"summary":null}"#,
+        ]);
+        let (log, _guard) = capture_logs();
+
+        memory.learn_after(saved.clone(), "c1", turn());
+        memory.wait_until_idle().await;
+        let l = line(&log, &["se guardaron recuerdos"]);
+        assert!(
+            l.contains("DEBUG") && l.contains("items=1") && l.contains("summary=false"),
+            "{l}"
+        );
+
+        let empty = ScriptedBackend::new([r#"{"items":[],"summary":null}"#]);
+        memory.learn_after(empty.clone(), "c2", turn());
+        memory.wait_until_idle().await;
+        let l = line(&log, &["la extracción no trajo nada que recordar"]);
+        assert!(l.contains("DEBUG"), "{l}");
+        assert!(!log.text().contains("recuerdocanarioqzx"));
+    }
+
+    #[tokio::test]
+    async fn un_descarte_esperable_va_en_debug_y_no_en_warn() {
+        let (_tmp, _keys, memory) = enabled().await;
+        let backend = ScriptedBackend::new([
+            r#"{"items":[{"kind":"preference","text":"Prefiere el mate"}],"summary":null}"#,
+        ]);
+        memory.forget_conversation("c1").await;
+        let (log, _guard) = capture_logs();
+
+        memory
+            .store_at(preference("Prefiere el mate"), "c1", memory.epoch())
+            .await
+            .unwrap_err();
+        memory.learn_after(backend, "c1", turn());
+        memory.wait_until_idle().await;
+
+        assert!(!log.text().contains(" WARN "), "{}", log.text());
+    }
+
+    #[tokio::test]
+    async fn pasado_el_tope_se_poda_y_se_dice_en_info_y_despues_en_warn_y_en_debug() {
+        let (tmp, _keys, memory) = enabled().await;
+        for n in 0..10 {
+            memory
+                .store(preference(&format!("Prefiere la cosa número {n}")), "c")
+                .await
+                .unwrap();
+        }
+        std::fs::write(
+            tmp.memory_dir().join("relleno"),
+            vec![0u8; MAX_MEMORY_DISK_BYTES as usize + 1],
+        )
+        .unwrap();
+        let db = memory.database().await.unwrap();
+        let pruned = AtomicBool::new(false);
+        let (log, _guard) = capture_logs();
+
+        // `write` corre acá, en el hilo de la prueba, donde se captura el registro.
+        write(
+            &db,
+            &tmp.memory_dir(),
+            &preference("Prefiere lo nuevo"),
+            "c",
+            &pruned,
+        )
+        .unwrap();
+        write(
+            &db,
+            &tmp.memory_dir(),
+            &preference("Prefiere lo otro"),
+            "c",
+            &pruned,
+        )
+        .unwrap();
+
+        let pruning = line(&log, &["la memoria pasó su tope de espacio"]);
+        assert!(
+            pruning.contains("INFO") && pruning.contains("max=4194304"),
+            "{pruning}"
+        );
+        assert!(pruning.contains("bytes="), "{pruning}");
+        let full = line(&log, &["la memoria llegó a su tope de espacio"]);
+        assert!(full.contains("WARN"), "{full}");
+        let still = line(&log, &["la memoria sigue pasada de su tope"]);
+        assert!(still.contains("DEBUG"), "{still}");
+        // Una sola poda por episodio.
+        assert_eq!(log.text().matches("la memoria pasó su tope").count(), 1);
+        assert!(!log.text().contains("Prefiere lo nuevo"));
+    }
+
+    #[tokio::test]
+    async fn olvidar_una_conversacion_con_la_memoria_que_no_abre_deja_una_linea_warn() {
+        let (tmp, _keys, memory) = enabled().await;
+        memory.close().await;
+        let keys = FixedKey::new(None);
+        let broken = Memory::new(Some(tmp.memory_dir()), keys);
+        let (log, _guard) = capture_logs();
+
+        broken.forget_conversation("c1").await;
+
+        let l = line(&log, &["no se borraron los resúmenes de la conversación"]);
+        assert!(l.contains("WARN"), "{l}");
+    }
+
+    #[tokio::test]
+    async fn borrar_los_resumenes_deja_una_linea_debug_con_cuantos() {
+        let (_tmp, _keys, memory) = enabled().await;
+        memory
+            .store(
+                Extraction {
+                    items: Vec::new(),
+                    summary: Some("Resumen canario qzx".into()),
+                },
+                "123e4567-e89b-12d3-a456-426614174000",
+            )
+            .await
+            .unwrap();
+        let (log, _guard) = capture_logs();
+
+        memory
+            .forget_conversation("123e4567-e89b-12d3-a456-426614174000")
+            .await;
+
+        let l = line(&log, &["se borraron los resúmenes de la conversación"]);
+        assert!(
+            l.contains("DEBUG") && l.contains("deleted=1") && l.contains("conversation=123e4567"),
+            "{l}"
+        );
+        assert!(!log.text().contains("canario qzx"));
+    }
+
+    #[tokio::test]
+    async fn encender_con_el_llavero_caido_y_crear_con_una_llave_que_no_se_relee_dejan_su_warn() {
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        *keys.duplicated.lock() = true;
+        let memory = Memory::new(Some(tmp.memory_dir()), keys);
+        let (log, _guard) = capture_logs();
+
+        let result = memory.set_enabled(true).await;
+
+        assert!(result.is_err());
+        let l = line(&log, &["la llave de la memoria no se pudo releer"]);
+        assert!(l.contains("WARN"), "{l}");
+    }
+
+    // ── Sin texto libre de Grafeo ni de E/S ───────────────────────────────────
+
+    #[test]
+    fn un_error_de_grafeo_se_cuenta_solo_por_su_codigo() {
+        for error in [
+            grafeo::Error::InvalidValue("valorcanarioqzx".into()),
+            grafeo::Error::PropertyNotFound("valorcanarioqzx".into()),
+            grafeo::Error::LabelNotFound("valorcanarioqzx".into()),
+            grafeo::Error::Internal("valorcanarioqzx".into()),
+            grafeo::Error::TypeMismatch {
+                expected: "valorcanarioqzx".into(),
+                found: "valorcanarioqzx".into(),
+            },
+        ] {
+            let code = error.error_code().to_string();
+            let shown = db_error(error);
+            assert_eq!(shown, code);
+            assert!(shown.starts_with("GRAFEO-"), "{shown}");
+            assert!(!shown.contains("canarioqzx"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn un_error_de_e_s_se_cuenta_por_la_ruta_y_la_clase_y_nunca_por_su_texto() {
+        let path = Path::new("/var/lib/vasak-assistant/memory");
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::NotFound,
+            io::ErrorKind::Other,
+        ] {
+            let shown = io_error(path)(io::Error::new(kind, "textolibrecanarioqzx"));
+            assert_eq!(shown, format!("{}: {kind}", path.display()));
+            assert!(!shown.contains("canarioqzx"), "{shown}");
+        }
+        let os = io_error(path)(io::Error::from_raw_os_error(13));
+        assert_eq!(os, format!("{}: permission denied", path.display()));
+    }
+
+    #[tokio::test]
+    async fn un_fallo_real_de_e_s_al_crear_la_memoria_dice_la_ruta_y_la_clase() {
+        let tmp = TempDir::new();
+        // La carpeta de estado es un archivo: no se puede crear `memory/` adentro.
+        let blocker = tmp.path().join("estado");
+        std::fs::write(&blocker, b"x").unwrap();
+        let memory = Memory::new(Some(blocker.join("memory")), FixedKey::new(None));
+        let (log, _guard) = capture_logs();
+
+        let error = memory.set_enabled(true).await.unwrap_err();
+
+        let Error::Unavailable(text) = error else {
+            panic!("tenía que ser Unavailable");
+        };
+        assert!(text.contains("estado"), "{text}");
+        assert!(!text.contains("Not a directory"), "{text}");
+        assert!(!log.text().contains("Not a directory"), "{}", log.text());
+    }
+
+    // ── La memoria que no se abre: una línea por motivo ───────────────────────
+
+    fn count(log: &LogCapture, text: &str) -> usize {
+        log.text().matches(text).count()
+    }
+
+    #[tokio::test]
+    async fn el_warn_de_que_no_se_puede_abrir_no_se_repite_con_el_mismo_motivo() {
+        let (tmp, keys, memory) = enabled().await;
+        memory.close().await;
+        *keys.memory_key.lock() = None;
+        let broken = Memory::new(Some(tmp.memory_dir()), keys);
+        let (log, _guard) = capture_logs();
+
+        for _ in 0..4 {
+            assert_eq!(broken.status().await.reason, REASON_MISSING_KEY);
+            assert_eq!(broken.recall("hola", true).await, None);
+        }
+
+        let l = line(&log, &["la memoria no se puede abrir"]);
+        assert!(l.contains("WARN") && l.contains(REASON_MISSING_KEY), "{l}");
+        assert_eq!(count(&log, "la memoria no se puede abrir"), 1);
+        assert_eq!(count(&log, "la memoria se abrió"), 0);
+    }
+
+    #[tokio::test]
+    async fn el_warn_vuelve_a_salir_cuando_cambia_el_motivo_y_hay_info_al_reabrir() {
+        let (tmp, keys, memory) = enabled().await;
+        memory.close().await;
+        let good = keys.memory_key.lock().clone();
+        let broken = Memory::new(Some(tmp.memory_dir()), keys.clone());
+        let (log, _guard) = capture_logs();
+
+        // Primer motivo: la llave falta.
+        *keys.memory_key.lock() = None;
+        broken.status().await;
+        broken.status().await;
+        // Segundo motivo: el llavero está bloqueado (con la llave puesta).
+        *keys.memory_key.lock() = good.clone();
+        *keys.locked.lock() = true;
+        broken.status().await;
+        broken.status().await;
+        assert_eq!(count(&log, "la memoria no se puede abrir"), 2);
+        assert!(log.text().contains(REASON_MISSING_KEY) && log.text().contains(REASON_LOCKED));
+        // Vuelve el primero: otro aviso, porque cambió respecto del último.
+        *keys.locked.lock() = false;
+        *keys.memory_key.lock() = None;
+        broken.status().await;
+        assert_eq!(count(&log, "la memoria no se puede abrir"), 3);
+        // Se arregla: un info, una sola vez.
+        *keys.memory_key.lock() = good;
+        assert!(broken.status().await.available);
+        broken.status().await;
+        broken.recall("hola", true).await;
+        let l = line(&log, &["la memoria se abrió"]);
+        assert!(l.contains("INFO"), "{l}");
+        assert_eq!(count(&log, "la memoria se abrió"), 1);
+        // Si vuelve a fallar después de reabrir, avisa de nuevo.
+        broken.close().await;
+        *keys.memory_key.lock() = None;
+        broken.status().await;
+        assert_eq!(count(&log, "la memoria no se puede abrir"), 4);
+    }
+
+    #[tokio::test]
+    async fn abrir_bien_desde_el_principio_no_deja_ni_warn_ni_info() {
+        let (_tmp, _keys, memory) = enabled().await;
+        let (log, _guard) = capture_logs();
+
+        memory.status().await;
+        memory.recall("hola", true).await;
+
+        assert_eq!(count(&log, "la memoria no se puede abrir"), 0);
+        assert_eq!(count(&log, "la memoria se abrió"), 0);
+    }
+
+    #[tokio::test]
+    async fn el_warn_de_no_poder_abrir_lleva_el_motivo_fijo_y_nunca_la_llave() {
+        let (tmp, keys, memory) = enabled().await;
+        memory.close().await;
+        let key = keys.memory_key.lock().clone().unwrap();
+        *keys.memory_key.lock() = Some(vec![7u8; 32]);
+        let broken = Memory::new(Some(tmp.memory_dir()), keys);
+        let (log, _guard) = capture_logs();
+
+        broken.status().await;
+
+        let text = log.text();
+        assert!(text.contains(REASON_NOT_OPENED), "{text}");
+        for byte in [key[0], 7u8] {
+            assert!(
+                !text.contains(&format!("{byte:02x}{byte:02x}{byte:02x}")),
+                "{text}"
+            );
+        }
+        assert!(!text.contains("[7, 7"), "{text}");
+    }
+
+    // ── El texto fijo de una tarea que falla y el indicador ───────────────────
+
+    #[tokio::test]
+    async fn una_tarea_bloqueante_que_entra_en_panico_no_deja_su_mensaje_en_el_error_ni_en_el_registro(
+    ) {
+        let (log, _guard) = capture_logs();
+
+        let result: Result<(), String> =
+            blocking(|| panic!("mensajecanariopanicoqzx con valorcanarioqzx")).await;
+
+        let error = result.unwrap_err();
+        assert_eq!(error, "la tarea de la memoria falló (pánico)");
+        assert!(!error.contains("canario"), "{error}");
+        assert!(!log.text().contains("canario"), "{}", log.text());
+        // Una tarea que anda sigue andando.
+        assert_eq!(blocking(|| Ok::<_, String>(7)).await, Ok(7));
+        assert_eq!(
+            blocking(|| Err::<(), _>("motivo propio".to_owned())).await,
+            Err("motivo propio".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn un_fallo_al_escribir_el_indicador_dice_ruta_y_clase_y_no_el_texto_del_sistema() {
+        let tmp = TempDir::new();
+        let memory = Memory::new(Some(tmp.memory_dir()), FixedKey::new(None));
+        // `enabled` ya existe y es una carpeta: no se puede abrir como archivo.
+        std::fs::create_dir(tmp.path().join("enabled")).unwrap();
+        let (log, _guard) = capture_logs();
+
+        let error = memory.set_enabled(true).await.unwrap_err();
+
+        let Error::Unavailable(text) = error else {
+            panic!("tenía que ser Unavailable");
+        };
+        assert!(
+            text.starts_with("No se pudo encender la memoria: "),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{}", tmp.path().join("enabled").display())),
+            "{text}"
+        );
+        for system in ["Is a directory", "os error"] {
+            assert!(!text.contains(system), "{text}");
+        }
+        assert!(!log.text().contains("os error"), "{}", log.text());
+    }
+
+    #[tokio::test]
+    async fn un_fallo_al_borrar_el_indicador_dice_ruta_y_clase_y_no_el_texto_del_sistema() {
+        let tmp = TempDir::new();
+        let memory = Memory::new(Some(tmp.memory_dir()), FixedKey::new(None));
+        let flag_dir = tmp.path().join("enabled");
+        std::fs::create_dir(&flag_dir).unwrap();
+        std::fs::write(flag_dir.join("algo"), b"x").unwrap();
+
+        let error = memory.set_enabled(false).await.unwrap_err();
+
+        let Error::Unavailable(text) = error else {
+            panic!("tenía que ser Unavailable");
+        };
+        assert!(text.starts_with("No se pudo apagar la memoria: "), "{text}");
+        assert!(text.contains(&format!("{}", flag_dir.display())), "{text}");
+        for system in ["os error", "Directory not empty", "Is a directory"] {
+            assert!(!text.contains(system), "{system}: {text}");
+        }
+        // Un indicador que ya no está no es un error.
+        std::fs::remove_dir_all(&flag_dir).unwrap();
+        memory.set_enabled(false).await.unwrap();
     }
 }

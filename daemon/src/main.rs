@@ -18,6 +18,7 @@ mod config;
 mod conversations;
 mod http;
 mod keyring;
+mod logging;
 mod memory;
 mod ollama;
 mod openai;
@@ -30,12 +31,7 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use parking_lot::Mutex;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::level_filters::LevelFilter;
 use tracing::{info, warn};
-use tracing_subscriber::filter::{EnvFilter, FilterExt, Targets};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::Layer;
 use zbus::names::BusName;
 use zbus::{connection, Connection};
 
@@ -51,32 +47,7 @@ use vasak_assistant_protocol::{SERVICE_NAME, SERVICE_PATH};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // El nombre del crate lo pone el compilador: el binario es
-    // `vasak-assistant` pero el paquete es `vasak-assistant-daemon`.
-    let env = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| format!("{}=info", env!("CARGO_CRATE_NAME")).into());
-    // Las bibliotecas que ven los cuerpos (el bus, HTTP, TLS) no pasan de
-    // `info` aunque `RUST_LOG` pida más: en `debug` o `trace` vuelcan mensajes
-    // del bus, conversaciones y la cabecera con la clave. `Targets` va aparte
-    // del filtro del entorno, así que nada en `RUST_LOG` lo afloja.
-    let libraries = Targets::new()
-        .with_default(LevelFilter::TRACE)
-        .with_targets(
-            [
-                "zbus",
-                "zvariant",
-                "hyper",
-                "hyper_util",
-                "h2",
-                "reqwest",
-                "rustls",
-                "tower",
-            ]
-            .map(|target| (target, LevelFilter::INFO)),
-        );
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_filter(env.and(libraries)))
-        .init();
+    logging::init();
 
     let settings = config::read_settings();
     let client = http::client()?;
@@ -87,16 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let backend: Arc<dyn ModelBackend> = match config::select_backend(&settings) {
         Ok(selection) => {
-            info!(
-                "backend: {} en {} ({}), modelo {}",
-                config::provider_name(selection.kind),
-                http::origin(&selection.url),
-                if selection.local { "local" } else { "remoto" },
-                selection
-                    .model
-                    .as_deref()
-                    .unwrap_or("(el primero que ofrezca)")
-            );
+            info!("{}", logging::backend_summary(&selection));
             let backend: Arc<dyn ModelBackend> = match selection.kind {
                 BackendKind::Ollama => {
                     Arc::new(OllamaBackend::new(client, selection, settings.allow_remote))
@@ -108,7 +70,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(Limited::new(backend))
         }
         Err(rejection) => {
-            warn!("backend no disponible: {}", rejection.reason);
+            warn!(
+                backend = rejection.info.provider.as_str(),
+                "backend no disponible: {}", rejection.reason
+            );
             Arc::new(RejectedBackend {
                 info: rejection.info,
                 reason: rejection.reason,
@@ -126,6 +91,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Memory::from_env(secrets.clone())
             .with_remote_blocked(remote_blocked)
             .with_share_with_remote(settings.share_memory_with_remote),
+    );
+    info!(
+        "{}",
+        logging::startup_summary(&settings, &backend.info(), memory.is_enabled().await)
     );
     let service = AssistantService {
         backend,
@@ -147,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .receive_name_owner_changed()
         .await?;
     connection.request_name(SERVICE_NAME).await?;
-    info!("servicio en {SERVICE_NAME}");
+    info!(name = SERVICE_NAME, "servicio en el bus de sesión");
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -163,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // `DeleteConversation`, que es pedirlo, los borra.
                     let released = conversations.lock().release_owner(name.as_str());
                     if released > 0 {
-                        info!("{name} se fue: se liberan {released} conversaciones");
+                        info!(sender = %name, released, "la conexión se fue: se liberan sus conversaciones");
                     }
                 }
             }
