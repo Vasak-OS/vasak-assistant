@@ -689,7 +689,9 @@ impl Memory {
                 Ok(())
             }
             Err(error) => {
-                tracing::warn!("no se pudo abrir la memoria: {error}");
+                // El detalle, en cada intento; el aviso, una vez por motivo, lo
+                // deja `ensure_open`.
+                tracing::debug!("no se pudo abrir la memoria: {error}");
                 Err(REASON_NOT_OPENED)
             }
         }
@@ -2547,8 +2549,11 @@ mod log_tests {
         let status = broken.status().await;
 
         assert_eq!(status.reason, REASON_NOT_OPENED);
+        // El detalle va en DEBUG; el aviso en WARN es el de `ensure_open`.
         let l = line(&log, &["no se pudo abrir la memoria"]);
-        assert!(l.contains("WARN"), "{l}");
+        assert!(l.contains("DEBUG"), "{l}");
+        let w = line(&log, &["la memoria no se puede abrir"]);
+        assert!(w.contains("WARN") && w.contains(REASON_NOT_OPENED), "{w}");
     }
 
     // Con la llave ausente (o bloqueada, duplicada o inválida) la memoria
