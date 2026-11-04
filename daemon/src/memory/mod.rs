@@ -379,6 +379,11 @@ impl Memory {
                 return;
             }
             let request = learn::extraction_request(&conversation, gate);
+            // La extracción no cuenta para el tope de chats del dueño (#3): hay
+            // una sola a la vez para todo el servicio (`learning`), así que
+            // ocupa como mucho un lugar del cupo global y ningún cliente la
+            // puede multiplicar. Contarla le sacaría a la persona uno de sus dos
+            // chats justo después de cada respuesta.
             // Sin permiso para el remoto, la extracción sólo va a un modelo
             // local, decidido con la misma resolución que manda el pedido.
             let sent = if memory.share_with_remote {

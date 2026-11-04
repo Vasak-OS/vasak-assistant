@@ -122,11 +122,18 @@ pub const MAX_IN_FLIGHT: usize = 4;
 /// necesita enterarse de cada vez.
 pub const ACTIVE_MODEL_TTL: Duration = Duration::from_secs(5);
 
+/// Cuántos `models` y `active_model` puede haber en vuelo a la vez. Van con su
+/// propio cupo, aparte del de los chats: un `Status` o un `Models` no espera
+/// detrás de chats de hasta 300 s (#3).
+pub const MAX_METADATA_IN_FLIGHT: usize = 2;
+
 /// Envuelve un backend con un tope de pedidos simultáneos y una caché corta del
 /// modelo activo.
 pub struct Limited {
     inner: Arc<dyn ModelBackend>,
     permits: Semaphore,
+    /// El cupo de `models` y `active_model`, aparte del de los chats.
+    metadata_permits: Semaphore,
     active: parking_lot::Mutex<Option<(Instant, Result<ModelInfo, BackendError>)>>,
 }
 
@@ -135,16 +142,17 @@ impl Limited {
         Self {
             inner,
             permits: Semaphore::new(MAX_IN_FLIGHT),
+            metadata_permits: Semaphore::new(MAX_METADATA_IN_FLIGHT),
             active: parking_lot::Mutex::new(None),
         }
     }
 
     async fn permit(&self) -> Result<SemaphorePermit<'_>, BackendError> {
-        // El semáforo sólo se cierra a mano, y acá nadie lo cierra.
-        self.permits
-            .acquire()
-            .await
-            .map_err(|_| BackendError::Failed("el servicio se está cerrando".into()))
+        acquire(&self.permits).await
+    }
+
+    async fn metadata_permit(&self) -> Result<SemaphorePermit<'_>, BackendError> {
+        acquire(&self.metadata_permits).await
     }
 }
 
@@ -155,7 +163,7 @@ impl ModelBackend for Limited {
 
     fn models(&self) -> BoxFuture<'_, Result<Vec<String>, BackendError>> {
         Box::pin(async move {
-            let _permit = self.permit().await?;
+            let _permit = self.metadata_permit().await?;
             let started = Instant::now();
             let result = self.inner.models().await;
             log_request(&self.inner, "models", started, &result);
@@ -170,8 +178,20 @@ impl ModelBackend for Limited {
                     return cached.clone();
                 }
             }
+            // Sin lugar libre, lo último que se supo aunque esté vencido: el
+            // estado no tiene que esperar. Sin nada guardado, se espera el
+            // turno, en el cupo propio, que no compite con los chats.
+            let permit = match self.metadata_permits.try_acquire() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    if let Some((_, cached)) = &*self.active.lock() {
+                        return cached.clone();
+                    }
+                    self.metadata_permit().await?
+                }
+            };
             let result = {
-                let _permit = self.permit().await?;
+                let _permit = permit;
                 let started = Instant::now();
                 let result = self.inner.active_model().await;
                 log_request(&self.inner, "active_model", started, &result);
@@ -204,6 +224,14 @@ impl ModelBackend for Limited {
             result
         })
     }
+}
+
+async fn acquire(semaphore: &Semaphore) -> Result<SemaphorePermit<'_>, BackendError> {
+    // Los semáforos sólo se cierran a mano, y acá nadie los cierra.
+    semaphore
+        .acquire()
+        .await
+        .map_err(|_| BackendError::Failed("el servicio se está cerrando".into()))
 }
 
 /// Una línea por pedido a un backend: el proveedor, la operación y cuánto

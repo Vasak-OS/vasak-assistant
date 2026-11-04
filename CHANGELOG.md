@@ -2,6 +2,21 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-assistant 0.3.5
+
+Un solo cliente ya no acapara los pedidos al modelo (#3).
+
+- **`protocol`** — `MAX_CHATS_IN_FLIGHT_PER_OWNER` (2): cuántos `Chat` puede
+  tener una conexión esperando respuesta a la vez. Pasado eso, `Chat` da
+  `Busy`.
+- **`daemon`** — el tope por dueño se cuenta en las conversaciones, bajo el
+  mismo candado que las marca ocupadas, y el rechazo no ocupa lugar en el
+  backend; queda en el registro como cualquier llamada rechazada. `models` y
+  `active_model` tienen su propio cupo, aparte del de los chats; sin lugar
+  libre, `active_model` devuelve lo último que se supo aunque esté vencido. La
+  extracción de recuerdos en segundo plano no cuenta para el tope del dueño:
+  hay una sola a la vez para todo el servicio.
+
 ## vasak-assistant 0.3.4
 
 Un registro de errores completo y que no filtra datos (#29).

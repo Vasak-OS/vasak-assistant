@@ -20,8 +20,8 @@ use std::collections::HashMap;
 
 use uuid::Uuid;
 use vasak_assistant_protocol::{
-    Error, Message, Role, MAX_CONVERSATIONS, MAX_CONVERSATIONS_PER_OWNER, MAX_HISTORY_BYTES,
-    MAX_HISTORY_MESSAGES, MAX_MESSAGE_BYTES,
+    Error, Message, Role, MAX_CHATS_IN_FLIGHT_PER_OWNER, MAX_CONVERSATIONS,
+    MAX_CONVERSATIONS_PER_OWNER, MAX_HISTORY_BYTES, MAX_HISTORY_MESSAGES, MAX_MESSAGE_BYTES,
 };
 
 struct Conversation {
@@ -117,12 +117,28 @@ impl Conversations {
         content: &str,
     ) -> Result<Vec<Message>, Error> {
         validate_content(content)?;
-        let conversation = self.get_mut(owner, id)?;
-        if conversation.busy {
+        if self.get(owner, id)?.busy {
             return Err(Error::Busy(
                 "la conversación todavía está esperando la respuesta anterior".into(),
             ));
         }
+        // El tope por dueño (#3): con los chats en vuelo de una conexión
+        // contados acá, bajo el mismo candado que los marca, un cliente no
+        // ocupa todo el cupo del backend. `Busy` y no `LimitExceeded`: es
+        // pasajero, alcanza con esperar a que llegue una respuesta, mientras
+        // que `LimitExceeded` es el tope de conversaciones abiertas, que no se
+        // libera solo.
+        let in_flight = self
+            .open
+            .values()
+            .filter(|conversation| conversation.owner == owner && conversation.busy)
+            .count();
+        if in_flight >= MAX_CHATS_IN_FLIGHT_PER_OWNER {
+            return Err(Error::Busy(format!(
+                "ya hay {in_flight} pedidos esperando respuesta del modelo; esperá a que termine uno"
+            )));
+        }
+        let conversation = self.get_mut(owner, id)?;
         conversation.busy = true;
         let mut context = conversation.messages.clone();
         context.push(Message {

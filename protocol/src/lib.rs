@@ -62,6 +62,12 @@ pub const MAX_CONVERSATIONS: usize = 32;
 /// Cuántas conversaciones abiertas puede tener una misma conexión.
 pub const MAX_CONVERSATIONS_PER_OWNER: usize = 8;
 
+/// Cuántos `Chat` puede tener una misma conexión esperando respuesta a la vez,
+/// entre todas sus conversaciones. Pasado eso, `Chat` da `Busy` sin ocupar
+/// lugar en el backend: así un solo cliente no acapara los pedidos al modelo
+/// y los demás no esperan hasta el plazo de D-Bus.
+pub const MAX_CHATS_IN_FLIGHT_PER_OWNER: usize = 2;
+
 /// Cuántos mensajes guarda una conversación. Pasado eso se olvidan los más
 /// viejos; el último intercambio se conserva siempre.
 pub const MAX_HISTORY_MESSAGES: usize = 100;
@@ -207,7 +213,9 @@ pub enum Error {
     NotFound(String),
     /// Se llegó a [`MAX_CONVERSATIONS`] o a [`MAX_CONVERSATIONS_PER_OWNER`].
     LimitExceeded(String),
-    /// La conversación ya está esperando una respuesta.
+    /// La conversación ya está esperando una respuesta, o quien llama ya tiene
+    /// [`MAX_CHATS_IN_FLIGHT_PER_OWNER`] chats esperando la suya. Es
+    /// pasajero: se puede volver a intentar cuando llegue una respuesta.
     Busy(String),
     /// Quien llama no puede hacer eso: una aplicación confinada (AppArmor) no
     /// enciende, apaga ni borra la memoria, ni guarda o consulta claves.
