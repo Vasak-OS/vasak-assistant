@@ -2995,9 +2995,12 @@ mod log_tests {
         );
         fill(&tmp);
 
+        // La primera poda y sigue pasada; la segunda ya ni poda.
         let over = memory.store(preference("Prefiere lo nuevo"), "c").await;
+        let still = memory.store(preference("Prefiere lo otro"), "c").await;
 
         assert_eq!(over, Ok(false));
+        assert_eq!(still, Ok(false));
         // Lo nuevo no entró (la poda pudo dejar la memoria sin recuerdos).
         let notes = memory.recall("nuevo", false).await;
         assert!(notes.is_none_or(|block| !block.contains("lo nuevo")));
