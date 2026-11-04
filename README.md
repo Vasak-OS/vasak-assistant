@@ -247,7 +247,8 @@ host y puerto). De un error de la base de la memoria se registra sólo su códig
 (`GRAFEO-…`), de uno de archivos la ruta y la clase, y de un `vasak.conf` que no
 se puede leer, la línea, la columna y la clase del error, nunca el valor. Los
 errores del bus y del llavero (zbus) sí se registran con su texto: viene del
-demonio del bus o de `vasak-keyring` y no trae secretos. Las
+demonio del bus o de `vasak-keyring` y no trae secretos. Un pánico deja sólo
+dónde ocurrió (archivo y línea), nunca su mensaje. Las
 bibliotecas que ven los cuerpos (el bus, HTTP, TLS) no pasan de `info` aunque
 `RUST_LOG` pida más.
 

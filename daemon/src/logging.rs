@@ -15,7 +15,8 @@
 //! ruta. Los textos de los errores del contrato ya están escritos para
 //! mostrarse y no llevan nada de eso. De un error de Grafeo se cuenta sólo su
 //! código, de uno de E/S la ruta y la clase (`memory`), y de un error de serde
-//! en `vasak.conf` la línea, la columna y la clase (`config`). Las bibliotecas
+//! en `vasak.conf` la línea, la columna y la clase (`config`). Un pánico deja
+//! sólo dónde ocurrió ([`panic_report`]), nunca su mensaje. Las bibliotecas
 //! que ven los cuerpos (el bus, HTTP, TLS) no pasan de `info` aunque `RUST_LOG`
 //! pida más.
 
@@ -56,6 +57,30 @@ pub fn init() {
             .init();
     } else {
         registry.with(layer.with_filter(filter)).init();
+    }
+    install_panic_hook();
+}
+
+/// Instala el aviso de pánico: una línea `error` sólo con dónde ocurrió
+/// ([`panic_report`]), nunca con el mensaje. El de Rust por omisión escribe el
+/// mensaje en stderr, que va al journal, y ese mensaje puede llevar un valor.
+/// Si todavía no hay registro, la misma línea va directo a stderr.
+pub fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let report = panic_report(info.location());
+        if tracing::dispatcher::has_been_set() {
+            tracing::error!("{report}");
+        } else {
+            eprintln!("{report}");
+        }
+    }));
+}
+
+/// Lo que se cuenta de un pánico: el archivo y la línea donde ocurrió.
+pub fn panic_report(location: Option<&std::panic::Location<'_>>) -> String {
+    match location {
+        Some(location) => format!("pánico en {}:{}", location.file(), location.line()),
+        None => "pánico en un lugar desconocido".to_owned(),
     }
 }
 
@@ -137,7 +162,9 @@ impl Call {
         }
     }
 
-    /// Una llamada de un método que no mira quién llama.
+    /// Una llamada sin cabecera, para las pruebas: todos los métodos del
+    /// servicio llevan la suya ([`Self::new`]).
+    #[cfg(test)]
     pub fn method(method: &'static str) -> Self {
         Self {
             method,

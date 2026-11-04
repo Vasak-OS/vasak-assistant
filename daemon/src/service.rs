@@ -126,17 +126,18 @@ impl AssistantService {
     /// Las capacidades sobre cada dominio. Las de datos del usuario no están
     /// en esta fase: se dicen no disponibles, nunca rotas. `memory`, según la
     /// memoria esté encendida y abierta.
-    async fn capabilities(&self) -> Vec<Capability> {
-        let call = Call::method("Capabilities");
+    async fn capabilities(&self, #[zbus(header)] header: Header<'_>) -> Vec<Capability> {
+        let call = Call::new("Capabilities", &header);
         let all = capabilities(self.remote_allowed, &self.memory_status_now().await);
         call.done();
         all
     }
 
     /// Los modelos instalados en el backend.
-    async fn models(&self) -> Result<Vec<String>, Error> {
-        let call = Call::method("Models");
-        call.finish(self.backend.models().await.map_err(to_dbus))
+    #[zbus(name = "Models")]
+    async fn models_for(&self, #[zbus(header)] header: Header<'_>) -> Result<Vec<String>, Error> {
+        let call = Call::new("Models", &header);
+        call.finish(self.models().await)
     }
 
     /// Abre una conversación nueva, de quien llama, y devuelve su id.
@@ -255,8 +256,8 @@ impl AssistantService {
     }
 
     /// Cómo está la memoria. Nunca falla: el problema va en el motivo.
-    async fn memory_status(&self) -> MemoryStatus {
-        let call = Call::method("MemoryStatus");
+    async fn memory_status(&self, #[zbus(header)] header: Header<'_>) -> MemoryStatus {
+        let call = Call::new("MemoryStatus", &header);
         let status = self.memory_status_now().await;
         call.done();
         status
@@ -386,6 +387,11 @@ impl AssistantService {
 
 /// Lo mismo que la interfaz, con el dueño ya resuelto: se puede llamar sin bus.
 impl AssistantService {
+    /// Los modelos instalados en el backend (`Models`, sin el registro).
+    pub async fn models(&self) -> Result<Vec<String>, Error> {
+        self.backend.models().await.map_err(to_dbus)
+    }
+
     pub async fn status_for(&self, owner: &str) -> ServiceStatus {
         let count = self.conversations.lock().count_for(owner);
         let conversations = u32::try_from(count).unwrap_or(u32::MAX);
