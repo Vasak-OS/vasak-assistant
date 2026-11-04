@@ -3434,6 +3434,21 @@ mod log_tests {
             "{text}"
         );
     }
+
+    #[tokio::test]
+    async fn capabilities_y_memory_status_dejan_su_linea_debug() {
+        let rig = rig().await;
+        let (log, _guard) = capture_logs();
+
+        rig.proxy.capabilities().await.unwrap();
+        rig.proxy.memory_status().await.unwrap();
+
+        for method in ["Capabilities", "MemoryStatus"] {
+            let l = line(&log, &["llamada atendida", &format!("method=\"{method}\"")]);
+            assert!(l.contains("DEBUG"), "{l}");
+        }
+        assert!(!log.text().contains(" WARN ") && !log.text().contains(" INFO "));
+    }
 }
 
 /// Privacidad del registro: un chat completo con memoria, aprendizaje,

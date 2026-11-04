@@ -2539,7 +2539,7 @@ mod log_tests {
     }
 
     #[tokio::test]
-    async fn una_cabecera_invalida_deja_la_linea_warn_de_que_no_se_pudo_abrir() {
+    async fn una_cabecera_invalida_deja_el_detalle_en_debug_y_el_aviso_en_warn() {
         let (tmp, keys, memory) = enabled().await;
         memory.close().await;
         std::fs::write(tmp.memory_dir().join(DB_FILE), b"esto no es una base").unwrap();
@@ -2974,5 +2974,165 @@ mod log_tests {
         // Un indicador que ya no está no es un error.
         std::fs::remove_dir_all(&flag_dir).unwrap();
         memory.set_enabled(false).await.unwrap();
+    }
+
+    // ── Lo que dice «se guardaron» y lo que corre en spawn_blocking ───────────
+
+    fn fill(tmp: &TempDir) {
+        std::fs::write(
+            tmp.memory_dir().join("relleno"),
+            vec![0u8; MAX_MEMORY_DISK_BYTES as usize + 1],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn store_dice_si_escribio_y_pasado_el_tope_dice_que_no() {
+        let (tmp, _keys, memory) = enabled().await;
+        assert_eq!(
+            memory.store(preference("Prefiere el mate"), "c").await,
+            Ok(true)
+        );
+        fill(&tmp);
+
+        let over = memory.store(preference("Prefiere lo nuevo"), "c").await;
+
+        assert_eq!(over, Ok(false));
+        // Lo nuevo no entró (la poda pudo dejar la memoria sin recuerdos).
+        let notes = memory.recall("nuevo", false).await;
+        assert!(notes.is_none_or(|block| !block.contains("lo nuevo")));
+    }
+
+    #[tokio::test]
+    async fn pasado_el_tope_no_aparece_se_guardaron_recuerdos_y_si_el_motivo() {
+        let (tmp, _keys, memory) = enabled().await;
+        fill(&tmp);
+        let backend = ScriptedBackend::new([
+            r#"{"items":[{"kind":"preference","text":"Prefiere recuerdocanarioqzx"}],"summary":null}"#,
+        ]);
+        let (log, _guard) = capture_logs();
+
+        memory.learn_after(backend.clone(), "c1", turn());
+        memory.wait_until_idle().await;
+
+        let text = log.text();
+        assert!(!text.contains("se guardaron recuerdos"), "{text}");
+        let l = line(&log, &["no se guardó nada"]);
+        assert!(
+            l.contains("DEBUG") && l.contains("pasada de su tope"),
+            "{l}"
+        );
+        assert!(!text.contains("recuerdocanarioqzx"), "{text}");
+
+        // Con lugar, la misma extracción sí dice que guardó.
+        std::fs::remove_file(tmp.memory_dir().join("relleno")).unwrap();
+        let again = ScriptedBackend::new([
+            r#"{"items":[{"kind":"preference","text":"Prefiere otracosa"}],"summary":null}"#,
+        ]);
+        memory.learn_after(again, "c2", turn());
+        memory.wait_until_idle().await;
+        assert!(
+            log.text().contains("se guardaron recuerdos"),
+            "{}",
+            log.text()
+        );
+    }
+
+    #[tokio::test]
+    async fn apagar_dos_veces_deja_una_sola_linea_y_apagar_sin_haber_encendido_ninguna() {
+        let (_tmp, _keys, memory) = enabled().await;
+        let (log, _guard) = capture_logs();
+
+        memory.set_enabled(false).await.unwrap();
+        memory.set_enabled(false).await.unwrap();
+
+        assert_eq!(count(&log, "memoria apagada"), 1);
+
+        let tmp = TempDir::new();
+        let never = Memory::new(Some(tmp.memory_dir()), FixedKey::new(None));
+        let (log2, _guard2) = capture_logs();
+        never.set_enabled(false).await.unwrap();
+        assert_eq!(count(&log2, "memoria apagada"), 0);
+        // Encendida de nuevo y apagada otra vez: otra línea.
+        never.set_enabled(true).await.unwrap();
+        never.set_enabled(false).await.unwrap();
+        assert_eq!(count(&log2, "memoria apagada"), 1);
+    }
+
+    #[tokio::test]
+    async fn lo_que_se_registra_dentro_de_spawn_blocking_lo_captura_capture_logs() {
+        let (log, _guard) = capture_logs();
+
+        blocking(|| {
+            tracing::info!("desde-el-hilo-bloqueante");
+            Ok::<_, String>(())
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            log.text().contains("desde-el-hilo-bloqueante"),
+            "{}",
+            log.text()
+        );
+    }
+
+    #[tokio::test]
+    async fn store_at_pasado_el_tope_registra_la_poda_desde_el_hilo_bloqueante_sin_el_contenido() {
+        let (tmp, _keys, memory) = enabled().await;
+        for n in 0..10 {
+            memory
+                .store(preference(&format!("Prefiere la cosa número {n}")), "c")
+                .await
+                .unwrap();
+        }
+        fill(&tmp);
+        let (log, _guard) = capture_logs();
+
+        memory
+            .store(preference("Prefiere notacanariaqzx"), "c")
+            .await
+            .unwrap();
+        memory
+            .store(preference("Prefiere segundocanarioqzx"), "c")
+            .await
+            .unwrap();
+
+        // `write` corre en `spawn_blocking`: antes no se veía.
+        let pruning = line(&log, &["la memoria pasó su tope de espacio"]);
+        assert!(pruning.contains("INFO"), "{pruning}");
+        line(&log, &["la memoria llegó a su tope de espacio"]);
+        line(&log, &["la memoria sigue pasada de su tope"]);
+        let text = log.text();
+        assert!(
+            !text.contains("canarioqzx") && !text.contains("cosa número"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn con_la_memoria_que_no_abre_y_status_repetido_hay_un_solo_warn_y_un_debug_por_intento()
+    {
+        let (tmp, keys, memory) = enabled().await;
+        memory.close().await;
+        std::fs::write(tmp.memory_dir().join(DB_FILE), b"esto no es una base").unwrap();
+        let broken = Memory::new(Some(tmp.memory_dir()), keys);
+        let (log, _guard) = capture_logs();
+
+        for _ in 0..5 {
+            assert_eq!(broken.status().await.reason, REASON_NOT_OPENED);
+        }
+
+        let text = log.text();
+        let warns = text.lines().filter(|l| l.contains(" WARN ")).count();
+        let details = text
+            .lines()
+            .filter(|l| l.contains(" DEBUG ") && l.contains("no se pudo abrir la memoria"))
+            .count();
+        assert_eq!(warns, 1, "{text}");
+        assert_eq!(details, 5, "{text}");
+        assert!(text
+            .lines()
+            .any(|l| l.contains(" WARN ") && l.contains("la memoria no se puede abrir")));
     }
 }
