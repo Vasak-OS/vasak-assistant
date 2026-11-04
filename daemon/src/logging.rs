@@ -586,14 +586,14 @@ mod panic_tests {
 
         let by_macro = catch_unwind(|| panic!("mensajecanarioqzx con clave sk-valorcanarioqzx"));
         let by_unwrap = catch_unwind(|| {
-            Err::<(), String>("errorcanarioqzx".into()).unwrap();
+            std::hint::black_box(Err::<(), String>("errorcanarioqzx".into())).unwrap();
         });
         let by_expect = catch_unwind(|| {
-            None::<u8>.expect("expectcanarioqzx");
+            std::hint::black_box(None::<u8>).expect("expectcanarioqzx");
         });
         let by_payload = catch_unwind(|| panic_any(String::from("payloadcanarioqzx")));
         let by_index = catch_unwind(AssertUnwindSafe(|| {
-            let v = vec![1u8];
+            let v = std::hint::black_box([1u8]);
             v[usize::from(v[0]) + 9]
         }));
 
@@ -628,7 +628,7 @@ mod panic_tests {
         install_panic_hook();
         let _ = catch_unwind(|| panic!("mensajecanarioqzx"));
         let _ = catch_unwind(|| {
-            Err::<(), String>("errorcanarioqzx".into()).unwrap();
+            std::hint::black_box(Err::<(), String>("errorcanarioqzx".into())).unwrap();
         });
     }
 
