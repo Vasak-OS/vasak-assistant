@@ -220,9 +220,18 @@ su duración, la puerta de AppArmor):
 
 ```bash
 systemctl --user edit vasak-assistant
-# en el editor:
-# [Service]
-# Environment=RUST_LOG=debug
+```
+
+En el editor que se abre, entre las líneas de comentario de arriba y de abajo:
+
+```ini
+[Service]
+Environment=RUST_LOG=debug
+```
+
+Y después:
+
+```bash
 systemctl --user restart vasak-assistant
 ```
 

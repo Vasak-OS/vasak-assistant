@@ -127,7 +127,10 @@ impl AssistantService {
     /// en esta fase: se dicen no disponibles, nunca rotas. `memory`, según la
     /// memoria esté encendida y abierta.
     async fn capabilities(&self) -> Vec<Capability> {
-        capabilities(self.remote_allowed, &self.memory_status_now().await)
+        let call = Call::method("Capabilities");
+        let all = capabilities(self.remote_allowed, &self.memory_status_now().await);
+        call.done();
+        all
     }
 
     /// Los modelos instalados en el backend.
@@ -253,7 +256,10 @@ impl AssistantService {
 
     /// Cómo está la memoria. Nunca falla: el problema va en el motivo.
     async fn memory_status(&self) -> MemoryStatus {
-        self.memory_status_now().await
+        let call = Call::method("MemoryStatus");
+        let status = self.memory_status_now().await;
+        call.done();
+        status
     }
 
     /// Enciende o apaga la memoria. Encender reabre la base que haya (o la

@@ -153,6 +153,18 @@ impl Call {
         self
     }
 
+    /// Registra en `debug` una llamada que no puede fallar.
+    pub fn done(self) {
+        let ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        tracing::debug!(
+            method = self.method,
+            sender = self.sender.as_str(),
+            conversation = self.conversation.as_str(),
+            ms,
+            "llamada atendida"
+        );
+    }
+
     /// Registra el resultado y lo devuelve. Un error del bus es inesperado
     /// (`error`); los demás son rechazos esperables o degradaciones (`warn`),
     /// con su texto, que está escrito para mostrarse y no lleva contenido.

@@ -406,11 +406,15 @@ impl Memory {
             }
             let (items, summary) = (extraction.items.len(), extraction.summary.is_some());
             match memory.store_at(extraction, &conversation_id, epoch).await {
-                Ok(()) => tracing::debug!(
+                Ok(true) => tracing::debug!(
                     conversation = %short_id(&conversation_id),
                     items,
                     summary,
                     "se guardaron recuerdos"
+                ),
+                Ok(false) => tracing::debug!(
+                    conversation = %short_id(&conversation_id),
+                    "no se guardó nada: la memoria está pasada de su tope de espacio"
                 ),
                 // Descartes esperables: se apagó, se borró la memoria o la
                 // conversación. Un fallo al escribir lo registra `store_at`.
@@ -426,7 +430,11 @@ impl Memory {
     /// memoria siga encendida y permitida.
     // Sin llamador en el servicio (aprende por `store_at`); lo usan las pruebas.
     #[cfg(test)]
-    pub async fn store(&self, extraction: Extraction, conversation_id: &str) -> Result<(), String> {
+    pub async fn store(
+        &self,
+        extraction: Extraction,
+        conversation_id: &str,
+    ) -> Result<bool, String> {
         let epoch = self.epoch.load(Ordering::SeqCst);
         self.store_at(extraction, conversation_id, epoch).await
     }
@@ -438,7 +446,7 @@ impl Memory {
         extraction: Extraction,
         conversation_id: &str,
         epoch: u64,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let dir = self.dir.as_ref().ok_or(REASON_NO_PLACE)?;
         let mut guard = self.db.lock().await;
         if self.epoch.load(Ordering::SeqCst) != epoch {
@@ -582,8 +590,11 @@ impl Memory {
         if !enabled {
             // Apagar no borra nada: deja de usarla y de escribirla.
             close(db.take()).await;
+            let was_enabled = is_file(&flag(dir)).await;
             remove_flag(dir).await?;
-            tracing::info!("memoria apagada");
+            if was_enabled {
+                tracing::info!("memoria apagada");
+            }
             return Ok(());
         }
         let created = !is_dir(dir).await;
@@ -925,14 +936,15 @@ async fn disk_usage(dir: PathBuf) -> u64 {
 
 /// La escritura de lo extraído, fuera del runtime. Antes de escribir mira el
 /// espacio: pasado [`MAX_MEMORY_DISK_BYTES`] poda el 10 % de cada clase, y si
-/// sigue pasado no escribe. Termina con `wal_checkpoint`.
+/// sigue pasado no escribe. Termina con `wal_checkpoint`. `Ok(false)` si no
+/// escribió nada (pasada del tope).
 fn write(
     db: &GrafeoDB,
     dir: &Path,
     extraction: &Extraction,
     conversation_id: &str,
     pruned: &AtomicBool,
-) -> grafeo::Result<()> {
+) -> grafeo::Result<bool> {
     let now = schema::now();
     if dir_size(dir) > MAX_MEMORY_DISK_BYTES {
         // Una sola poda por episodio sobre el tope: si el directorio sigue
@@ -940,7 +952,7 @@ fn write(
         // toda la memoria. Mientras siga pasado, no se escribe.
         if pruned.swap(true, Ordering::SeqCst) {
             tracing::debug!("la memoria sigue pasada de su tope: no se escribe");
-            return Ok(());
+            return Ok(false);
         }
         tracing::info!(
             bytes = dir_size(dir),
@@ -950,7 +962,7 @@ fn write(
         schema::prune_tenth(db, now)?;
         if dir_size(dir) > MAX_MEMORY_DISK_BYTES {
             tracing::warn!("la memoria llegó a su tope de espacio: no se guarda nada más");
-            return Ok(());
+            return Ok(false);
         }
     }
     pruned.store(false, Ordering::SeqCst);
@@ -981,7 +993,8 @@ fn write(
             now,
         )?;
     }
-    db.wal_checkpoint()
+    db.wal_checkpoint()?;
+    Ok(true)
 }
 
 async fn close(db: Option<Arc<GrafeoDB>>) {
@@ -995,7 +1008,17 @@ async fn close(db: Option<Arc<GrafeoDB>>) {
 async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
-    tokio::task::spawn_blocking(work)
+    // El registro de lo que corre en el hilo de `spawn_blocking` va al mismo
+    // suscriptor que el de quien lo lanza: en producción es el global, y en
+    // las pruebas el de `capture_logs`, que es por hilo.
+    let dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
+    // En las pruebas, además, la captura del registro de quien lo lanza.
+    #[cfg(test)]
+    let work = {
+        let capture = crate::test_support::current_capture();
+        move || crate::test_support::with_capture(capture, work)
+    };
+    tokio::task::spawn_blocking(move || tracing::dispatcher::with_default(&dispatch, work))
         .await
         // Un texto fijo: el de un `JoinError` trae el mensaje del pánico de lo
         // que corría adentro, y eso puede llevar un valor.
