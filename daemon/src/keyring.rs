@@ -1594,4 +1594,55 @@ mod tests {
         assert!(setup.created.lock().is_empty());
         assert!(!setup.calls.lock().contains(&"Delete"));
     }
+
+    // ── El registro del llavero ───────────────────────────────────────────────
+
+    use crate::test_support::capture_logs;
+
+    fn logged(log: &crate::test_support::LogCapture, pieces: &[&str]) -> String {
+        let text = log.text();
+        text.lines()
+            .find(|l| pieces.iter().all(|piece| l.contains(piece)))
+            .unwrap_or_else(|| panic!("falta una línea con {pieces:?}:\n{text}"))
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn un_llavero_que_no_responde_deja_su_linea_warn_al_leer_y_al_guardar_sin_la_clave() {
+        let (_server, client) =
+            p2p_pair(|builder| builder.serve_at(SESSION, FakeSession(Arc::default())))
+                .await
+                .unwrap();
+        let service = SecretService { connection: client };
+        let (log, _guard) = capture_logs();
+
+        assert!(service.api_key(URL).await.is_none());
+        assert!(service.store_key(URL, &key()).await.is_err());
+
+        let read = logged(&log, &["no se pudo leer la clave del llavero"]);
+        assert!(read.contains("WARN"), "{read}");
+        let write = logged(&log, &["no se pudo guardar la clave en el llavero"]);
+        assert!(write.contains("WARN"), "{write}");
+        assert!(!log.text().contains("clave-que-no-debe-filtrarse"));
+    }
+
+    #[tokio::test]
+    async fn dos_claves_para_la_misma_direccion_dejan_su_warn_y_una_bloqueada_su_info() {
+        let duplicated = secret_service(Item::Duplicated, b"sk-canario-qzx").await;
+        let (log, _guard) = capture_logs();
+        assert!(duplicated.service.api_key(URL).await.is_none());
+        let l = logged(&log, &["hay 2 claves en el llavero"]);
+        assert!(l.contains("WARN"), "{l}");
+        drop(_guard);
+
+        let locked = secret_service(Item::Locked, b"sk-canario-qzx").await;
+        let (log2, _guard2) = capture_logs();
+        assert!(locked.service.api_key(URL).await.is_none());
+        let l = logged(
+            &log2,
+            &["la clave del proveedor está en un llavero bloqueado"],
+        );
+        assert!(l.contains("INFO"), "{l}");
+        assert!(!log.text().contains("canario-qzx") && !log2.text().contains("canario-qzx"));
+    }
 }

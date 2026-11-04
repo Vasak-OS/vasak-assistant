@@ -2,6 +2,26 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-assistant 0.3.4
+
+Un registro de errores completo y que no filtra datos (#29).
+
+- **`daemon`** — cada llamada D-Bus que termina en error deja una línea con el
+  método, quien llama, la conversación en corto (8 caracteres) y el tipo de
+  error; en `debug`, también las que salen bien, con su duración. Los pedidos a
+  los backends, la extracción y la poda de la memoria, el llavero y la puerta de
+  AppArmor registran sus fallas y su ciclo de vida (arranque con la versión y un
+  resumen de la configuración, parada, encender, apagar y borrar la memoria).
+  Nunca se registra el contenido de los mensajes ni de las respuestas, las
+  notas, los recuerdos, las claves ni una dirección con credenciales o
+  consulta (`logging::redact_url`); de un pedido a un backend va la operación y
+  no la ruta, de un error de la base de la memoria sólo su código y de un
+  `vasak.conf` ilegible la línea, la columna y la clase. Si la memoria no se
+  puede abrir (llave ausente, bloqueada, duplicada o inválida, llavero caído),
+  queda una línea la primera vez y cada vez que cambia el motivo. Sin colores ni
+  hora propia cuando la salida va al journal.
+- **`packaging`** — la unidad dice `StandardError=journal`.
+
 ## vasak-assistant 0.3.3
 
 - **`daemon`** — borrar una conversación (`DeleteConversation`) borra su resumen

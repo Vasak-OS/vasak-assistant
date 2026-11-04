@@ -838,3 +838,126 @@ impl PrivateBus {
         bus
     }
 }
+
+// ── Captura del registro ──────────────────────────────────────────────────────
+
+/// Lo que se escribió en el registro mientras dura la captura, de cualquier
+/// módulo y en cualquier nivel (hasta `trace`), sin colores.
+#[derive(Clone, Default)]
+pub struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+#[allow(dead_code)]
+impl LogCapture {
+    /// Todo el texto capturado hasta ahora.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock()).into_owned()
+    }
+}
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = LogCapture;
+
+    fn make_writer(&'a self) -> LogCapture {
+        self.clone()
+    }
+}
+
+/// Captura el registro del hilo actual hasta que se suelta el guardián, con
+/// el mismo filtro de bibliotecas que el servicio
+/// ([`crate::logging::library_filter`]) y todo lo del servicio hasta `trace`. Con
+/// `#[tokio::test]` (un solo hilo) cubre también las tareas lanzadas, y lo que
+/// corre en `spawn_blocking` a través de `memory::blocking`, que le pasa al hilo
+/// de trabajo la captura de quien lo lanza. Con un runtime de varios hilos,
+/// sólo lo del hilo que llama.
+///
+/// ```ignore
+/// let (log, _guard) = capture_logs();
+/// // …
+/// assert!(!log.text().contains("secreto"));
+/// ```
+// Infraestructura para las pruebas del registro, que escribe qa.
+#[allow(dead_code)]
+pub fn capture_logs() -> (LogCapture, CaptureGuard) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::Layer;
+    // Un solo suscriptor global para todas las pruebas, instalado una vez, que
+    // escribe en la captura activa del hilo que registra. Con un `set_default`
+    // por prueba, cada una que instala o suelta el suyo hace que `tracing`
+    // recalcule el interés y el nivel máximo de cada línea mientras otras están
+    // registrando, y a veces una línea se perdía.
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(|| CurrentCapture)
+                .with_ansi(false)
+                .with_filter(crate::logging::library_filter()),
+        );
+        // Si otra cosa ya puso uno global, las capturas quedan vacías y la
+        // prueba lo dice.
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    });
+    let log = LogCapture::default();
+    let previous = CAPTURE.with(|current| current.replace(Some(log.clone())));
+    (log, CaptureGuard { previous })
+}
+
+thread_local! {
+    /// La captura activa de este hilo, si hay.
+    static CAPTURE: std::cell::RefCell<Option<LogCapture>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Mientras vive, lo que se registra en este hilo va a su captura. Al soltarse
+/// vuelve la que hubiera antes.
+pub struct CaptureGuard {
+    previous: Option<LogCapture>,
+}
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        CAPTURE.with(|current| *current.borrow_mut() = previous);
+    }
+}
+
+/// La captura activa de este hilo, para pasarla a otro (`memory::blocking`).
+pub fn current_capture() -> Option<LogCapture> {
+    CAPTURE.with(|current| current.borrow().clone())
+}
+
+/// Corre `work` con `capture` como captura activa de este hilo.
+pub fn with_capture<T>(capture: Option<LogCapture>, work: impl FnOnce() -> T) -> T {
+    let previous = CAPTURE.with(|current| current.replace(capture));
+    let _restore = CaptureGuard { previous };
+    work()
+}
+
+/// El escritor del suscriptor global: va a la captura activa del hilo, o a
+/// ningún lado.
+struct CurrentCapture;
+
+impl std::io::Write for CurrentCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        CAPTURE.with(|current| {
+            if let Some(log) = &*current.borrow() {
+                log.0.lock().extend_from_slice(buf);
+            }
+        });
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
