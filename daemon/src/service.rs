@@ -3448,10 +3448,13 @@ mod log_tests {
 
         rig.proxy.capabilities().await.unwrap();
         rig.proxy.memory_status().await.unwrap();
+        rig.proxy.models().await.unwrap();
 
-        for method in ["Capabilities", "MemoryStatus"] {
+        for method in ["Capabilities", "MemoryStatus", "Models"] {
             let l = line(&log, &["llamada atendida", &format!("method=\"{method}\"")]);
             assert!(l.contains("DEBUG"), "{l}");
+            // Quien llama, también en los métodos que no miran el dueño.
+            assert!(l.contains(&format!("sender=\"{SENDER}\"")), "{method}: {l}");
         }
         assert!(!log.text().contains(" WARN ") && !log.text().contains(" INFO "));
     }

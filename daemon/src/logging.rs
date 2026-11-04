@@ -555,3 +555,104 @@ mod startup_tests {
         }
     }
 }
+
+/// El aviso de pánico: dónde ocurrió y nunca el mensaje.
+#[cfg(test)]
+mod panic_tests {
+    use super::*;
+    use crate::test_support::capture_logs;
+    use std::panic::{catch_unwind, panic_any, AssertUnwindSafe};
+
+    /// El hook de pánico es de todo el proceso: una prueba lo cambia a la vez.
+    static HOOK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    #[test]
+    fn panic_report_con_ubicacion_da_archivo_y_linea_y_sin_ella_un_texto_fijo() {
+        let here = std::panic::Location::caller();
+        let report = panic_report(Some(here));
+        assert_eq!(report, format!("pánico en {}:{}", here.file(), here.line()));
+        assert!(report.contains("logging.rs"), "{report}");
+        assert_eq!(panic_report(None), "pánico en un lugar desconocido");
+        // No hay por dónde entrar un mensaje: sólo la ubicación.
+        assert!(!report.contains("mensaje"));
+    }
+
+    #[test]
+    fn un_panico_deja_en_el_registro_la_ubicacion_y_nunca_el_mensaje() {
+        let _lock = HOOK.lock();
+        let previous = std::panic::take_hook();
+        install_panic_hook();
+        let (log, _guard) = capture_logs();
+
+        let by_macro = catch_unwind(|| panic!("mensajecanarioqzx con clave sk-valorcanarioqzx"));
+        let by_unwrap = catch_unwind(|| {
+            Err::<(), String>("errorcanarioqzx".into()).unwrap();
+        });
+        let by_expect = catch_unwind(|| {
+            None::<u8>.expect("expectcanarioqzx");
+        });
+        let by_payload = catch_unwind(|| panic_any(String::from("payloadcanarioqzx")));
+        let by_index = catch_unwind(AssertUnwindSafe(|| {
+            let v = vec![1u8];
+            v[usize::from(v[0]) + 9]
+        }));
+
+        std::panic::set_hook(previous);
+        for (name, result) in [
+            ("macro", by_macro.is_err()),
+            ("unwrap", by_unwrap.is_err()),
+            ("expect", by_expect.is_err()),
+            ("payload", by_payload.is_err()),
+            ("índice", by_index.is_err()),
+        ] {
+            assert!(result, "{name} tenía que entrar en pánico");
+        }
+        let text = log.text();
+        assert!(!text.contains("canarioqzx"), "{text}");
+        assert!(!text.contains("index out of bounds"), "{text}");
+        let lines: Vec<_> = text.lines().filter(|l| l.contains("pánico en")).collect();
+        assert_eq!(lines.len(), 5, "{text}");
+        for l in lines {
+            assert!(l.contains("ERROR"), "{l}");
+            assert!(l.contains("logging.rs:"), "{l}");
+        }
+    }
+
+    /// Hijo del siguiente: sin registro, el aviso va a stderr. Sólo hace algo si
+    /// el padre lo invoca con la variable puesta.
+    #[test]
+    fn hijo_que_entra_en_panico_sin_registro() {
+        if std::env::var_os("VASAK_PRUEBA_PANICO").is_none() {
+            return;
+        }
+        install_panic_hook();
+        let _ = catch_unwind(|| panic!("mensajecanarioqzx"));
+        let _ = catch_unwind(|| {
+            Err::<(), String>("errorcanarioqzx".into()).unwrap();
+        });
+    }
+
+    #[test]
+    fn sin_registro_el_aviso_va_a_stderr_con_la_ubicacion_y_sin_el_mensaje() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "logging::panic_tests::hijo_que_entra_en_panico_sin_registro",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("VASAK_PRUEBA_PANICO", "1")
+            .env_remove("RUST_BACKTRACE")
+            .output()
+            .unwrap();
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(stderr.matches("pánico en ").count(), 2, "{stderr}");
+        assert!(stderr.contains("logging.rs:"), "{stderr}");
+        assert!(!stderr.contains("canarioqzx"), "{stderr}");
+        assert!(
+            !stderr.contains("panicked at"),
+            "el aviso de Rust no tiene que salir: {stderr}"
+        );
+    }
+}
