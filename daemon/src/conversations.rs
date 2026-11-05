@@ -667,3 +667,160 @@ mod tests {
         assert_eq!(conversations.len(), 0);
     }
 }
+
+/// El tope de chats en vuelo por dueño (#3).
+#[cfg(test)]
+mod owner_limit_tests {
+    use super::*;
+
+    const A: &str = ":1.1";
+    const B: &str = ":1.2";
+
+    fn open(conversations: &mut Conversations, owner: &str, n: usize) -> Vec<String> {
+        (0..n)
+            .map(|_| conversations.create(owner).unwrap())
+            .collect()
+    }
+
+    fn busy_count(conversations: &Conversations, owner: &str) -> usize {
+        conversations
+            .open
+            .values()
+            .filter(|c| c.owner == owner && c.busy)
+            .count()
+    }
+
+    #[test]
+    fn con_dos_chats_en_vuelo_el_tercero_da_busy_y_no_queda_marcado_en_vuelo() {
+        let mut conversations = Conversations::default();
+        let ids = open(&mut conversations, A, 3);
+        conversations.begin_turn(A, &ids[0], "uno").unwrap();
+        conversations.begin_turn(A, &ids[1], "dos").unwrap();
+
+        let third = conversations.begin_turn(A, &ids[2], "tres");
+
+        assert_eq!(MAX_CHATS_IN_FLIGHT_PER_OWNER, 2);
+        match third {
+            Err(Error::Busy(text)) => {
+                assert!(text.contains('2'), "{text}");
+                assert!(!text.contains("tres"), "{text}");
+            }
+            other => panic!("se esperaba Busy, vino {other:?}"),
+        }
+        // El tercero no ocupó nada: ni el cupo del dueño ni la conversación.
+        assert_eq!(busy_count(&conversations, A), 2);
+        assert!(!conversations.open[&ids[2]].busy);
+        // Y su mensaje no entró al historial.
+        assert!(conversations.history(A, &ids[2]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn el_busy_del_tope_no_es_limit_exceeded() {
+        let mut conversations = Conversations::default();
+        let ids = open(&mut conversations, A, 3);
+        conversations.begin_turn(A, &ids[0], "uno").unwrap();
+        conversations.begin_turn(A, &ids[1], "dos").unwrap();
+        assert!(!matches!(
+            conversations.begin_turn(A, &ids[2], "tres"),
+            Err(Error::LimitExceeded(_))
+        ));
+    }
+
+    #[test]
+    fn otro_duenio_chatea_normal_con_el_primero_en_su_tope() {
+        let mut conversations = Conversations::default();
+        let a = open(&mut conversations, A, 3);
+        let b = open(&mut conversations, B, 3);
+        conversations.begin_turn(A, &a[0], "uno").unwrap();
+        conversations.begin_turn(A, &a[1], "dos").unwrap();
+        assert!(conversations.begin_turn(A, &a[2], "tres").is_err());
+
+        conversations.begin_turn(B, &b[0], "uno").unwrap();
+        conversations.begin_turn(B, &b[1], "dos").unwrap();
+
+        assert_eq!(busy_count(&conversations, B), 2);
+        assert!(matches!(
+            conversations.begin_turn(B, &b[2], "tres"),
+            Err(Error::Busy(_))
+        ));
+    }
+
+    #[test]
+    fn terminar_un_chat_con_respuesta_o_sin_ella_devuelve_el_lugar() {
+        for reply in [Some("respuesta"), None] {
+            let mut conversations = Conversations::default();
+            let ids = open(&mut conversations, A, 3);
+            conversations.begin_turn(A, &ids[0], "uno").unwrap();
+            conversations.begin_turn(A, &ids[1], "dos").unwrap();
+            assert!(conversations.begin_turn(A, &ids[2], "tres").is_err());
+
+            conversations.finish_turn(&ids[0], "uno", reply);
+
+            conversations.begin_turn(A, &ids[2], "tres").unwrap();
+            assert_eq!(busy_count(&conversations, A), 2, "{reply:?}");
+        }
+    }
+
+    #[test]
+    fn irse_el_duenio_devuelve_el_lugar() {
+        let mut conversations = Conversations::default();
+        let ids = open(&mut conversations, A, 2);
+        conversations.begin_turn(A, &ids[0], "uno").unwrap();
+        conversations.begin_turn(A, &ids[1], "dos").unwrap();
+
+        conversations.release_owner(A);
+
+        assert_eq!(busy_count(&conversations, A), 0);
+        let fresh = conversations.create(A).unwrap();
+        conversations.begin_turn(A, &fresh, "nuevo").unwrap();
+    }
+
+    // Un cliente esquiva el tope borrando las conversaciones que esperan
+    // respuesta: el chat sigue en vuelo en el backend pero ya no cuenta. Falla
+    // hoy; se quita el `ignore` al arreglarlo.
+    #[test]
+    #[ignore = "bypass: borrar la conversación saca el chat de la cuenta"]
+    fn borrar_una_conversacion_en_vuelo_no_devuelve_el_lugar() {
+        let mut conversations = Conversations::default();
+        let ids = open(&mut conversations, A, 3);
+        conversations.begin_turn(A, &ids[0], "uno").unwrap();
+        conversations.begin_turn(A, &ids[1], "dos").unwrap();
+
+        conversations.delete(A, &ids[0]).unwrap();
+
+        // El pedido de «uno» sigue esperando al modelo: el dueño sigue en su tope.
+        assert!(matches!(
+            conversations.begin_turn(A, &ids[2], "tres"),
+            Err(Error::Busy(_))
+        ));
+    }
+
+    #[test]
+    fn la_misma_conversacion_ocupada_sigue_dando_su_busy_y_no_cuenta_dos_veces() {
+        let mut conversations = Conversations::default();
+        let ids = open(&mut conversations, A, 2);
+        conversations.begin_turn(A, &ids[0], "uno").unwrap();
+
+        let again = conversations.begin_turn(A, &ids[0], "otra vez");
+
+        let Err(Error::Busy(text)) = again else {
+            panic!("se esperaba Busy");
+        };
+        assert!(text.contains("anterior"), "{text}");
+        // Sigue habiendo un lugar para otra conversación.
+        conversations.begin_turn(A, &ids[1], "dos").unwrap();
+    }
+
+    #[test]
+    fn un_mensaje_invalido_ni_una_conversacion_ajena_ocupan_ni_gastan_lugar() {
+        let mut conversations = Conversations::default();
+        let ids = open(&mut conversations, A, 2);
+        let theirs = conversations.create(B).unwrap();
+
+        assert!(conversations.begin_turn(A, &ids[0], "").is_err());
+        assert!(conversations.begin_turn(A, &theirs, "hola").is_err());
+
+        assert_eq!(busy_count(&conversations, A), 0);
+        assert_eq!(busy_count(&conversations, B), 0);
+    }
+}

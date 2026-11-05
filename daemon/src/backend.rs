@@ -778,3 +778,219 @@ mod log_tests {
         }
     }
 }
+
+/// El cupo de `models` y `active_model`, aparte del de los chats (#3).
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use crate::test_support::{model_info, FakeBackend};
+    use std::time::Duration;
+    use vasak_assistant_protocol::Role;
+
+    fn hello() -> Vec<Message> {
+        vec![Message {
+            role: Role::User,
+            content: "hola".into(),
+        }]
+    }
+
+    /// Una prueba que se cuelga falla a los 5 s en vez de bloquear el CI.
+    async fn quickly<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), future)
+            .await
+            .expect("la llamada se colgó")
+    }
+
+    /// Ocupa los `MAX_IN_FLIGHT` lugares de los chats con pedidos que esperan la
+    /// compuerta. Devuelve las tareas y la compuerta.
+    async fn fill_chats(
+        limited: &Arc<Limited>,
+        backend: &Arc<FakeBackend>,
+        gate: &Arc<tokio::sync::Notify>,
+    ) -> Vec<tokio::task::JoinHandle<Result<String, BackendError>>> {
+        let _ = gate;
+        let mut tasks = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT {
+            let limited = limited.clone();
+            tasks.push(tokio::spawn(async move { limited.chat(&hello()).await }));
+            quickly(backend.entered.notified()).await;
+        }
+        assert_eq!(limited.permits.available_permits(), 0);
+        tasks
+    }
+
+    #[tokio::test]
+    async fn con_los_cuatro_lugares_de_chat_ocupados_models_y_active_model_responden() {
+        let (fake, gate) = FakeBackend::gated("hola");
+        let backend = Arc::new(fake);
+        let limited = Arc::new(Limited::new(backend.clone()));
+        let tasks = fill_chats(&limited, &backend, &gate).await;
+
+        let models = quickly(limited.models()).await.unwrap();
+        let active = quickly(limited.active_model()).await.unwrap();
+
+        assert_eq!(models, ["modelo-de-prueba"]);
+        assert_eq!(active, model_info("modelo-de-prueba"));
+        // Los chats siguen esperando: nada se liberó para contestar.
+        assert_eq!(limited.permits.available_permits(), 0);
+        for _ in 0..MAX_IN_FLIGHT {
+            gate.notify_one();
+        }
+        for task in tasks {
+            assert_eq!(quickly(task).await.unwrap().unwrap(), "hola");
+        }
+    }
+
+    #[tokio::test]
+    async fn un_chat_nuevo_con_el_cupo_lleno_espera_pero_los_modelos_no() {
+        let (fake, gate) = FakeBackend::gated("hola");
+        let backend = Arc::new(fake);
+        let limited = Arc::new(Limited::new(backend.clone()));
+        let tasks = fill_chats(&limited, &backend, &gate).await;
+        let waiting = {
+            let limited = limited.clone();
+            tokio::spawn(async move { limited.chat(&hello()).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(!waiting.is_finished());
+        quickly(limited.models()).await.unwrap();
+        quickly(limited.active_model()).await.unwrap();
+
+        for _ in 0..(MAX_IN_FLIGHT + 1) {
+            gate.notify_one();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        quickly(waiting).await.unwrap().unwrap();
+        for task in tasks {
+            quickly(task).await.unwrap().unwrap();
+        }
+    }
+
+    /// Una caché vencida: lo último que se supo, de hace más del TTL.
+    fn expire(limited: &Limited, result: Result<ModelInfo, BackendError>) {
+        *limited.active.lock() = Some((
+            Instant::now()
+                .checked_sub(ACTIVE_MODEL_TTL * 2)
+                .expect("el reloj tiene que tener más de 10 s"),
+            result,
+        ));
+    }
+
+    #[tokio::test]
+    async fn con_el_cupo_de_modelos_agotado_active_model_devuelve_la_cache_vencida() {
+        let backend = Arc::new(FakeBackend::replying("hola"));
+        let limited = Limited::new(backend);
+        expire(&limited, Ok(model_info("viejo")));
+        let held: Vec<_> = (0..MAX_METADATA_IN_FLIGHT)
+            .map(|_| limited.metadata_permits.try_acquire().unwrap())
+            .collect();
+        assert_eq!(limited.metadata_permits.available_permits(), 0);
+
+        let stale = quickly(limited.active_model()).await.unwrap();
+
+        assert_eq!(stale, model_info("viejo"));
+        // No consultó al backend ni renovó la caché.
+        assert!(limited.active.lock().as_ref().unwrap().0.elapsed() > ACTIVE_MODEL_TTL);
+        drop(held);
+        // Con lugar otra vez, se renueva.
+        let fresh = quickly(limited.active_model()).await.unwrap();
+        assert_eq!(fresh, model_info("modelo-de-prueba"));
+        assert!(limited.active.lock().as_ref().unwrap().0.elapsed() < ACTIVE_MODEL_TTL);
+    }
+
+    #[tokio::test]
+    async fn la_cache_vencida_con_error_tambien_se_devuelve_sin_lugar() {
+        let limited = Limited::new(Arc::new(FakeBackend::replying("hola")));
+        expire(
+            &limited,
+            Err(BackendError::Unavailable("sin modelo".into())),
+        );
+        let _held: Vec<_> = (0..MAX_METADATA_IN_FLIGHT)
+            .map(|_| limited.metadata_permits.try_acquire().unwrap())
+            .collect();
+
+        let result = quickly(limited.active_model()).await;
+
+        assert_eq!(result, Err(BackendError::Unavailable("sin modelo".into())));
+    }
+
+    #[tokio::test]
+    async fn sin_cache_y_sin_lugar_active_model_espera_y_da_la_respuesta_de_siempre() {
+        let limited = Arc::new(Limited::new(Arc::new(FakeBackend::replying("hola"))));
+        let held: Vec<_> = (0..MAX_METADATA_IN_FLIGHT)
+            .map(|_| limited.metadata_permits.try_acquire().unwrap())
+            .collect();
+        let pending = {
+            let limited = limited.clone();
+            tokio::spawn(async move { limited.active_model().await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!pending.is_finished(), "no hay caché: espera su turno");
+
+        drop(held);
+
+        assert_eq!(
+            quickly(pending).await.unwrap().unwrap(),
+            model_info("modelo-de-prueba")
+        );
+    }
+
+    #[tokio::test]
+    async fn sin_cache_y_sin_lugar_el_error_del_backend_es_el_de_siempre() {
+        let mut fake = FakeBackend::replying("hola");
+        fake.active_result = Err(BackendError::Unavailable("apagado".into()));
+        let limited = Arc::new(Limited::new(Arc::new(fake)));
+        let held: Vec<_> = (0..MAX_METADATA_IN_FLIGHT)
+            .map(|_| limited.metadata_permits.try_acquire().unwrap())
+            .collect();
+        let pending = {
+            let limited = limited.clone();
+            tokio::spawn(async move { limited.active_model().await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(held);
+
+        let result = quickly(pending).await.unwrap();
+
+        assert_eq!(result, Err(BackendError::Unavailable("apagado".into())));
+    }
+
+    #[tokio::test]
+    async fn models_con_el_cupo_agotado_espera_su_lugar_y_no_usa_el_de_los_chats() {
+        let limited = Arc::new(Limited::new(Arc::new(FakeBackend::replying("hola"))));
+        let held: Vec<_> = (0..MAX_METADATA_IN_FLIGHT)
+            .map(|_| limited.metadata_permits.try_acquire().unwrap())
+            .collect();
+        let pending = {
+            let limited = limited.clone();
+            tokio::spawn(async move { limited.models().await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!pending.is_finished());
+        // Los chats no están bloqueados por el cupo de modelos.
+        assert_eq!(quickly(limited.chat(&hello())).await.unwrap(), "hola");
+
+        drop(held);
+
+        assert_eq!(
+            quickly(pending).await.unwrap().unwrap(),
+            ["modelo-de-prueba"]
+        );
+    }
+
+    #[tokio::test]
+    async fn los_modelos_no_gastan_lugares_de_chat_ni_los_chats_los_de_modelos() {
+        let limited = Limited::new(Arc::new(FakeBackend::replying("hola")));
+
+        limited.models().await.unwrap();
+        limited.active_model().await.unwrap();
+        limited.chat(&hello()).await.unwrap();
+
+        assert_eq!(limited.permits.available_permits(), MAX_IN_FLIGHT);
+        assert_eq!(
+            limited.metadata_permits.available_permits(),
+            MAX_METADATA_IN_FLIGHT
+        );
+    }
+}
