@@ -668,6 +668,9 @@ fn reason(error: &BackendError) -> &str {
 
 pub fn to_dbus(error: BackendError) -> Error {
     match error {
+        BackendError::Unavailable(text) if text == crate::backend::METADATA_BUSY => {
+            Error::Busy(text)
+        }
         BackendError::Unavailable(text) => Error::Unavailable(text),
         BackendError::Failed(text) => Error::Backend(text),
     }

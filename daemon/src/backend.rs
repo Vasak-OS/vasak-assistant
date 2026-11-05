@@ -75,6 +75,15 @@ pub fn not_local() -> BackendError {
     BackendError::Unavailable(NOT_LOCAL.into())
 }
 
+/// El motivo de `models` cuando el cupo de modelos está lleno. El servicio lo
+/// devuelve como `Busy` ([`crate::service::to_dbus`]).
+pub const METADATA_BUSY: &str =
+    "Hay demasiados pedidos de la lista de modelos a la vez: volvé a intentarlo en un momento.";
+
+pub fn metadata_busy() -> BackendError {
+    BackendError::Unavailable(METADATA_BUSY.into())
+}
+
 /// Si el error es el rechazo de [`ModelBackend::chat_local_only`].
 pub fn is_not_local(error: &BackendError) -> bool {
     matches!(error, BackendError::Unavailable(text) if text == NOT_LOCAL)
@@ -163,7 +172,12 @@ impl ModelBackend for Limited {
 
     fn models(&self) -> BoxFuture<'_, Result<Vec<String>, BackendError>> {
         Box::pin(async move {
-            let _permit = self.metadata_permit().await?;
+            // Sin fila: si el cupo de modelos está lleno, `Busy` en el acto.
+            // Esperar dejaría que un cliente que inunda `Models` haga esperar
+            // a todos los demás (#3).
+            let Ok(_permit) = self.metadata_permits.try_acquire() else {
+                return Err(metadata_busy());
+            };
             let started = Instant::now();
             let result = self.inner.models().await;
             log_request(&self.inner, "models", started, &result);
@@ -957,24 +971,25 @@ mod metadata_tests {
     }
 
     #[tokio::test]
-    async fn models_con_el_cupo_agotado_espera_su_lugar_y_no_usa_el_de_los_chats() {
+    async fn models_con_el_cupo_agotado_da_busy_sin_esperar_y_no_usa_el_de_los_chats() {
         let limited = Arc::new(Limited::new(Arc::new(FakeBackend::replying("hola"))));
         let held: Vec<_> = (0..MAX_METADATA_IN_FLIGHT)
             .map(|_| limited.metadata_permits.try_acquire().unwrap())
             .collect();
-        let pending = {
-            let limited = limited.clone();
-            tokio::spawn(async move { limited.models().await })
-        };
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!pending.is_finished());
+        // Sin fila: con el cupo lleno, `Busy` en el acto (#3).
+        let busy = quickly(limited.models()).await.unwrap_err();
+        assert_eq!(busy, metadata_busy());
+        assert!(matches!(
+            crate::service::to_dbus(busy),
+            vasak_assistant_protocol::Error::Busy(_)
+        ));
         // Los chats no están bloqueados por el cupo de modelos.
         assert_eq!(quickly(limited.chat(&hello())).await.unwrap(), "hola");
 
         drop(held);
 
         assert_eq!(
-            quickly(pending).await.unwrap().unwrap(),
+            quickly(limited.models()).await.unwrap(),
             ["modelo-de-prueba"]
         );
     }

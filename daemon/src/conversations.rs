@@ -36,6 +36,12 @@ struct Conversation {
 #[derive(Default)]
 pub struct Conversations {
     open: HashMap<String, Conversation>,
+    /// Los chats en vuelo: id de la conversación → su dueño. Se anota en
+    /// `begin_turn` y se saca en `finish_turn` (que corre siempre, por el
+    /// `Drop` del turno), exista o no la conversación: borrarla mientras espera
+    /// al modelo no devuelve el lugar, porque el pedido sigue ocupando el
+    /// backend. Sólo tiene los que están en vuelo, así que no acumula nada.
+    in_flight: HashMap<String, String>,
 }
 
 impl Conversations {
@@ -94,6 +100,8 @@ impl Conversations {
 
     pub fn delete(&mut self, owner: &str, id: &str) -> Result<(), Error> {
         self.get(owner, id)?;
+        // El chat en vuelo, si hay, sigue anotado en `in_flight` hasta que
+        // termine: sigue ocupando el backend.
         self.open.remove(id);
         Ok(())
     }
@@ -103,6 +111,10 @@ impl Conversations {
     pub fn release_owner(&mut self, owner: &str) -> usize {
         let before = self.open.len();
         self.open.retain(|_, c| c.owner != owner);
+        // La conexión ya no existe, y su nombre único no vuelve: no hay a
+        // quién ponerle el tope.
+        self.in_flight
+            .retain(|_, in_flight_owner| in_flight_owner != owner);
         before - self.open.len()
     }
 
@@ -129,15 +141,16 @@ impl Conversations {
         // que `LimitExceeded` es el tope de conversaciones abiertas, que no se
         // libera solo.
         let in_flight = self
-            .open
+            .in_flight
             .values()
-            .filter(|conversation| conversation.owner == owner && conversation.busy)
+            .filter(|in_flight_owner| *in_flight_owner == owner)
             .count();
         if in_flight >= MAX_CHATS_IN_FLIGHT_PER_OWNER {
             return Err(Error::Busy(format!(
                 "ya hay {in_flight} pedidos esperando respuesta del modelo; esperá a que termine uno"
             )));
         }
+        self.in_flight.insert(id.to_owned(), owner.to_owned());
         let conversation = self.get_mut(owner, id)?;
         conversation.busy = true;
         let mut context = conversation.messages.clone();
@@ -154,6 +167,7 @@ impl Conversations {
     /// dueño: sólo se llama después de un `begin_turn` que ya lo comprobó, y un
     /// id (UUID v4) no vuelve a darse.
     pub fn finish_turn(&mut self, id: &str, content: &str, reply: Option<&str>) {
+        self.in_flight.remove(id);
         let Some(conversation) = self.open.get_mut(id) else {
             return;
         };
@@ -775,11 +789,9 @@ mod owner_limit_tests {
         conversations.begin_turn(A, &fresh, "nuevo").unwrap();
     }
 
-    // Un cliente esquiva el tope borrando las conversaciones que esperan
-    // respuesta: el chat sigue en vuelo en el backend pero ya no cuenta. Falla
-    // hoy; se quita el `ignore` al arreglarlo.
+    // Un cliente esquivaba el tope borrando las conversaciones que esperan
+    // respuesta: el chat seguía en vuelo en el backend pero ya no contaba.
     #[test]
-    #[ignore = "bypass: borrar la conversación saca el chat de la cuenta"]
     fn borrar_una_conversacion_en_vuelo_no_devuelve_el_lugar() {
         let mut conversations = Conversations::default();
         let ids = open(&mut conversations, A, 3);
