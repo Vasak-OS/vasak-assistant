@@ -637,7 +637,7 @@ impl ModelBackend for ScriptedBackend {
     ) -> BoxFuture<'a, Result<String, BackendError>> {
         Box::pin(async move {
             if !self.effective_local.unwrap_or(self.local) {
-                return Err(crate::backend::not_local());
+                return Err(crate::backend::BackendError::NotLocal);
             }
             self.chat(messages).await
         })
@@ -701,7 +701,7 @@ impl ModelBackend for FlippingBackend {
         messages: &'a [Message],
     ) -> BoxFuture<'a, Result<String, BackendError>> {
         if !self.resolve_local() {
-            return Box::pin(async { Err(crate::backend::not_local()) });
+            return Box::pin(async { Err(crate::backend::BackendError::NotLocal) });
         }
         self.inner.chat(messages)
     }

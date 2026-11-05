@@ -30,7 +30,7 @@ use vasak_assistant_protocol::{
     DOMAIN_REMOTE_BACKENDS,
 };
 
-use crate::backend::{is_not_local, BackendError, BoxFuture, ModelBackend};
+use crate::backend::{BackendError, BoxFuture, ModelBackend};
 use crate::config::{is_local, normalize_url};
 use crate::conversations::Conversations;
 use crate::keyring::{ApiKey, SecretSource};
@@ -255,12 +255,21 @@ impl AssistantService {
         call.finish(result)
     }
 
-    /// Cómo está la memoria. Nunca falla: el problema va en el motivo.
-    async fn memory_status(&self, #[zbus(header)] header: Header<'_>) -> MemoryStatus {
+    /// Cómo está la memoria. Fuera de la puerta no falla: el problema va en el
+    /// motivo. `AccessDenied` para un llamador confinado: lo que ocupa crece
+    /// con el uso y deja inferir cuánto se usa el asistente (#22).
+    async fn memory_status(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> Result<MemoryStatus, Error> {
         let call = Call::new("MemoryStatus", &header);
-        let status = self.memory_status_now().await;
-        call.done();
-        status
+        let result = async {
+            self.deny_confined(connection, &header).await?;
+            Ok(self.memory_status_now().await)
+        }
+        .await;
+        call.finish(result)
     }
 
     /// Enciende o apaga la memoria. Encender reabre la base que haya (o la
@@ -337,6 +346,7 @@ impl AssistantService {
             let reason = match self.backend.active_model().await {
                 Ok(model) if model.local => None,
                 Ok(_) => Some(crate::memory::REASON_REMOTE),
+                Err(BackendError::NotAllowed(_)) => Some(crate::memory::REASON_MODEL_NOT_ALLOWED),
                 Err(_) => Some(crate::memory::REASON_MODEL_UNREACHABLE),
             };
             if let Some(reason) = reason {
@@ -404,7 +414,7 @@ impl AssistantService {
             },
             Err(error) => ServiceStatus {
                 backend_available: false,
-                reason: reason(&error).to_owned(),
+                reason: error.text().to_owned(),
                 model: self.backend.info(),
                 conversations,
             },
@@ -486,7 +496,7 @@ impl AssistantService {
                     // se reintenta sin notas (la persona igual tiene respuesta,
                     // y la conversación ya podía ir a ese modelo) y ese turno
                     // no se aprende.
-                    Err(error) if is_not_local(&error) => {
+                    Err(BackendError::NotLocal) => {
                         use_memory = false;
                         self.backend.chat(&context).await
                     }
@@ -660,18 +670,13 @@ pub fn capabilities(remote_allowed: bool, memory: &MemoryStatus) -> Vec<Capabili
         .collect()
 }
 
-fn reason(error: &BackendError) -> &str {
-    match error {
-        BackendError::Unavailable(text) | BackendError::Failed(text) => text,
-    }
-}
-
 pub fn to_dbus(error: BackendError) -> Error {
     match error {
-        BackendError::Unavailable(text) if text == crate::backend::METADATA_BUSY => {
-            Error::Busy(text)
+        BackendError::Busy => Error::Busy(crate::backend::METADATA_BUSY.into()),
+        BackendError::NotLocal => Error::Unavailable(crate::backend::NOT_LOCAL.into()),
+        BackendError::Unavailable(text) | BackendError::NotAllowed(text) => {
+            Error::Unavailable(text)
         }
-        BackendError::Unavailable(text) => Error::Unavailable(text),
         BackendError::Failed(text) => Error::Backend(text),
     }
 }
@@ -789,9 +794,7 @@ mod tests {
             BackendError::Unavailable("no hay modelo".into()),
             BackendError::Failed("respuesta rota".into()),
         ] {
-            let texto = match &error {
-                BackendError::Unavailable(t) | BackendError::Failed(t) => t.clone(),
-            };
+            let texto = error.text().to_owned();
             let mut backend = FakeBackend::replying("");
             backend.active_result = Err(error);
             let status = service(backend, false).status_for(OWNER).await;
@@ -2043,8 +2046,7 @@ mod gate_tests {
         let gate = gate(FixedLabel::of(CONFINED), []).await;
         gate.memory.set_enabled(true).await.unwrap();
 
-        let status = gate.proxy.memory_status().await.unwrap();
-        assert!(status.enabled && status.available);
+        // `MemoryStatus` ya no: da `AccessDenied` a un confinado (#22).
         let capabilities = gate.proxy.capabilities().await.unwrap();
         assert!(
             capabilities
@@ -2528,7 +2530,7 @@ mod effective_model_tests {
             messages: &'a [Message],
         ) -> BoxFuture<'a, Result<String, BackendError>> {
             if !self.local_now() {
-                return Box::pin(async { Err(crate::backend::not_local()) });
+                return Box::pin(async { Err(BackendError::NotLocal) });
             }
             self.inner.chat(messages)
         }
@@ -4037,7 +4039,7 @@ mod owner_chat_limit_tests {
     fn el_cupo_de_modelos_lleno_llega_como_busy_y_cualquier_otro_unavailable_sigue_siendo_unavailable(
     ) {
         assert!(matches!(
-            to_dbus(crate::backend::metadata_busy()),
+            to_dbus(BackendError::Busy),
             Error::Busy(text) if text == crate::backend::METADATA_BUSY
         ));
         assert!(matches!(

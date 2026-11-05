@@ -304,9 +304,13 @@ pub trait Assistant {
     /// `AccessDenied` si quien llama es una aplicación confinada (AppArmor).
     fn has_provider_key(&self, url: &str) -> Result<bool, Error>;
 
-    /// Cómo está la memoria. Nunca falla (salvo el bus): cualquier problema
-    /// llega como `available: false` con el motivo (también el de un
-    /// proveedor remoto sin permiso). `bytes` se mide sin abrir la base.
+    /// Cómo está la memoria. Para quien puede preguntar no falla (salvo el
+    /// bus): cualquier problema llega como `available: false` con el motivo
+    /// (también el de un proveedor remoto sin permiso, o el de un modelo por
+    /// omisión en la nube sin `allow_remote`). `bytes` se mide sin abrir la
+    /// base.
+    /// `AccessDenied` si quien llama es una aplicación confinada (AppArmor):
+    /// lo que ocupa crece con el uso.
     fn memory_status(&self) -> Result<MemoryStatus, Error>;
 
     /// Enciende o apaga la memoria.

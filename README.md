@@ -92,10 +92,10 @@ paquete instalado; no hay una excepción de desarrollo en el llavero.
 **Aplicaciones confinadas.** La memoria y las claves son de la persona, no de
 cada aplicación. Si quien llama está confinado por AppArmor (el bus informa su
 `LinuxSecurityLabel` y no es `unconfined`), `SetProviderKey`, `HasProviderKey`,
-`SetMemoryEnabled` y `ClearMemory` contestan
+`MemoryStatus`, `SetMemoryEnabled` y `ClearMemory` contestan
 `ar.net.vasak.os.Assistant.Error.AccessDenied`, y su `Chat` va sin memoria: no
-se le pasan notas ni se aprende de lo que dice. `MemoryStatus` y
-`Capabilities` siguen abiertos. Sin AppArmor no hay etiqueta y se deja pasar;
+se le pasan notas ni se aprende de lo que dice. `MemoryStatus` está cerrado
+porque lo que ocupa la memoria crece con el uso. `Capabilities` sigue abierto. Sin AppArmor no hay etiqueta y se deja pasar;
 una etiqueta vacía cuenta como confinada.
 
 Cuenta como confinado todo lo que tenga perfil, aunque esté en modo complain
@@ -196,7 +196,7 @@ systemd, `$STATE_DIRECTORY`). No va en el almacén de cuentas.
 
 | Método | Qué hace |
 |---|---|
-| `MemoryStatus() → (bbst)` | `enabled`, `available`, `reason` y `bytes` (lo que ocupa en disco, encendida o apagada, medido sin abrirla). Nunca falla: un problema llega como `available = false` con el motivo («La memoria está apagada», «El llavero está bloqueado», «La clave de la memoria no está en el llavero», «La memoria no se pudo abrir»). |
+| `MemoryStatus() → (bbst)` | `enabled`, `available`, `reason` y `bytes` (lo que ocupa en disco, encendida o apagada, medido sin abrirla). Un problema llega como `available = false` con el motivo («La memoria está apagada», «El llavero está bloqueado», «La clave de la memoria no está en el llavero», «La memoria no se pudo abrir», «El modelo no está permitido: corre en la nube y falta «allow_remote»»). `AccessDenied` para un llamador confinado. |
 | `SetMemoryEnabled(b enabled) → ()` | Encender: reabre la base que haya o, si no hay, llave nueva al llavero y base vacía. `Unavailable` si el llavero está bloqueado (no abre ningún diálogo), no responde o la base no abre. Apagar: deja de usarla, sin borrar nada. |
 | `ClearMemory() → ()` | La borra (llave y archivos) y, si estaba encendida, la recrea vacía con una llave nueva. `Unavailable` con el llavero bloqueado, sin tocar nada. |
 
@@ -274,8 +274,8 @@ busctl --user call $d $p $d Chat ss "$id" "Hola, ¿quién sos?"
 ```
 
 Con AppArmor, `busctl` tiene perfil (en modo complain), así que cuenta como
-confinado: el `Chat` de arriba va **sin memoria** y `SetMemoryEnabled`,
-`ClearMemory`, `SetProviderKey` y `HasProviderKey` le contestan
+confinado: el `Chat` de arriba va **sin memoria** y `MemoryStatus`,
+`SetMemoryEnabled`, `ClearMemory`, `SetProviderKey` y `HasProviderKey` le contestan
 `AccessDenied`. Para la memoria y las claves, Configuración.
 
 Instalado, lo arranca systemd como servicio de usuario

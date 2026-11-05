@@ -84,6 +84,8 @@ pub const REASON_NO_KEYRING: &str = "El llavero no responde";
 pub const REASON_NO_PLACE: &str = "No hay una carpeta de estado donde guardar la memoria";
 pub const REASON_REMOTE: &str = "La memoria no se comparte con un proveedor remoto";
 pub const REASON_MODEL_UNREACHABLE: &str = "El modelo no responde";
+pub const REASON_MODEL_NOT_ALLOWED: &str =
+    "El modelo no está permitido: corre en la nube y falta «allow_remote»";
 
 /// El tope de lo que ocupa la base en disco.
 pub const MAX_MEMORY_DISK_BYTES: u64 = 4 << 20;
