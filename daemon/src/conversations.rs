@@ -20,8 +20,8 @@ use std::collections::HashMap;
 
 use uuid::Uuid;
 use vasak_assistant_protocol::{
-    Error, Message, Role, MAX_CONVERSATIONS, MAX_CONVERSATIONS_PER_OWNER, MAX_HISTORY_BYTES,
-    MAX_HISTORY_MESSAGES, MAX_MESSAGE_BYTES,
+    Error, Message, Role, MAX_CHATS_IN_FLIGHT_PER_OWNER, MAX_CONVERSATIONS,
+    MAX_CONVERSATIONS_PER_OWNER, MAX_HISTORY_BYTES, MAX_HISTORY_MESSAGES, MAX_MESSAGE_BYTES,
 };
 
 struct Conversation {
@@ -36,6 +36,12 @@ struct Conversation {
 #[derive(Default)]
 pub struct Conversations {
     open: HashMap<String, Conversation>,
+    /// Los chats en vuelo: id de la conversación → su dueño. Se anota en
+    /// `begin_turn` y se saca en `finish_turn` (que corre siempre, por el
+    /// `Drop` del turno), exista o no la conversación: borrarla mientras espera
+    /// al modelo no devuelve el lugar, porque el pedido sigue ocupando el
+    /// backend. Sólo tiene los que están en vuelo, así que no acumula nada.
+    in_flight: HashMap<String, String>,
 }
 
 impl Conversations {
@@ -94,6 +100,8 @@ impl Conversations {
 
     pub fn delete(&mut self, owner: &str, id: &str) -> Result<(), Error> {
         self.get(owner, id)?;
+        // El chat en vuelo, si hay, sigue anotado en `in_flight` hasta que
+        // termine: sigue ocupando el backend.
         self.open.remove(id);
         Ok(())
     }
@@ -103,6 +111,10 @@ impl Conversations {
     pub fn release_owner(&mut self, owner: &str) -> usize {
         let before = self.open.len();
         self.open.retain(|_, c| c.owner != owner);
+        // La conexión ya no existe, y su nombre único no vuelve: no hay a
+        // quién ponerle el tope.
+        self.in_flight
+            .retain(|_, in_flight_owner| in_flight_owner != owner);
         before - self.open.len()
     }
 
@@ -117,12 +129,29 @@ impl Conversations {
         content: &str,
     ) -> Result<Vec<Message>, Error> {
         validate_content(content)?;
-        let conversation = self.get_mut(owner, id)?;
-        if conversation.busy {
+        if self.get(owner, id)?.busy {
             return Err(Error::Busy(
                 "la conversación todavía está esperando la respuesta anterior".into(),
             ));
         }
+        // El tope por dueño (#3): con los chats en vuelo de una conexión
+        // contados acá, bajo el mismo candado que los marca, un cliente no
+        // ocupa todo el cupo del backend. `Busy` y no `LimitExceeded`: es
+        // pasajero, alcanza con esperar a que llegue una respuesta, mientras
+        // que `LimitExceeded` es el tope de conversaciones abiertas, que no se
+        // libera solo.
+        let in_flight = self
+            .in_flight
+            .values()
+            .filter(|in_flight_owner| *in_flight_owner == owner)
+            .count();
+        if in_flight >= MAX_CHATS_IN_FLIGHT_PER_OWNER {
+            return Err(Error::Busy(format!(
+                "ya hay {in_flight} pedidos esperando respuesta del modelo; esperá a que termine uno"
+            )));
+        }
+        self.in_flight.insert(id.to_owned(), owner.to_owned());
+        let conversation = self.get_mut(owner, id)?;
         conversation.busy = true;
         let mut context = conversation.messages.clone();
         context.push(Message {
@@ -138,6 +167,7 @@ impl Conversations {
     /// dueño: sólo se llama después de un `begin_turn` que ya lo comprobó, y un
     /// id (UUID v4) no vuelve a darse.
     pub fn finish_turn(&mut self, id: &str, content: &str, reply: Option<&str>) {
+        self.in_flight.remove(id);
         let Some(conversation) = self.open.get_mut(id) else {
             return;
         };
@@ -649,5 +679,229 @@ mod tests {
         conversations.release_owner(OWNER);
         conversations.finish_turn(&id, "hola", Some("respuesta"));
         assert_eq!(conversations.len(), 0);
+    }
+}
+
+/// El tope de chats en vuelo por dueño (#3).
+#[cfg(test)]
+mod owner_limit_tests {
+    use super::*;
+
+    const A: &str = ":1.1";
+    const B: &str = ":1.2";
+
+    fn open(conversations: &mut Conversations, owner: &str, n: usize) -> Vec<String> {
+        (0..n)
+            .map(|_| conversations.create(owner).unwrap())
+            .collect()
+    }
+
+    fn busy_count(conversations: &Conversations, owner: &str) -> usize {
+        conversations
+            .open
+            .values()
+            .filter(|c| c.owner == owner && c.busy)
+            .count()
+    }
+
+    #[test]
+    fn con_dos_chats_en_vuelo_el_tercero_da_busy_y_no_queda_marcado_en_vuelo() {
+        let mut conversations = Conversations::default();
+        let ids = open(&mut conversations, A, 3);
+        conversations.begin_turn(A, &ids[0], "uno").unwrap();
+        conversations.begin_turn(A, &ids[1], "dos").unwrap();
+
+        let third = conversations.begin_turn(A, &ids[2], "tres");
+
+        assert_eq!(MAX_CHATS_IN_FLIGHT_PER_OWNER, 2);
+        match third {
+            Err(Error::Busy(text)) => {
+                assert!(text.contains('2'), "{text}");
+                assert!(!text.contains("tres"), "{text}");
+            }
+            other => panic!("se esperaba Busy, vino {other:?}"),
+        }
+        // El tercero no ocupó nada: ni el cupo del dueño ni la conversación.
+        assert_eq!(busy_count(&conversations, A), 2);
+        assert!(!conversations.open[&ids[2]].busy);
+        // Y su mensaje no entró al historial.
+        assert!(conversations.history(A, &ids[2]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn el_busy_del_tope_no_es_limit_exceeded() {
+        let mut conversations = Conversations::default();
+        let ids = open(&mut conversations, A, 3);
+        conversations.begin_turn(A, &ids[0], "uno").unwrap();
+        conversations.begin_turn(A, &ids[1], "dos").unwrap();
+        assert!(!matches!(
+            conversations.begin_turn(A, &ids[2], "tres"),
+            Err(Error::LimitExceeded(_))
+        ));
+    }
+
+    #[test]
+    fn otro_duenio_chatea_normal_con_el_primero_en_su_tope() {
+        let mut conversations = Conversations::default();
+        let a = open(&mut conversations, A, 3);
+        let b = open(&mut conversations, B, 3);
+        conversations.begin_turn(A, &a[0], "uno").unwrap();
+        conversations.begin_turn(A, &a[1], "dos").unwrap();
+        assert!(conversations.begin_turn(A, &a[2], "tres").is_err());
+
+        conversations.begin_turn(B, &b[0], "uno").unwrap();
+        conversations.begin_turn(B, &b[1], "dos").unwrap();
+
+        assert_eq!(busy_count(&conversations, B), 2);
+        assert!(matches!(
+            conversations.begin_turn(B, &b[2], "tres"),
+            Err(Error::Busy(_))
+        ));
+    }
+
+    #[test]
+    fn terminar_un_chat_con_respuesta_o_sin_ella_devuelve_el_lugar() {
+        for reply in [Some("respuesta"), None] {
+            let mut conversations = Conversations::default();
+            let ids = open(&mut conversations, A, 3);
+            conversations.begin_turn(A, &ids[0], "uno").unwrap();
+            conversations.begin_turn(A, &ids[1], "dos").unwrap();
+            assert!(conversations.begin_turn(A, &ids[2], "tres").is_err());
+
+            conversations.finish_turn(&ids[0], "uno", reply);
+
+            conversations.begin_turn(A, &ids[2], "tres").unwrap();
+            assert_eq!(busy_count(&conversations, A), 2, "{reply:?}");
+        }
+    }
+
+    #[test]
+    fn irse_el_duenio_devuelve_el_lugar() {
+        let mut conversations = Conversations::default();
+        let ids = open(&mut conversations, A, 2);
+        conversations.begin_turn(A, &ids[0], "uno").unwrap();
+        conversations.begin_turn(A, &ids[1], "dos").unwrap();
+
+        conversations.release_owner(A);
+
+        assert_eq!(busy_count(&conversations, A), 0);
+        let fresh = conversations.create(A).unwrap();
+        conversations.begin_turn(A, &fresh, "nuevo").unwrap();
+    }
+
+    // Un cliente esquivaba el tope borrando las conversaciones que esperan
+    // respuesta: el chat seguía en vuelo en el backend pero ya no contaba.
+    #[test]
+    fn borrar_una_conversacion_en_vuelo_no_devuelve_el_lugar() {
+        let mut conversations = Conversations::default();
+        let ids = open(&mut conversations, A, 3);
+        conversations.begin_turn(A, &ids[0], "uno").unwrap();
+        conversations.begin_turn(A, &ids[1], "dos").unwrap();
+
+        conversations.delete(A, &ids[0]).unwrap();
+
+        // El pedido de «uno» sigue esperando al modelo: el dueño sigue en su tope.
+        assert!(matches!(
+            conversations.begin_turn(A, &ids[2], "tres"),
+            Err(Error::Busy(_))
+        ));
+    }
+
+    #[test]
+    fn la_misma_conversacion_ocupada_sigue_dando_su_busy_y_no_cuenta_dos_veces() {
+        let mut conversations = Conversations::default();
+        let ids = open(&mut conversations, A, 2);
+        conversations.begin_turn(A, &ids[0], "uno").unwrap();
+
+        let again = conversations.begin_turn(A, &ids[0], "otra vez");
+
+        let Err(Error::Busy(text)) = again else {
+            panic!("se esperaba Busy");
+        };
+        assert!(text.contains("anterior"), "{text}");
+        // Sigue habiendo un lugar para otra conversación.
+        conversations.begin_turn(A, &ids[1], "dos").unwrap();
+    }
+
+    #[test]
+    fn un_mensaje_invalido_ni_una_conversacion_ajena_ocupan_ni_gastan_lugar() {
+        let mut conversations = Conversations::default();
+        let ids = open(&mut conversations, A, 2);
+        let theirs = conversations.create(B).unwrap();
+
+        assert!(conversations.begin_turn(A, &ids[0], "").is_err());
+        assert!(conversations.begin_turn(A, &theirs, "hola").is_err());
+
+        assert_eq!(busy_count(&conversations, A), 0);
+        assert_eq!(busy_count(&conversations, B), 0);
+        // Ni el mapa de chats en vuelo anotó nada...
+        assert!(conversations.in_flight.is_empty());
+        // ...y el dueño conserva sus dos lugares enteros.
+        conversations.begin_turn(A, &ids[0], "uno").unwrap();
+        conversations.begin_turn(A, &ids[1], "dos").unwrap();
+        let third = conversations.create(A).unwrap();
+        assert!(matches!(
+            conversations.begin_turn(A, &third, "tres"),
+            Err(Error::Busy(_))
+        ));
+        assert_eq!(conversations.in_flight.len(), 2);
+    }
+
+    #[test]
+    fn al_irse_el_duenio_con_dos_chats_colgados_se_liberan_sus_lugares_y_no_se_hereda_nada() {
+        let mut conversations = Conversations::default();
+        let old = open(&mut conversations, A, 2);
+        let other = open(&mut conversations, B, 1);
+        conversations.begin_turn(A, &old[0], "uno").unwrap();
+        conversations.begin_turn(A, &old[1], "dos").unwrap();
+        conversations.begin_turn(B, &other[0], "uno").unwrap();
+        assert_eq!(conversations.in_flight.len(), 3);
+
+        // La conexión se va con sus dos chats colgados: sólo el otro dueño queda anotado.
+        conversations.release_owner(A);
+
+        assert_eq!(conversations.in_flight.len(), 1);
+        assert!(conversations.in_flight.values().all(|owner| owner == B));
+        // Otra conexión con el mismo nombre (aunque no debería repetirse) empieza de cero.
+        let fresh = open(&mut conversations, A, 3);
+        conversations.begin_turn(A, &fresh[0], "uno").unwrap();
+        conversations.begin_turn(A, &fresh[1], "dos").unwrap();
+        assert!(matches!(
+            conversations.begin_turn(A, &fresh[2], "tres"),
+            Err(Error::Busy(_))
+        ));
+        // Los pedidos viejos terminan después (su `Drop` llama a `finish_turn`):
+        // no liberan los lugares nuevos ni rompen nada.
+        conversations.finish_turn(&old[0], "uno", None);
+        conversations.finish_turn(&old[1], "dos", Some("tarde"));
+        assert_eq!(conversations.in_flight.len(), 3);
+        assert!(matches!(
+            conversations.begin_turn(A, &fresh[2], "tres"),
+            Err(Error::Busy(_))
+        ));
+        // Y el otro dueño sigue con lo suyo.
+        conversations.finish_turn(&other[0], "uno", None);
+        assert_eq!(conversations.in_flight.len(), 2);
+    }
+
+    #[test]
+    fn el_mapa_de_chats_en_vuelo_solo_tiene_los_que_estan_en_vuelo() {
+        let mut conversations = Conversations::default();
+        let ids = open(&mut conversations, A, 2);
+        assert!(conversations.in_flight.is_empty());
+
+        conversations.begin_turn(A, &ids[0], "uno").unwrap();
+        assert!(conversations.begin_turn(A, &ids[0], "otra vez").is_err());
+        assert_eq!(conversations.in_flight.len(), 1);
+        conversations.delete(A, &ids[0]).unwrap();
+        // Borrada, el pedido sigue ocupando el backend: sigue anotado.
+        assert_eq!(conversations.in_flight.len(), 1);
+        conversations.finish_turn(&ids[0], "uno", Some("respuesta"));
+
+        assert!(conversations.in_flight.is_empty());
+        // Terminar un turno que ya no existe o nunca empezó no rompe nada.
+        conversations.finish_turn("no-existe", "x", None);
+        conversations.finish_turn(&ids[1], "x", None);
+        assert!(conversations.in_flight.is_empty());
     }
 }
