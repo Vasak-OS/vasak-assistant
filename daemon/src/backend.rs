@@ -204,6 +204,13 @@ impl ModelBackend for Limited {
                     self.metadata_permit().await?
                 }
             };
+            // Mientras se esperaba el lugar, otro llamador pudo haber guardado
+            // la respuesta: no se repite el pedido al backend.
+            if let Some((at, cached)) = &*self.active.lock() {
+                if at.elapsed() < ACTIVE_MODEL_TTL {
+                    return cached.clone();
+                }
+            }
             let result = {
                 let _permit = permit;
                 let started = Instant::now();
