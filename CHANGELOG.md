@@ -21,8 +21,8 @@ escondidas (#18, #19).
   de ahora», «actuá como», «disregard», «forget», «developer» y las comillas
   `'‘’‹›„`; se buscan también con las letras separadas por espacios juntadas,
   con los homoglifos cirílicos llevados a su letra latina, en NFKC y, los que
-  son sólo letras, en el texto sin nada que no sea letra o dígito
-  (`i.g.n.o.r.a`). Los selectores de variación y los rellenos de Hangul cuentan
+  son sólo letras, palabra por palabra sin lo que no es letra o dígito
+  (`i.g.n.o.r.a`), sin juntar palabras distintas. Los selectores de variación y los rellenos de Hangul cuentan
   como caracteres prohibidos, y una nota sólo puede tener letras latinas (ASCII,
   Latin-1 y Latin Extended-A, sin `ı`), dígitos, el espacio y la puntuación
   básica. `recall` aplica al leer los mismos filtros que al escribir, antes del

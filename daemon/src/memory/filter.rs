@@ -228,10 +228,14 @@ const INJECTION_MARKERS: &[&str] = &[
 /// Si el texto trae marcadores de rol o de instrucciones. Se mira en NFKC
 /// (ancho completo), con los homoglifos cirílicos llevados a su letra latina,
 /// y además con las letras sueltas juntadas (`i g n o r a` es `ignora`). Los
-/// marcadores que son sólo letras se buscan también en el texto sin nada que
-/// no sea letra o dígito, así `i.g.n.o.r.a` e `ign ora` cuentan; puede juntar
-/// dos palabras en un marcador («prefiere glaseado» tiene `regla`), y se
-/// acepta: perder la nota cuesta menos.
+/// marcadores que son sólo letras se buscan también palabra por palabra, sin lo
+/// que no es letra o dígito dentro de cada una (`i.g.n.o.r.a` e `i_g_n_o_r_a`
+/// son `ignora`), sin juntar palabras distintas («prefiere glaseado» no es
+/// `regla`).
+///
+/// shortcut: una palabra partida en dos (`ign ora`) o en leetspeak pasa, y la
+/// defensa de fondo es el escapado JSON con nonce del bloque; mejorarlo si
+/// aparece una forma de detectarlo sin descartar notas legítimas.
 pub fn has_injection_markers(text: &str) -> bool {
     let latin: String = normalize_terms(&nfkc(text))
         .chars()
@@ -240,12 +244,17 @@ pub fn has_injection_markers(text: &str) -> bool {
     // `user :` cuenta como `user:` (normalize_terms ya colapsó los espacios).
     let joined = join_single_letters(&latin).replace(" :", ":");
     let folded = latin.replace(" :", ":");
-    let compact: String = latin.chars().filter(|c| c.is_alphanumeric()).collect();
+    let words = latin
+        .split(' ')
+        .map(|word| word.chars().filter(|c| c.is_alphanumeric()).collect())
+        .collect::<Vec<String>>()
+        .join(" ");
+    // `i. g. n. o. r. a` también: las palabras ya limpias, con las sueltas juntas.
+    let words = join_single_letters(&words);
     INJECTION_MARKERS.iter().any(|marker| {
         folded.contains(marker)
             || joined.contains(marker)
-            || marker.chars().all(|c| c.is_alphabetic() || c == ' ')
-                && compact.contains(&marker.replace(' ', ""))
+            || marker.chars().all(|c| c.is_alphabetic() || c == ' ') && words.contains(marker)
     })
 }
 
