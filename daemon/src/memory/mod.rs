@@ -812,15 +812,18 @@ fn config(path: &Path, key: &[u8; MEMORY_KEY_BYTES]) -> Config {
 /// nueva donde no hay archivo, y migraría y adoptaría una base 0.5.x sin
 /// cifrar. Antes de abrir se exige la cabecera de una base 0.6 cifrada
 /// ([`is_encrypted_header`]) y que no haya restos de una migración de Grafeo.
+///
+/// Entre mirar la cabecera y abrir, otro proceso puede cambiar el archivo por
+/// una base 0.5.x en claro, y Grafeo la migraría. Por eso, después de abrir se
+/// vuelve a mirar: si aparecieron restos, se cierra y se rechaza. Abrir por un
+/// fd ya validado no se puede: `Config::persistent` toma una ruta, y Grafeo
+/// arma con ella la del WAL y la de la migración.
 fn open_existing(path: &Path, key: &[u8; MEMORY_KEY_BYTES]) -> Result<GrafeoDB, String> {
-    for leftover in ["pre-0.6", "migrating"] {
-        let leftover = path.with_extension(format!("grafeo.{leftover}"));
-        if std::fs::symlink_metadata(&leftover).is_ok() {
-            return Err(format!(
-                "hay restos de una migración: {}",
-                leftover.display()
-            ));
-        }
+    if let Some(leftover) = migration_leftover(path) {
+        return Err(format!(
+            "hay restos de una migración: {}",
+            leftover.display()
+        ));
     }
     let mut header = [0u8; HEADER_PREFIX_BYTES];
     std::fs::File::open(path)
@@ -830,8 +833,22 @@ fn open_existing(path: &Path, key: &[u8; MEMORY_KEY_BYTES]) -> Result<GrafeoDB, 
         return Err(format!("{} no es una base 0.6 cifrada", path.display()));
     }
     let db = GrafeoDB::with_config(config(path, key)).map_err(db_error)?;
+    if migration_leftover(path).is_some() {
+        // Sin la ruta ni el texto de Grafeo: sólo que pasó y qué se hizo.
+        let _ = db.close();
+        tracing::warn!("Grafeo migró la base al abrirla: se cerró y no se usa");
+        return Err("la base cambió entre mirar la cabecera y abrirla".to_owned());
+    }
     schema::ensure_indexes(&db).map_err(db_error)?;
     Ok(db)
+}
+
+/// El primer resto de una migración de Grafeo al lado de `path`, si hay.
+fn migration_leftover(path: &Path) -> Option<PathBuf> {
+    ["pre-0.6", "migrating"]
+        .into_iter()
+        .map(|leftover| path.with_extension(format!("grafeo.{leftover}")))
+        .find(|leftover| std::fs::symlink_metadata(leftover).is_ok())
 }
 
 /// Cuántos bytes de la cabecera de `.grafeo` hacen falta para decidir.

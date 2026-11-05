@@ -2,6 +2,25 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-assistant 0.3.6
+
+La memoria, más dura frente a una base cambiada y a las notas con órdenes
+escondidas (#18, #19).
+
+- **`daemon`** — después de abrir la base se vuelve a mirar si Grafeo dejó
+  restos de una migración (`lince.grafeo.pre-0.6`, `.migrating`): si alguien
+  cambió el archivo por una base 0.5.x en claro entre mirar la cabecera y
+  abrirla, la base se cierra, no se usa y queda una línea en el registro, sin la
+  ruta ni el texto de Grafeo (#18). Abrir por un descriptor ya validado no se
+  puede con Grafeo 0.6.0-beta.1, que sólo abre por ruta.
+- **`daemon`** — más marcadores de inyección: «olvidá lo anterior», «a partir
+  de ahora», «actuá como», «disregard», «forget», «developer» y las comillas
+  `'‘’‹›„`; se buscan también con las letras separadas por espacios juntadas,
+  con los homoglifos cirílicos llevados a su letra latina y en NFKC. Los
+  selectores de variación y los rellenos de Hangul cuentan como caracteres
+  prohibidos. `recall` aplica los dos filtros al leer, así las notas que guardó
+  una versión anterior y hoy no entrarían ya no llegan al modelo (#19).
+
 ## vasak-assistant 0.3.4
 
 Un registro de errores completo y que no filtra datos (#29).

@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use grafeo::{GrafeoDB, NodeId};
 use vasak_assistant_protocol::MAX_MESSAGE_BYTES;
 
-use super::filter::normalize_terms;
+use super::filter::{has_forbidden_chars, has_injection_markers, normalize_terms};
 use super::schema::{about_topic, entries, entry, Entry, MemoryKind, LABEL};
 
 /// El tope del bloque de notas.
@@ -37,7 +37,7 @@ pub fn build(db: &GrafeoDB, message: &str, first_turn: bool, now: i64) -> Option
     let mut picked: Vec<Entry> = Vec::new();
     let mut seen: HashSet<NodeId> = HashSet::new();
     let mut push = |found: Entry, picked: &mut Vec<Entry>| {
-        if seen.insert(found.node) {
+        if is_clean(&found) && seen.insert(found.node) {
             picked.push(found);
         }
     };
@@ -94,6 +94,14 @@ pub fn build(db: &GrafeoDB, message: &str, first_turn: bool, now: i64) -> Option
     }
 
     render(&picked)
+}
+
+/// Si la nota pasa los filtros de caracteres y de marcadores de hoy. Una base
+/// escrita por una versión anterior pudo guardar notas que hoy no entrarían.
+fn is_clean(found: &Entry) -> bool {
+    std::iter::once(found.text.as_str())
+        .chain(found.phrase.as_deref())
+        .all(|text| !has_forbidden_chars(text) && !has_injection_markers(text))
 }
 
 /// Los `n` de mayor `key`.

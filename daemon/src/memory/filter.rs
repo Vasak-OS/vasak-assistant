@@ -135,8 +135,9 @@ pub fn nfkc(text: &str) -> String {
 
 /// Caracteres que no tienen nada que hacer en una nota y sirven para esconder
 /// o reordenar texto: las categorías Unicode Cf (formato, incluidos los de
-/// dirección), Zl y Zp (separadores de línea y de párrafo), Co (uso privado) y
-/// los de control.
+/// dirección), Zl y Zp (separadores de línea y de párrafo), Co (uso privado),
+/// los de control, los selectores de variación y los rellenos de Hangul (se
+/// ven como nada y parten una palabra sin que se note).
 pub fn has_forbidden_chars(text: &str) -> bool {
     text.chars()
         .any(|c| c.is_control() || is_format_or_private(c))
@@ -154,13 +155,27 @@ fn is_format_or_private(c: char) -> bool {
             | 0x2028 | 0x2029
             // Co
             | 0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD
+            // Selectores de variación (también los mongoles)
+            | 0x180B..=0x180D | 0x180F | 0xFE00..=0xFE0F | 0xE0100..=0xE01EF
+            // Rellenos de Hangul
+            | 0x115F | 0x1160 | 0x3164 | 0xFFA0
     )
 }
 
 /// Marcadores de rol o de instrucciones, para que una nota no se lea como un
-/// mensaje del sistema o del asistente. Se buscan en minúsculas y sin tildes.
+/// mensaje del sistema o del asistente. Se buscan en minúsculas y sin tildes,
+/// como subcadenas, igual que el resto de la lista: las notas son frases
+/// cortas en español en tercera persona («Prefiere…»), así que una palabra en
+/// inglés como «forget» casi nunca es una nota legítima, y perder un recuerdo
+/// cuesta menos que dejar pasar una orden.
 const INJECTION_MARKERS: &[&str] = &[
     "ignor",
+    "disregard",
+    "forget",
+    "developer",
+    "olvida lo anterior",
+    "a partir de ahora",
+    "actua como",
     "instrucci",
     "sistema",
     "system",
@@ -175,15 +190,72 @@ const INJECTION_MARKERS: &[&str] = &[
     "###",
     "</",
     "notas",
+    // Comillas que pueden abrir o cerrar un texto citado en el bloque.
+    "'",
+    "‘",
+    "’",
+    "‹",
+    "›",
+    "„",
 ];
 
-/// Si el texto trae marcadores de rol o de instrucciones.
+/// Si el texto trae marcadores de rol o de instrucciones. Se mira en NFKC
+/// (ancho completo), con los homoglifos cirílicos llevados a su letra latina,
+/// y además con las letras sueltas juntadas (`i g n o r a` es `ignora`).
 pub fn has_injection_markers(text: &str) -> bool {
+    let latin: String = normalize_terms(&nfkc(text))
+        .chars()
+        .map(cyrillic_to_latin)
+        .collect();
     // `user :` cuenta como `user:` (normalize_terms ya colapsó los espacios).
-    let folded = normalize_terms(text).replace(" :", ":");
+    let joined = join_single_letters(&latin).replace(" :", ":");
+    let folded = latin.replace(" :", ":");
     INJECTION_MARKERS
         .iter()
-        .any(|marker| folded.contains(marker))
+        .any(|marker| folded.contains(marker) || joined.contains(marker))
+}
+
+/// La letra latina que se ve igual, para las cirílicas que tienen una (ya en
+/// minúsculas: `Н` y `В` quedan `н` y `в`, que en mayúscula son `H` y `B`).
+fn cyrillic_to_latin(c: char) -> char {
+    match c {
+        'а' => 'a',
+        'в' => 'b',
+        'с' => 'c',
+        'ԁ' => 'd',
+        'е' => 'e',
+        'һ' | 'н' => 'h',
+        'і' => 'i',
+        'ј' => 'j',
+        'к' => 'k',
+        'ӏ' => 'l',
+        'м' => 'm',
+        'о' => 'o',
+        'р' => 'p',
+        'ԛ' => 'q',
+        'ѕ' => 's',
+        'т' => 't',
+        'ԝ' => 'w',
+        'х' => 'x',
+        'у' => 'y',
+        other => other,
+    }
+}
+
+/// Las palabras de un solo carácter seguidas, juntas en una: `s y s t e m`
+/// queda `system`. Las de más de un carácter quedan como estaban.
+fn join_single_letters(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut previous_single = false;
+    for (i, word) in text.split(' ').enumerate() {
+        let single = word.chars().count() == 1;
+        if i > 0 && !(single && previous_single) {
+            out.push(' ');
+        }
+        out.push_str(word);
+        previous_single = single;
+    }
+    out
 }
 
 /// Palabras que hablan de credenciales o de cuentas: una nota que las nombra
