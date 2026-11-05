@@ -3766,7 +3766,7 @@ mod owner_chat_limit_tests {
         let a2 = start_chat(&service, A, &a[1]);
         quickly(backend.entered.notified()).await;
         assert!(matches!(
-            service.chat_as(A, &a[2], "tres").await,
+            quickly(service.chat_as(A, &a[2], "tres")).await,
             Err(Error::Busy(_))
         ));
         let b = service.open(B).unwrap();
@@ -3795,7 +3795,7 @@ mod owner_chat_limit_tests {
         quickly(backend.entered.notified()).await;
         let second = start_chat(&service, A, &ids[1]);
         quickly(backend.entered.notified()).await;
-        assert!(service.chat_as(A, &ids[2], "tres").await.is_err());
+        assert!(quickly(service.chat_as(A, &ids[2], "tres")).await.is_err());
 
         gate.notify_one();
         quickly(first).await.unwrap().unwrap();
@@ -3845,7 +3845,7 @@ mod owner_chat_limit_tests {
         quickly(backend.entered.notified()).await;
         let second = start_chat(&service, A, &ids[1]);
         quickly(backend.entered.notified()).await;
-        assert!(service.chat_as(A, &ids[2], "tres").await.is_err());
+        assert!(quickly(service.chat_as(A, &ids[2], "tres")).await.is_err());
 
         // El cliente se va a mitad del pedido (el pedido se abandona).
         first.abort();
@@ -3894,7 +3894,7 @@ mod owner_chat_limit_tests {
         quickly(backend.entered.notified()).await;
         let third = start_chat(&service, A, &ids[2]);
         quickly(backend.entered.notified()).await;
-        let busy = service.chat_as(A, &service.open(A).unwrap(), "otro").await;
+        let busy = quickly(service.chat_as(A, &service.open(A).unwrap(), "otro")).await;
         assert!(matches!(busy, Err(Error::Busy(_))), "{busy:?}");
 
         for _ in 0..3 {
@@ -3942,7 +3942,7 @@ mod owner_chat_limit_tests {
         quickly(backend.entered.notified()).await;
         quickly(backend.entered.notified()).await;
 
-        let third = proxy.chat(&ids[2], "mensajecanarioqzx").await;
+        let third = quickly(proxy.chat(&ids[2], "mensajecanarioqzx")).await;
 
         assert!(matches!(third, Err(Error::Busy(_))), "{third:?}");
         let text = log.text();
