@@ -2096,6 +2096,59 @@ mod gate_tests {
         gate.proxy.delete_conversation(&id).await.unwrap();
     }
 
+    fn memory_capability(capabilities: &[Capability]) -> &Capability {
+        capabilities
+            .iter()
+            .find(|c| c.domain == DOMAIN_MEMORY)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sin_confinar_y_con_la_memoria_encendida_las_capacidades_dicen_que_esta_disponible() {
+        for (name, label) in [
+            ("sin AppArmor", FixedLabel::none()),
+            ("unconfined", FixedLabel::of(b"unconfined\0")),
+        ] {
+            let gate = gate(label, []).await;
+            gate.memory.set_enabled(true).await.unwrap();
+
+            let capabilities = gate.proxy.capabilities().await.unwrap();
+
+            let memory = memory_capability(&capabilities);
+            assert!(memory.available, "{name}: {memory:?}");
+            assert_ne!(memory.reason, crate::memory::REASON_CONFINED, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_un_confinado_las_capacidades_no_le_consultan_el_llavero_ni_dicen_si_esta_encendida()
+    {
+        for (name, label) in labels() {
+            for enabled in [true, false] {
+                for unreachable in [false, true] {
+                    let gate = gate(label.clone(), []).await;
+                    if enabled {
+                        gate.memory.set_enabled(true).await.unwrap();
+                    }
+                    *gate.keys.unreachable.lock() = unreachable;
+                    let calls = gate.keys.calls.lock().len();
+
+                    let capabilities = gate.proxy.capabilities().await.unwrap();
+
+                    let memory = memory_capability(&capabilities);
+                    let caso = format!("{name}, encendida={enabled}, llavero caído={unreachable}");
+                    assert!(!memory.available, "{caso}");
+                    assert_eq!(memory.reason, crate::memory::REASON_CONFINED, "{caso}");
+                    assert_eq!(
+                        gate.keys.calls.lock().len(),
+                        calls,
+                        "{caso}: tocó el llavero"
+                    );
+                }
+            }
+        }
+    }
+
     fn remembered() -> Extraction {
         Extraction {
             items: vec![Item {
