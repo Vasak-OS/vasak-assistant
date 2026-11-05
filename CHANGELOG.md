@@ -10,6 +10,10 @@ de reconocerse por el texto (#22, #24).
 - **`daemon`** — `MemoryStatus` contesta `AccessDenied` a un llamador
   confinado, igual que `SetMemoryEnabled` y `ClearMemory`: lo que ocupa la
   memoria crece con el uso y dejaba inferir cuánto se usa el asistente (#22).
+- **`daemon`** — a un llamador confinado, `Capabilities` le informa `memory`
+  como no disponible con un motivo fijo («No disponible para aplicaciones
+  confinadas»), sin abrir la base ni preguntar al llavero: antes le decía si
+  estaba encendida y cómo estaba el llavero.
 - **`daemon`** — con el modelo por omisión de Ollama en la nube y sin
   `allow_remote`, `MemoryStatus` dice «El modelo no está permitido: corre en la
   nube y falta «allow_remote»» en lugar de «El modelo no responde» (#24).

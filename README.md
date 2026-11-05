@@ -95,14 +95,19 @@ cada aplicación. Si quien llama está confinado por AppArmor (el bus informa su
 `MemoryStatus`, `SetMemoryEnabled` y `ClearMemory` contestan
 `ar.net.vasak.os.Assistant.Error.AccessDenied`, y su `Chat` va sin memoria: no
 se le pasan notas ni se aprende de lo que dice. `MemoryStatus` está cerrado
-porque lo que ocupa la memoria crece con el uso. `Capabilities` sigue abierto. Sin AppArmor no hay etiqueta y se deja pasar;
-una etiqueta vacía cuenta como confinada.
+porque lo que ocupa la memoria crece con el uso. `Capabilities` sigue abierto,
+pero a un confinado le informa `memory` como no disponible con un motivo fijo
+(«No disponible para aplicaciones confinadas»), sin abrir la base ni preguntar
+al llavero. Sin AppArmor no hay etiqueta y se deja pasar; una etiqueta vacía
+cuenta como confinada.
 
 Cuenta como confinado todo lo que tenga perfil, aunque esté en modo complain
 (por ejemplo `busctl` y `qdbus`) o sea un perfil `(unconfined)` con nombre
 (Flatpak, Firefox): `Chat` va sin memoria y los métodos de control dan
 `AccessDenied`. Sólo pasa la etiqueta `unconfined` a secas. Configuración, el
-chat y la CLI propia del asistente no tienen perfil.
+chat y la CLI propia del asistente no tienen perfil. Si Configuración
+(vasak-settings) llega a tener un perfil de AppArmor, tiene que contar como sin
+confinar para esta puerta: si no, pierde el control de la memoria y las claves.
 
 **El límite.** La puerta mira a quien hace el llamado, y nada más. El perfil
 `vasak-appimage` permite `dbus,`, `file,` y `change_profile,`: con eso, un
@@ -201,7 +206,8 @@ systemd, `$STATE_DIRECTORY`). No va en el almacén de cuentas.
 | `ClearMemory() → ()` | La borra (llave y archivos) y, si estaba encendida, la recrea vacía con una llave nueva. `Unavailable` con el llavero bloqueado, sin tocar nada. |
 
 `Capabilities` informa `memory` como disponible cuando está encendida y
-abierta.
+abierta; a un llamador confinado, siempre no disponible con «No disponible para
+aplicaciones confinadas».
 
 ## Ver los errores
 

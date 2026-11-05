@@ -125,10 +125,26 @@ impl AssistantService {
 
     /// Las capacidades sobre cada dominio. Las de datos del usuario no están
     /// en esta fase: se dicen no disponibles, nunca rotas. `memory`, según la
-    /// memoria esté encendida y abierta.
-    async fn capabilities(&self, #[zbus(header)] header: Header<'_>) -> Vec<Capability> {
+    /// memoria esté encendida y abierta; a un llamador confinado, no
+    /// disponible con un motivo fijo, sin abrir la base ni preguntar al
+    /// llavero: si no, sabría si está encendida y cómo está el llavero.
+    async fn capabilities(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> Vec<Capability> {
         let call = Call::new("Capabilities", &header);
-        let all = capabilities(self.remote_allowed, &self.memory_status_now().await);
+        let memory = if self.confined(connection, &header).await {
+            MemoryStatus {
+                enabled: false,
+                available: false,
+                reason: crate::memory::REASON_CONFINED.to_owned(),
+                bytes: 0,
+            }
+        } else {
+            self.memory_status_now().await
+        };
+        let all = capabilities(self.remote_allowed, &memory);
         call.done();
         all
     }
@@ -672,8 +688,8 @@ pub fn capabilities(remote_allowed: bool, memory: &MemoryStatus) -> Vec<Capabili
 
 pub fn to_dbus(error: BackendError) -> Error {
     match error {
-        BackendError::Busy => Error::Busy(crate::backend::METADATA_BUSY.into()),
-        BackendError::NotLocal => Error::Unavailable(crate::backend::NOT_LOCAL.into()),
+        BackendError::Busy => Error::Busy(error.text().to_owned()),
+        BackendError::NotLocal => Error::Unavailable(error.text().to_owned()),
         BackendError::Unavailable(text) | BackendError::NotAllowed(text) => {
             Error::Unavailable(text)
         }
@@ -1681,6 +1697,7 @@ mod memory_tests {
             seen: parking_lot::Mutex::default(),
             local: false,
             effective_local: None,
+            reject_local_only: parking_lot::Mutex::default(),
         });
         let remote =
             Memory::new(Some(world.tmp.memory_dir()), world.keys.clone()).with_remote_blocked(true);
@@ -2064,14 +2081,14 @@ mod gate_tests {
         gate.memory.set_enabled(true).await.unwrap();
 
         // `MemoryStatus` ya no: da `AccessDenied` a un confinado (#22).
+        // `Capabilities` sigue abierto, pero no le cuenta cómo está la memoria.
         let capabilities = gate.proxy.capabilities().await.unwrap();
-        assert!(
-            capabilities
-                .iter()
-                .find(|c| c.domain == DOMAIN_MEMORY)
-                .unwrap()
-                .available
-        );
+        let memory = capabilities
+            .iter()
+            .find(|c| c.domain == DOMAIN_MEMORY)
+            .unwrap();
+        assert!(!memory.available);
+        assert_eq!(memory.reason, crate::memory::REASON_CONFINED);
         let id = gate.proxy.new_conversation().await.unwrap();
         gate.proxy.conversations().await.unwrap();
         gate.proxy.status().await.unwrap();
@@ -2499,40 +2516,14 @@ mod effective_model_tests {
         assert_eq!(status.reason, REASON_MODEL_NOT_ALLOWED);
     }
 
-    /// Un backend que rechaza `chat_local_only` con el mismo texto que `NotLocal`
-    /// pero como `Unavailable`: no es el rechazo, no se reintenta.
-    struct FakeNotLocalText(Arc<ScriptedBackend>);
-
-    impl ModelBackend for FakeNotLocalText {
-        fn info(&self) -> vasak_assistant_protocol::ModelInfo {
-            self.0.info()
-        }
-        fn models(&self) -> BoxFuture<'_, Result<Vec<String>, BackendError>> {
-            self.0.models()
-        }
-        fn active_model(
-            &self,
-        ) -> BoxFuture<'_, Result<vasak_assistant_protocol::ModelInfo, BackendError>> {
-            self.0.active_model()
-        }
-        fn chat<'a>(
-            &'a self,
-            messages: &'a [Message],
-        ) -> BoxFuture<'a, Result<String, BackendError>> {
-            self.0.chat(messages)
-        }
-        fn chat_local_only<'a>(
-            &'a self,
-            _: &'a [Message],
-        ) -> BoxFuture<'a, Result<String, BackendError>> {
-            Box::pin(async { Err(BackendError::Unavailable(crate::backend::NOT_LOCAL.into())) })
-        }
-    }
-
+    /// Un backend que rechaza `chat_local_only` con el mismo texto que
+    /// `NotLocal` pero como `Unavailable`: no es el rechazo, no se reintenta.
     #[tokio::test]
     async fn un_unavailable_con_el_texto_de_no_local_no_reintenta_sin_notas() {
         let inner = ScriptedBackend::new(["Hola."]);
-        let rig = rig(Arc::new(FakeNotLocalText(inner.clone())), false).await;
+        *inner.reject_local_only.lock() =
+            Some(BackendError::Unavailable(crate::backend::NOT_LOCAL.into()));
+        let rig = rig(inner.clone(), false).await;
         let id = rig.service.open(OWNER).unwrap();
 
         let result = rig

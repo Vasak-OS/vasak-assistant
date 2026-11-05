@@ -314,6 +314,9 @@ fn log_request<T>(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::test_support::model_info;
+
     #[test]
     fn el_texto_de_cada_variante_es_el_que_le_toca() {
         for (error, text) in [
@@ -326,9 +329,6 @@ mod tests {
             assert_eq!(error.text(), text, "{error:?}");
         }
     }
-
-    use super::*;
-    use crate::test_support::model_info;
 
     fn rejected() -> RejectedBackend {
         RejectedBackend {
