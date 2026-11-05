@@ -1995,6 +1995,21 @@ mod gate_tests {
     }
 
     #[tokio::test]
+    async fn un_llamador_confinado_no_puede_preguntar_el_estado_de_la_memoria() {
+        for (name, label) in labels() {
+            let gate = gate(label, []).await;
+            gate.memory.set_enabled(true).await.unwrap();
+
+            denied(gate.proxy.memory_status().await);
+
+            assert!(
+                *gate.label.asked.lock() >= 1,
+                "{name}: se preguntó la etiqueta"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn un_llamador_confinado_no_guarda_ni_consulta_claves_del_proveedor() {
         for (name, label) in labels() {
             let gate = gate(label, []).await;
@@ -2016,7 +2031,7 @@ mod gate_tests {
     }
 
     #[tokio::test]
-    async fn sin_etiqueta_o_unconfined_los_cuatro_metodos_funcionan() {
+    async fn sin_etiqueta_o_unconfined_los_cinco_metodos_funcionan() {
         for (name, label) in [
             ("sin AppArmor", FixedLabel::none()),
             ("unconfined", FixedLabel::of(b"unconfined\0")),
@@ -2034,10 +2049,12 @@ mod gate_tests {
                 .has_provider_key("https://api.openai.com/v1")
                 .await
                 .unwrap());
+            let status = gate.proxy.memory_status().await.unwrap();
+            assert!(status.enabled && status.available, "{name}");
             gate.proxy.clear_memory().await.unwrap();
             gate.proxy.set_memory_enabled(false).await.unwrap();
             assert!(!gate.memory.status().await.enabled, "{name}");
-            assert!(*gate.label.asked.lock() >= 5, "se pregunta en cada pedido");
+            assert!(*gate.label.asked.lock() >= 6, "se pregunta en cada pedido");
         }
     }
 
@@ -2339,7 +2356,7 @@ mod effective_model_tests {
     // ── La carrera entre la puerta y el envío ─────────────────────────────────
 
     use crate::backend::Limited;
-    use crate::memory::REASON_MODEL_UNREACHABLE;
+    use crate::memory::{REASON_MODEL_NOT_ALLOWED, REASON_MODEL_UNREACHABLE};
     use crate::test_support::FlippingBackend;
 
     /// El modelo se resuelve local en la puerta y `:cloud` al mandar el chat.
@@ -2443,6 +2460,88 @@ mod effective_model_tests {
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0][0].role, Role::System);
         assert!(remembers(&rig, "mate amargo").await);
+    }
+
+    #[tokio::test]
+    async fn un_modelo_no_permitido_da_su_propio_motivo_y_no_el_de_que_no_responde() {
+        let mut fake = FakeBackend::replying("");
+        fake.active_result = Err(BackendError::NotAllowed("no permitido".into()));
+        let rig = rig(Arc::new(fake), false).await;
+
+        let status = rig.service.memory_status_now().await;
+
+        assert!(!status.available && status.enabled, "{status:?}");
+        assert_eq!(status.reason, REASON_MODEL_NOT_ALLOWED);
+        assert_ne!(REASON_MODEL_NOT_ALLOWED, REASON_MODEL_UNREACHABLE);
+    }
+
+    #[tokio::test]
+    async fn un_ollama_con_modelo_por_omision_cloud_sin_allow_remote_explica_el_motivo_en_el_estado(
+    ) {
+        use crate::ollama::OllamaBackend;
+        use crate::test_support::{client, local_selection, FakeServer, Reply};
+
+        let server = FakeServer::start(|pedido| match pedido.path.as_str() {
+            "/api/tags" => Reply::json(r#"{"models":[{"name":"gpt-oss:120b-cloud"}]}"#),
+            _ => Reply::status(404),
+        })
+        .await;
+        let ollama = OllamaBackend::new(
+            client(),
+            local_selection("ollama", &server.url(""), None),
+            false,
+        );
+        let rig = rig(Arc::new(Limited::new(Arc::new(ollama))), false).await;
+
+        let status = rig.service.memory_status_now().await;
+
+        assert!(!status.available && status.enabled, "{status:?}");
+        assert_eq!(status.reason, REASON_MODEL_NOT_ALLOWED);
+    }
+
+    /// Un backend que rechaza `chat_local_only` con el mismo texto que `NotLocal`
+    /// pero como `Unavailable`: no es el rechazo, no se reintenta.
+    struct FakeNotLocalText(Arc<ScriptedBackend>);
+
+    impl ModelBackend for FakeNotLocalText {
+        fn info(&self) -> vasak_assistant_protocol::ModelInfo {
+            self.0.info()
+        }
+        fn models(&self) -> BoxFuture<'_, Result<Vec<String>, BackendError>> {
+            self.0.models()
+        }
+        fn active_model(
+            &self,
+        ) -> BoxFuture<'_, Result<vasak_assistant_protocol::ModelInfo, BackendError>> {
+            self.0.active_model()
+        }
+        fn chat<'a>(
+            &'a self,
+            messages: &'a [Message],
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            self.0.chat(messages)
+        }
+        fn chat_local_only<'a>(
+            &'a self,
+            _: &'a [Message],
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            Box::pin(async { Err(BackendError::Unavailable(crate::backend::NOT_LOCAL.into())) })
+        }
+    }
+
+    #[tokio::test]
+    async fn un_unavailable_con_el_texto_de_no_local_no_reintenta_sin_notas() {
+        let inner = ScriptedBackend::new(["Hola."]);
+        let rig = rig(Arc::new(FakeNotLocalText(inner.clone())), false).await;
+        let id = rig.service.open(OWNER).unwrap();
+
+        let result = rig
+            .service
+            .chat_as(OWNER, &id, "prefiero el mate amargo, ¿qué tal?")
+            .await;
+
+        assert!(matches!(result, Err(Error::Unavailable(_))), "{result:?}");
+        assert!(inner.seen.lock().is_empty(), "no se mandó ningún pedido");
     }
 
     #[tokio::test]
@@ -4049,6 +4148,25 @@ mod owner_chat_limit_tests {
         assert!(matches!(
             to_dbus(BackendError::Failed(crate::backend::METADATA_BUSY.into())),
             Error::Backend(_)
+        ));
+    }
+
+    #[test]
+    fn to_dbus_decide_por_variante_y_no_por_el_texto() {
+        assert!(matches!(
+            to_dbus(BackendError::NotLocal),
+            Error::Unavailable(text) if text == crate::backend::NOT_LOCAL
+        ));
+        assert!(matches!(
+            to_dbus(BackendError::NotAllowed("en la nube".into())),
+            Error::Unavailable(text) if text == "en la nube"
+        ));
+        // El texto del cupo lleno en un `Unavailable` no es el cupo lleno.
+        assert!(matches!(
+            to_dbus(BackendError::Unavailable(
+                crate::backend::METADATA_BUSY.into()
+            )),
+            Error::Unavailable(_)
         ));
     }
 }

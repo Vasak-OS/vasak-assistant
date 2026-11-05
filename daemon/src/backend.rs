@@ -314,6 +314,19 @@ fn log_request<T>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn el_texto_de_cada_variante_es_el_que_le_toca() {
+        for (error, text) in [
+            (BackendError::Unavailable("a".into()), "a"),
+            (BackendError::Failed("b".into()), "b"),
+            (BackendError::NotAllowed("c".into()), "c"),
+            (BackendError::NotLocal, NOT_LOCAL),
+            (BackendError::Busy, METADATA_BUSY),
+        ] {
+            assert_eq!(error.text(), text, "{error:?}");
+        }
+    }
+
     use super::*;
     use crate::test_support::model_info;
 
