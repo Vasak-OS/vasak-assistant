@@ -58,7 +58,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use grafeo::{Config, EncryptionConfig, GrafeoDB, KeyChain};
+use grafeo::{Config, EncryptionConfig, GrafeoDB, KeyChain, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Semaphore};
 use vasak_assistant_protocol::{Error, MemoryStatus, Message, Role};
 use zeroize::Zeroizing;
@@ -88,8 +89,9 @@ pub const REASON_MODEL_UNREACHABLE: &str = "El modelo no responde";
 /// El tope de lo que ocupa la base en disco.
 pub const MAX_MEMORY_DISK_BYTES: u64 = 4 << 20;
 
-/// La versión del formato de la base, en el nodo `:LinceMeta`.
-pub const FORMAT_VERSION: i64 = 1;
+/// La versión del formato de la base, en el nodo `:LinceMeta`. La 2 trae el
+/// canario ([`canary`]); una base sin él no se abre.
+pub const FORMAT_VERSION: i64 = 2;
 
 /// El archivo de la base dentro de `memory/` (Grafeo le agrega al lado su WAL,
 /// `lince.grafeo.wal/`).
@@ -833,14 +835,54 @@ fn open_existing(path: &Path, key: &[u8; MEMORY_KEY_BYTES]) -> Result<GrafeoDB, 
         return Err(format!("{} no es una base 0.6 cifrada", path.display()));
     }
     let db = GrafeoDB::with_config(config(path, key)).map_err(db_error)?;
-    if migration_leftover(path).is_some() {
+    // El canario es lo que decide: una base cambiada por otra (y migrada por
+    // Grafeo con nuestra llave) no lo tiene, porque sin la llave no se puede
+    // calcular. Los restos de migración quedan como un chequeo más, que se
+    // esquiva borrándolos.
+    if !has_canary(&db, key) || migration_leftover(path).is_some() {
         // Sin la ruta ni el texto de Grafeo: sólo que pasó y qué se hizo.
         let _ = db.close();
-        tracing::warn!("Grafeo migró la base al abrirla: se cerró y no se usa");
-        return Err("la base cambió entre mirar la cabecera y abrirla".to_owned());
+        tracing::warn!("la base no es la que creó el servicio: se cerró y no se usa");
+        return Err("la base no es la que creó el servicio".to_owned());
     }
     schema::ensure_indexes(&db).map_err(db_error)?;
     Ok(db)
+}
+
+/// El canario de la base: `SHA-256(llave ‖ "lince-canary")` en hexadecimal.
+/// Va en `:LinceMeta`, dentro de la base cifrada.
+fn canary(key: &[u8; MEMORY_KEY_BYTES]) -> String {
+    Sha256::new()
+        .chain_update(key)
+        .chain_update(b"lince-canary")
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Si la base tiene un `:LinceMeta` con este formato y el canario de esta
+/// llave. Se compara en tiempo constante: el largo es fijo y público.
+fn has_canary(db: &GrafeoDB, key: &[u8; MEMORY_KEY_BYTES]) -> bool {
+    let expected = canary(key);
+    db.store()
+        .nodes_by_label("LinceMeta")
+        .into_iter()
+        .filter_map(|node| db.get_node(node))
+        .any(|meta| {
+            let format = meta.get_property("format").and_then(Value::as_int64);
+            let found = meta
+                .get_property("canary")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            format == Some(FORMAT_VERSION)
+                && found.len() == expected.len()
+                && found
+                    .bytes()
+                    .zip(expected.bytes())
+                    .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+                    == 0
+        })
 }
 
 /// El primer resto de una migración de Grafeo al lado de `path`, si hay.
@@ -890,8 +932,14 @@ fn create_files(dir: &Path, key: &[u8; MEMORY_KEY_BYTES]) -> Result<GrafeoDB, St
         .map_err(io_error(&tmp))?;
     let built = (|| {
         let db = GrafeoDB::with_config(config(&tmp.join(DB_FILE), key)).map_err(db_error)?;
-        db.create_node_with_props(&["LinceMeta"], [("format", FORMAT_VERSION)])
-            .map_err(db_error)?;
+        db.create_node_with_props(
+            &["LinceMeta"],
+            [
+                ("format", Value::from(FORMAT_VERSION)),
+                ("canary", Value::from(canary(key).as_str())),
+            ],
+        )
+        .map_err(db_error)?;
         schema::ensure_indexes(&db).map_err(db_error)?;
         db.close().map_err(db_error)?;
         drop(db);

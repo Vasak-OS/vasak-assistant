@@ -143,6 +143,32 @@ pub fn has_forbidden_chars(text: &str) -> bool {
         .any(|c| c.is_control() || is_format_or_private(c))
 }
 
+/// Si el texto tiene sólo lo que puede llevar una nota: letras latinas (ASCII,
+/// Latin-1 y Latin Extended-A, sin la `ı` sin punto, que se confunde con la
+/// `i`), dígitos ASCII, el espacio y la puntuación básica. Todo lo demás
+/// (griego, armenio, cirílico, IPA como `ɡ`, otras comillas y separadores) puede
+/// imitar una letra o un delimitador, y una nota en español no lo necesita.
+pub fn has_only_allowed_chars(text: &str) -> bool {
+    text.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || ".,;:¡!¿?()-/&%+*#=–—° ".contains(c)
+            || matches!(c, '\u{C0}'..='\u{17F}') && !matches!(c, '×' | '÷' | 'ı')
+    })
+}
+
+/// Lo que tiene que cumplir una nota, al escribirla y al leerla: no vacía, sólo
+/// caracteres permitidos, sin caracteres prohibidos, marcadores de inyección,
+/// palabras de credenciales, secretos ni datos de la persona.
+pub fn is_clean_note(text: &str) -> bool {
+    !text.is_empty()
+        && has_only_allowed_chars(text)
+        && !has_forbidden_chars(text)
+        && !has_injection_markers(text)
+        && !mentions_credentials(text)
+        && !contains_secret(text)
+        && !is_user_data(text)
+}
+
 fn is_format_or_private(c: char) -> bool {
     matches!(
         u32::from(c),
@@ -201,7 +227,11 @@ const INJECTION_MARKERS: &[&str] = &[
 
 /// Si el texto trae marcadores de rol o de instrucciones. Se mira en NFKC
 /// (ancho completo), con los homoglifos cirílicos llevados a su letra latina,
-/// y además con las letras sueltas juntadas (`i g n o r a` es `ignora`).
+/// y además con las letras sueltas juntadas (`i g n o r a` es `ignora`). Los
+/// marcadores que son sólo letras se buscan también en el texto sin nada que
+/// no sea letra o dígito, así `i.g.n.o.r.a` e `ign ora` cuentan; puede juntar
+/// dos palabras en un marcador («prefiere glaseado» tiene `regla`), y se
+/// acepta: perder la nota cuesta menos.
 pub fn has_injection_markers(text: &str) -> bool {
     let latin: String = normalize_terms(&nfkc(text))
         .chars()
@@ -210,9 +240,13 @@ pub fn has_injection_markers(text: &str) -> bool {
     // `user :` cuenta como `user:` (normalize_terms ya colapsó los espacios).
     let joined = join_single_letters(&latin).replace(" :", ":");
     let folded = latin.replace(" :", ":");
-    INJECTION_MARKERS
-        .iter()
-        .any(|marker| folded.contains(marker) || joined.contains(marker))
+    let compact: String = latin.chars().filter(|c| c.is_alphanumeric()).collect();
+    INJECTION_MARKERS.iter().any(|marker| {
+        folded.contains(marker)
+            || joined.contains(marker)
+            || marker.chars().all(|c| c.is_alphabetic() || c == ' ')
+                && compact.contains(&marker.replace(' ', ""))
+    })
 }
 
 /// La letra latina que se ve igual, para las cirílicas que tienen una (ya en

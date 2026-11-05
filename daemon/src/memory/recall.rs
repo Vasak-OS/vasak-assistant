@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use grafeo::{GrafeoDB, NodeId};
 use vasak_assistant_protocol::MAX_MESSAGE_BYTES;
 
-use super::filter::{has_forbidden_chars, has_injection_markers, normalize_terms};
+use super::filter::{is_clean_note, normalize_terms};
 use super::schema::{about_topic, entries, entry, Entry, MemoryKind, LABEL};
 
 /// El tope del bloque de notas.
@@ -96,16 +96,19 @@ pub fn build(db: &GrafeoDB, message: &str, first_turn: bool, now: i64) -> Option
     render(&picked)
 }
 
-/// Si la nota pasa los filtros de caracteres y de marcadores de hoy. Una base
-/// escrita por una versión anterior pudo guardar notas que hoy no entrarían.
+/// Si la nota pasa los filtros de hoy, los mismos que al escribirla (sin el
+/// recorte). Una base escrita por una versión anterior pudo guardar notas que
+/// hoy no entrarían.
 fn is_clean(found: &Entry) -> bool {
     std::iter::once(found.text.as_str())
         .chain(found.phrase.as_deref())
-        .all(|text| !has_forbidden_chars(text) && !has_injection_markers(text))
+        .all(is_clean_note)
 }
 
-/// Los `n` de mayor `key`.
+/// Los `n` limpios de mayor `key`. Las sucias se sacan antes del corte, así no
+/// ocupan el lugar de una limpia.
 fn top(mut all: Vec<Entry>, n: usize, key: impl Fn(&Entry) -> f64) -> Vec<Entry> {
+    all.retain(is_clean);
     all.sort_by(|a, b| key(b).total_cmp(&key(a)));
     all.truncate(n);
     all
@@ -638,11 +641,9 @@ mod dirty_notes_tests {
         }
     }
 
-    // Falla hoy: lo fijo se queda con las 5 de mayor puntaje y recién después
-    // se descartan las sucias, así que con 5 o más sucias de igual puntaje la
-    // nota limpia puede quedar afuera. Se quita el `ignore` al arreglarlo.
+    // Lo fijo se queda con las 5 de mayor puntaje: si las sucias se sacaran
+    // después del corte, con 5 o más de igual puntaje la limpia quedaría afuera.
     #[test]
-    #[ignore = "bug: las notas sucias ocupan el tope de 5 antes de filtrarse"]
     fn las_notas_sucias_no_sacan_a_las_limpias_del_tope_de_lo_fijo() {
         let db = db();
         for (n, dirty) in DIRTY.iter().enumerate() {

@@ -7,19 +7,28 @@ Todas las novedades de este repositorio, por paquete.
 La memoria, más dura frente a una base cambiada y a las notas con órdenes
 escondidas (#18, #19).
 
-- **`daemon`** — después de abrir la base se vuelve a mirar si Grafeo dejó
-  restos de una migración (`lince.grafeo.pre-0.6`, `.migrating`): si alguien
+- **`daemon`** — la base guarda en `:LinceMeta` un canario atado a la llave
+  (`SHA-256(llave ‖ "lince-canary")`, formato 2). Al abrir, si el canario falta
+  o no coincide (comparado en tiempo constante), la base se cierra, no se usa y
+  queda una línea en el registro, sin la ruta ni el texto de Grafeo: si alguien
   cambió el archivo por una base 0.5.x en claro entre mirar la cabecera y
-  abrirla, la base se cierra, no se usa y queda una línea en el registro, sin la
-  ruta ni el texto de Grafeo (#18). Abrir por un descriptor ya validado no se
-  puede con Grafeo 0.6.0-beta.1, que sólo abre por ruta.
+  abrirla, Grafeo la migra con nuestra llave pero no puede tener el canario. Una
+  base sin canario se rechaza y nunca se le agrega. Después de abrir se vuelven
+  a mirar además los restos de una migración (`lince.grafeo.pre-0.6`,
+  `.migrating`) (#18). Abrir por un descriptor ya validado no se puede con
+  Grafeo 0.6.0-beta.1, que sólo abre por ruta.
 - **`daemon`** — más marcadores de inyección: «olvidá lo anterior», «a partir
   de ahora», «actuá como», «disregard», «forget», «developer» y las comillas
   `'‘’‹›„`; se buscan también con las letras separadas por espacios juntadas,
-  con los homoglifos cirílicos llevados a su letra latina y en NFKC. Los
-  selectores de variación y los rellenos de Hangul cuentan como caracteres
-  prohibidos. `recall` aplica los dos filtros al leer, así las notas que guardó
-  una versión anterior y hoy no entrarían ya no llegan al modelo (#19).
+  con los homoglifos cirílicos llevados a su letra latina, en NFKC y, los que
+  son sólo letras, en el texto sin nada que no sea letra o dígito
+  (`i.g.n.o.r.a`). Los selectores de variación y los rellenos de Hangul cuentan
+  como caracteres prohibidos, y una nota sólo puede tener letras latinas (ASCII,
+  Latin-1 y Latin Extended-A, sin `ı`), dígitos, el espacio y la puntuación
+  básica. `recall` aplica al leer los mismos filtros que al escribir, antes del
+  corte a las 5 de mayor puntaje, así las notas que guardó una versión anterior
+  y hoy no entrarían ya no llegan al modelo ni le quitan el lugar a una limpia
+  (#19).
 
 ## vasak-assistant 0.3.4
 
