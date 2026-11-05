@@ -835,4 +835,62 @@ mod owner_limit_tests {
         assert_eq!(busy_count(&conversations, A), 0);
         assert_eq!(busy_count(&conversations, B), 0);
     }
+
+    #[test]
+    fn al_irse_el_duenio_con_dos_chats_colgados_se_liberan_sus_lugares_y_no_se_hereda_nada() {
+        let mut conversations = Conversations::default();
+        let old = open(&mut conversations, A, 2);
+        let other = open(&mut conversations, B, 1);
+        conversations.begin_turn(A, &old[0], "uno").unwrap();
+        conversations.begin_turn(A, &old[1], "dos").unwrap();
+        conversations.begin_turn(B, &other[0], "uno").unwrap();
+        assert_eq!(conversations.in_flight.len(), 3);
+
+        // La conexión se va con sus dos chats colgados: sólo el otro dueño queda anotado.
+        conversations.release_owner(A);
+
+        assert_eq!(conversations.in_flight.len(), 1);
+        assert!(conversations.in_flight.values().all(|owner| owner == B));
+        // Otra conexión con el mismo nombre (aunque no debería repetirse) empieza de cero.
+        let fresh = open(&mut conversations, A, 3);
+        conversations.begin_turn(A, &fresh[0], "uno").unwrap();
+        conversations.begin_turn(A, &fresh[1], "dos").unwrap();
+        assert!(matches!(
+            conversations.begin_turn(A, &fresh[2], "tres"),
+            Err(Error::Busy(_))
+        ));
+        // Los pedidos viejos terminan después (su `Drop` llama a `finish_turn`):
+        // no liberan los lugares nuevos ni rompen nada.
+        conversations.finish_turn(&old[0], "uno", None);
+        conversations.finish_turn(&old[1], "dos", Some("tarde"));
+        assert_eq!(conversations.in_flight.len(), 3);
+        assert!(matches!(
+            conversations.begin_turn(A, &fresh[2], "tres"),
+            Err(Error::Busy(_))
+        ));
+        // Y el otro dueño sigue con lo suyo.
+        conversations.finish_turn(&other[0], "uno", None);
+        assert_eq!(conversations.in_flight.len(), 2);
+    }
+
+    #[test]
+    fn el_mapa_de_chats_en_vuelo_solo_tiene_los_que_estan_en_vuelo() {
+        let mut conversations = Conversations::default();
+        let ids = open(&mut conversations, A, 2);
+        assert!(conversations.in_flight.is_empty());
+
+        conversations.begin_turn(A, &ids[0], "uno").unwrap();
+        assert!(conversations.begin_turn(A, &ids[0], "otra vez").is_err());
+        assert_eq!(conversations.in_flight.len(), 1);
+        conversations.delete(A, &ids[0]).unwrap();
+        // Borrada, el pedido sigue ocupando el backend: sigue anotado.
+        assert_eq!(conversations.in_flight.len(), 1);
+        conversations.finish_turn(&ids[0], "uno", Some("respuesta"));
+
+        assert!(conversations.in_flight.is_empty());
+        // Terminar un turno que ya no existe o nunca empezó no rompe nada.
+        conversations.finish_turn("no-existe", "x", None);
+        conversations.finish_turn(&ids[1], "x", None);
+        assert!(conversations.in_flight.is_empty());
+    }
 }

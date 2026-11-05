@@ -3969,4 +3969,84 @@ mod owner_chat_limit_tests {
             quickly(task).await.unwrap().unwrap();
         }
     }
+
+    #[tokio::test]
+    async fn borrar_las_conversaciones_con_chats_en_vuelo_no_deja_esquivar_el_tope_por_el_servicio()
+    {
+        let (fake, gate) = FakeBackend::gated("hola");
+        let backend = Arc::new(fake);
+        let service = service(Arc::new(Limited::new(backend.clone())));
+        let ids: Vec<_> = (0..4).map(|_| service.open(A).unwrap()).collect();
+        let first = start_chat(&service, A, &ids[0]);
+        quickly(backend.entered.notified()).await;
+        let second = start_chat(&service, A, &ids[1]);
+        quickly(backend.entered.notified()).await;
+
+        // El cliente borra las dos conversaciones que esperan y prueba con otras.
+        service.delete_conversation_as(A, &ids[0]).await.unwrap();
+        service.delete_conversation_as(A, &ids[1]).await.unwrap();
+        let third = quickly(service.chat_as(A, &ids[2], "tres")).await;
+
+        assert!(matches!(third, Err(Error::Busy(_))), "{third:?}");
+        assert_eq!(backend.seen.lock().len(), 2);
+        // Al terminar los pedidos (aunque sus conversaciones ya no estén), vuelve el lugar.
+        for _ in 0..2 {
+            gate.notify_one();
+        }
+        quickly(first).await.unwrap().unwrap();
+        quickly(second).await.unwrap().unwrap();
+        let again = start_chat(&service, A, &ids[3]);
+        quickly(backend.entered.notified()).await;
+        gate.notify_one();
+        quickly(again).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn al_irse_el_duenio_con_chats_colgados_sus_lugares_se_liberan_y_los_pedidos_viejos_no_rompen(
+    ) {
+        let (fake, gate) = FakeBackend::gated("hola");
+        let backend = Arc::new(fake);
+        let service = service(Arc::new(Limited::new(backend.clone())));
+        let old: Vec<_> = (0..2).map(|_| service.open(A).unwrap()).collect();
+        let first = start_chat(&service, A, &old[0]);
+        quickly(backend.entered.notified()).await;
+        let second = start_chat(&service, A, &old[1]);
+        quickly(backend.entered.notified()).await;
+
+        let released = service.conversations.lock().release_owner(A);
+        assert_eq!(released, 2);
+        // Un dueño con el mismo nombre arranca limpio: sus dos chats entran.
+        let fresh: Vec<_> = (0..3).map(|_| service.open(A).unwrap()).collect();
+        let f1 = start_chat(&service, A, &fresh[0]);
+        quickly(backend.entered.notified()).await;
+        let f2 = start_chat(&service, A, &fresh[1]);
+        quickly(backend.entered.notified()).await;
+        let third = quickly(service.chat_as(A, &fresh[2], "tres")).await;
+        assert!(matches!(third, Err(Error::Busy(_))), "{third:?}");
+
+        for _ in 0..4 {
+            gate.notify_one();
+        }
+        // Los pedidos de la conexión que se fue terminan sin romper nada.
+        for task in [first, second, f1, f2] {
+            let _ = quickly(task).await.unwrap();
+        }
+    }
+
+    #[test]
+    fn el_cupo_de_modelos_lleno_llega_como_busy_y_cualquier_otro_unavailable_sigue_siendo_unavailable(
+    ) {
+        assert!(matches!(
+            to_dbus(crate::backend::metadata_busy()),
+            Error::Busy(text) if text == crate::backend::METADATA_BUSY
+        ));
+        assert!(matches!(
+            to_dbus(BackendError::Unavailable("apagado".into())),
+            Error::Unavailable(text) if text == "apagado"
+        ));
+        assert!(matches!(
+            to_dbus(BackendError::Failed(crate::backend::METADATA_BUSY.into())),
+            Error::Backend(_)
+        ));
+    }
 }
