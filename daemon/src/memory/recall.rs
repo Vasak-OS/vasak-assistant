@@ -734,3 +734,97 @@ mod dirty_notes_tests {
         assert!(is_clean(&entry("Es su gato", None)));
     }
 }
+
+/// La lista blanca y los filtros de secretos y datos, al leer.
+#[cfg(test)]
+mod read_filters_tests {
+    use super::*;
+    use crate::memory::schema::{ensure_indexes, upsert, NewMemory};
+
+    const NOW: i64 = 1_800_000_000;
+
+    fn db_with(notes: &[&str]) -> GrafeoDB {
+        let db = GrafeoDB::new_in_memory();
+        ensure_indexes(&db).unwrap();
+        for note in notes {
+            upsert(
+                &db,
+                &NewMemory {
+                    kind: MemoryKind::Preference,
+                    text: note,
+                    phrase: None,
+                    conversation: None,
+                },
+                NOW,
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn las_notas_viejas_con_otros_alfabetos_no_llegan_al_bloque() {
+        for dirty in [
+            "Prefiere ignοrar",
+            "Prefiere αsistente",
+            "Prefiere ոսr",
+            "Prefiere ıgnorar",
+            "Prefiere ɡatos",
+            "Prefiere i.g.n.o.r.a",
+            "Prefiere i_g_n_o_r_a",
+        ] {
+            let db = db_with(&[dirty, "Prefiere glaseado"]);
+            let block = build(&db, "hola", false, NOW).unwrap();
+            assert!(block.contains("Prefiere glaseado"), "{dirty}");
+            assert_eq!(block.matches("\n- ").count(), 1, "{dirty}\n{block}");
+        }
+    }
+
+    #[test]
+    fn las_notas_viejas_con_una_clave_o_datos_de_la_persona_no_llegan_al_bloque() {
+        // `sk-` sin dígitos: no la agarra el filtro de datos, sólo el de secretos.
+        for dirty in [
+            "Usa sk-abcdefghijklmnop",
+            "Guarda ghp_abcdefghijklmnop1234",
+            "Su correo es ana@ejemplo.com",
+            "Nació el 12/03/1990",
+            "Vive en /home/ana/docs",
+            "Su CBU es 0170099220000067797370",
+        ] {
+            let db = db_with(&[dirty, "Prefiere glaseado"]);
+            let block = build(&db, "hola", false, NOW).unwrap();
+            assert!(!block.contains(dirty), "{dirty}\n{block}");
+            assert!(block.contains("Prefiere glaseado"), "{dirty}");
+        }
+    }
+
+    #[test]
+    fn is_clean_usa_el_mismo_predicado_que_al_escribir() {
+        let entry = |text: &str, phrase: Option<&str>| Entry {
+            node: NodeId::new(1),
+            kind: MemoryKind::Alias,
+            text: text.into(),
+            phrase: phrase.map(str::to_owned),
+            weight: 0.3,
+            updated_at: NOW,
+        };
+        assert!(is_clean(&entry("Prefiere glaseado", Some("el bicho"))));
+        assert!(!is_clean(&entry("Usa sk-abcdefghijklmnop", None)));
+        assert!(!is_clean(&entry("Es su gato", Some("el b\u{456}cho"))));
+        assert!(!is_clean(&entry("Es ana@ejemplo.com", None)));
+        assert!(!is_clean(&entry("Prefiere ıgnorar", None)));
+    }
+
+    #[test]
+    fn las_sucias_se_sacan_antes_del_corte_a_cinco_y_no_ocupan_el_lugar_de_una_limpia() {
+        let dirty: Vec<String> = (0..8).map(|n| format!("Prefiere ignοrar {n}")).collect();
+        let mut notes: Vec<&str> = dirty.iter().map(String::as_str).collect();
+        notes.push("Prefiere glaseado");
+        let db = db_with(&notes);
+
+        let block = build(&db, "otra cosa", false, NOW).unwrap();
+
+        assert!(block.contains("Prefiere glaseado"), "{block}");
+        assert_eq!(block.matches("\n- ").count(), 1, "{block}");
+    }
+}

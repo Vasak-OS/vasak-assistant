@@ -3204,3 +3204,226 @@ mod log_tests {
             .any(|l| l.contains(" WARN ") && l.contains("la memoria no se puede abrir")));
     }
 }
+
+/// El canario atado a la llave: una base que no creó el servicio no se abre.
+#[cfg(test)]
+mod canary_tests {
+    use super::*;
+    use crate::test_support::{capture_logs, FixedKey, LogCapture, TempDir};
+
+    const KEY: [u8; MEMORY_KEY_BYTES] = [7u8; MEMORY_KEY_BYTES];
+    const OTHER_KEY: [u8; MEMORY_KEY_BYTES] = [9u8; MEMORY_KEY_BYTES];
+
+    /// Una base cifrada con `key` y un `:LinceMeta` a medida, armada a mano
+    /// como lo haría quien no tiene la llave del servicio (o Grafeo al migrar).
+    fn build(tmp: &TempDir, key: &[u8; MEMORY_KEY_BYTES], meta: Option<(i64, Option<String>)>) {
+        let dir = tmp.memory_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = GrafeoDB::with_config(config(&dir.join(DB_FILE), key)).unwrap();
+        if let Some((format, canary)) = meta {
+            let mut props = vec![("format", Value::from(format))];
+            if let Some(canary) = canary {
+                props.push(("canary", Value::from(canary.as_str())));
+            }
+            db.create_node_with_props(&["LinceMeta"], props).unwrap();
+        }
+        db.create_node_with_props(&["Memory", "Preference"], [("text", "del atacante")])
+            .unwrap();
+        schema::ensure_indexes(&db).unwrap();
+        db.close().unwrap();
+    }
+
+    fn memory_with(tmp: &TempDir, key: &[u8; MEMORY_KEY_BYTES]) -> Memory {
+        std::fs::write(tmp.path().join("enabled"), b"").unwrap();
+        let keys = FixedKey::new(None);
+        *keys.memory_key.lock() = Some(key.to_vec());
+        Memory::new(Some(tmp.memory_dir()), keys)
+    }
+
+    /// Cuántos nodos tiene la base de verdad, abriéndola directo con `key`. Abrir y
+    /// cerrar una base reescribe bytes del archivo (Grafeo), así que se comparan
+    /// los datos y no los bytes.
+    fn db_bytes(tmp: &TempDir) -> usize {
+        db_nodes(tmp, &KEY)
+            .or_else(|| db_nodes(tmp, &OTHER_KEY))
+            .unwrap()
+    }
+
+    fn db_nodes(tmp: &TempDir, key: &[u8; MEMORY_KEY_BYTES]) -> Option<usize> {
+        let db = GrafeoDB::with_config(config(&tmp.memory_dir().join(DB_FILE), key)).ok()?;
+        let count = db.store().node_count();
+        let _ = db.close();
+        Some(count)
+    }
+
+    fn assert_rejected(tmp: &TempDir, log: &LogCapture, name: &str) {
+        let path = tmp.path().display().to_string();
+        let text = log.text();
+        assert!(
+            !text.contains(&path),
+            "{name}: la ruta en el registro\n{text}"
+        );
+    }
+
+    #[test]
+    fn el_canario_es_el_sha256_de_la_llave_y_la_marca_y_cambia_con_la_llave() {
+        let expected: String = Sha256::digest([&KEY[..], b"lince-canary"].concat())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(canary(&KEY), expected);
+        assert_eq!(canary(&KEY).len(), 64);
+        assert_ne!(canary(&KEY), canary(&OTHER_KEY));
+        assert_eq!(FORMAT_VERSION, 2);
+    }
+
+    #[tokio::test]
+    async fn la_base_con_el_canario_de_la_llave_y_el_formato_2_abre() {
+        let tmp = TempDir::new();
+        build(&tmp, &KEY, Some((2, Some(canary(&KEY)))));
+
+        let status = memory_with(&tmp, &KEY).status().await;
+
+        assert!(status.enabled && status.available, "{status:?}");
+    }
+
+    #[tokio::test]
+    async fn una_base_cifrada_con_la_llave_correcta_pero_sin_canario_se_rechaza() {
+        for (name, meta) in [
+            ("sin :LinceMeta", None),
+            ("meta sin canario", Some((2, None))),
+        ] {
+            let tmp = TempDir::new();
+            build(&tmp, &KEY, meta);
+            let before = db_bytes(&tmp);
+            let memory = memory_with(&tmp, &KEY);
+            let (log, _guard) = capture_logs();
+
+            let status = memory.status().await;
+
+            assert!(status.enabled && !status.available, "{name}: {status:?}");
+            assert_eq!(status.reason, REASON_NOT_OPENED, "{name}");
+            assert_eq!(db_bytes(&tmp), before, "{name}: no se agrega nada");
+            assert!(
+                log.text().contains("la base no es la que creó el servicio"),
+                "{name}\n{}",
+                log.text()
+            );
+            assert!(log.text().contains("WARN"), "{name}");
+            assert_rejected(&tmp, &log, name);
+            // Y no quedó abierta para nadie.
+            assert!(memory.database().await.is_err(), "{name}");
+            assert_eq!(memory.recall("atacante", true).await, None, "{name}");
+            assert!(
+                memory.store(Extraction::default(), "c").await.is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn un_canario_que_no_coincide_se_rechaza() {
+        for (name, canary_text) in [
+            ("de otra llave", canary(&OTHER_KEY)),
+            ("vacío", String::new()),
+            ("corto", canary(&KEY)[..63].to_owned()),
+            ("largo", format!("{}0", canary(&KEY))),
+            ("un carácter distinto", {
+                let mut c = canary(&KEY).into_bytes();
+                c[10] = if c[10] == b'a' { b'b' } else { b'a' };
+                String::from_utf8(c).unwrap()
+            }),
+            ("en mayúsculas", canary(&KEY).to_uppercase()),
+        ] {
+            let tmp = TempDir::new();
+            build(&tmp, &KEY, Some((2, Some(canary_text))));
+            let before = db_bytes(&tmp);
+            let memory = memory_with(&tmp, &KEY);
+            let (log, _guard) = capture_logs();
+
+            let status = memory.status().await;
+
+            assert!(!status.available, "{name}");
+            assert_eq!(status.reason, REASON_NOT_OPENED, "{name}");
+            assert_eq!(db_bytes(&tmp), before, "{name}");
+            assert_rejected(&tmp, &log, name);
+        }
+    }
+
+    #[tokio::test]
+    async fn una_base_con_formato_1_o_distinto_de_2_se_rechaza_aunque_el_canario_sea_el_correcto() {
+        for format in [1, 0, 3, -1] {
+            let tmp = TempDir::new();
+            build(&tmp, &KEY, Some((format, Some(canary(&KEY)))));
+
+            let status = memory_with(&tmp, &KEY).status().await;
+
+            assert!(!status.available, "formato {format}");
+            assert_eq!(status.reason, REASON_NOT_OPENED, "formato {format}");
+        }
+    }
+
+    #[tokio::test]
+    async fn una_base_armada_sin_la_llave_de_la_persona_se_rechaza_sin_restos_de_migracion() {
+        // El ataque: otra base, con su propia llave y su propio canario, en el lugar de la
+        // verdadera, sin ningún `.pre-0.6` ni `.migrating` al lado.
+        let tmp = TempDir::new();
+        build(&tmp, &OTHER_KEY, Some((2, Some(canary(&OTHER_KEY)))));
+        assert!(!tmp.memory_dir().join("lince.grafeo.pre-0.6").exists());
+        assert!(!tmp.memory_dir().join("lince.grafeo.migrating").exists());
+        let before = db_bytes(&tmp);
+        let memory = memory_with(&tmp, &KEY);
+        let (log, _guard) = capture_logs();
+
+        let status = memory.status().await;
+
+        assert!(status.enabled && !status.available);
+        assert_eq!(status.reason, REASON_NOT_OPENED);
+        assert_eq!(db_bytes(&tmp), before);
+        assert_eq!(memory.recall("atacante", true).await, None);
+        assert_rejected(&tmp, &log, "otra llave");
+    }
+
+    #[tokio::test]
+    async fn el_canario_decide_aunque_los_restos_de_migracion_se_hayan_borrado() {
+        // Lo que esquiva el chequeo de restos (borrarlos a tiempo): una base migrada
+        // por Grafeo con nuestra llave no tiene canario.
+        let tmp = TempDir::new();
+        build(&tmp, &KEY, None);
+        // Nunca hubo ni hay restos.
+        assert!(migration_leftover(&tmp.memory_dir().join(DB_FILE)).is_none());
+
+        let status = memory_with(&tmp, &KEY).status().await;
+
+        assert!(!status.available);
+    }
+
+    #[tokio::test]
+    async fn crear_la_memoria_deja_el_formato_2_y_el_canario_de_su_llave_y_reabre() {
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        let memory = Memory::new(Some(tmp.memory_dir()), keys.clone());
+        memory.set_enabled(true).await.unwrap();
+        memory.close().await;
+        let key: [u8; MEMORY_KEY_BYTES] =
+            keys.memory_key.lock().clone().unwrap().try_into().unwrap();
+
+        let db = GrafeoDB::with_config(config(&tmp.memory_dir().join(DB_FILE), &key)).unwrap();
+        assert!(has_canary(&db, &key));
+        assert!(!has_canary(&db, &OTHER_KEY));
+        db.close().unwrap();
+        drop(db);
+        let status = Memory::new(Some(tmp.memory_dir()), keys).status().await;
+        assert!(status.available, "{status:?}");
+    }
+
+    #[test]
+    fn una_base_vacia_no_tiene_canario() {
+        let db = GrafeoDB::new_in_memory();
+        assert!(!has_canary(&db, &KEY));
+        db.create_node_with_props(&["Otra"], [("canary", Value::from(canary(&KEY).as_str()))])
+            .unwrap();
+        // El canario tiene que estar en `:LinceMeta`.
+        assert!(!has_canary(&db, &KEY));
+    }
+}

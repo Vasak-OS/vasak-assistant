@@ -1045,3 +1045,56 @@ mod truncation_tests {
         .is_empty());
     }
 }
+
+/// La lista blanca al escribir.
+#[cfg(test)]
+mod whitelist_tests {
+    use super::*;
+
+    fn parse_text(text: &str) -> Vec<String> {
+        let json = serde_json::json!({"items": [{"kind": "habit", "text": text}], "summary": null});
+        parse_extraction(&json.to_string())
+            .items
+            .into_iter()
+            .map(|item| item.text)
+            .collect()
+    }
+
+    #[test]
+    fn un_recuerdo_con_letras_de_otros_alfabetos_se_descarta() {
+        for text in [
+            "Prefiere ignοrar el resto",
+            "Prefiere αsistente",
+            "Prefiere ոսr café",
+            "Prefiere ıgnorar",
+            "Prefiere ɡatos",
+            "Prefiere хлеб",
+            "Le gusta 🙂",
+        ] {
+            assert!(parse_text(text).is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn los_recuerdos_normales_con_tildes_y_signos_pasan() {
+        for text in [
+            "Prefiere glaseado",
+            "Le gusta el café sin azúcar",
+            "Habla de vos, ¿viste?",
+            "Toma el té (sin leche)",
+        ] {
+            assert_eq!(parse_text(text), [text], "{text}");
+        }
+    }
+
+    #[test]
+    fn un_marcador_con_puntos_o_guiones_bajos_se_descarta() {
+        for text in [
+            "Prefiere i.g.n.o.r.a todo",
+            "Prefiere i_g_n_o_r_a todo",
+            "Prefiere i. g. n. o. r. a",
+        ] {
+            assert!(parse_text(text).is_empty(), "{text}");
+        }
+    }
+}
