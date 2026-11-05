@@ -834,6 +834,17 @@ mod owner_limit_tests {
 
         assert_eq!(busy_count(&conversations, A), 0);
         assert_eq!(busy_count(&conversations, B), 0);
+        // Ni el mapa de chats en vuelo anotó nada...
+        assert!(conversations.in_flight.is_empty());
+        // ...y el dueño conserva sus dos lugares enteros.
+        conversations.begin_turn(A, &ids[0], "uno").unwrap();
+        conversations.begin_turn(A, &ids[1], "dos").unwrap();
+        let third = conversations.create(A).unwrap();
+        assert!(matches!(
+            conversations.begin_turn(A, &third, "tres"),
+            Err(Error::Busy(_))
+        ));
+        assert_eq!(conversations.in_flight.len(), 2);
     }
 
     #[test]
