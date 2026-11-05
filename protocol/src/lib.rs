@@ -256,6 +256,7 @@ pub trait Assistant {
     fn capabilities(&self) -> Result<Vec<Capability>, Error>;
 
     /// Los modelos instalados en el backend. `Unavailable` si no responde.
+    /// `Busy` si hay demasiados pedidos de la lista a la vez; es pasajero.
     fn models(&self) -> Result<Vec<String>, Error>;
 
     /// Abre una conversación nueva, de quien llama, y devuelve su id.
