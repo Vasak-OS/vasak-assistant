@@ -982,6 +982,8 @@ mod metadata_tests {
     #[tokio::test]
     async fn los_modelos_no_gastan_lugares_de_chat_ni_los_chats_los_de_modelos() {
         let limited = Limited::new(Arc::new(FakeBackend::replying("hola")));
+        // Los topes del contrato: 4 chats y 2 consultas de modelos a la vez.
+        assert_eq!((MAX_IN_FLIGHT, MAX_METADATA_IN_FLIGHT), (4, 2));
 
         limited.models().await.unwrap();
         limited.active_model().await.unwrap();
