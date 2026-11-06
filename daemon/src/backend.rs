@@ -29,6 +29,27 @@ pub enum BackendError {
     /// Respondió, pero algo que no sirve: un estado HTTP de error, un cuerpo
     /// ilegible o demasiado grande, o tardó más de la cuenta.
     Failed(String),
+    /// El modelo responde, pero la configuración no deja usarlo: el modelo por
+    /// omisión de Ollama corre en la nube y no hay `allow_remote`. El texto es
+    /// para la persona.
+    NotAllowed(String),
+    /// El rechazo de [`ModelBackend::chat_local_only`]: el modelo que
+    /// respondería no es local, y no se mandó nada. El texto es [`NOT_LOCAL`].
+    NotLocal,
+    /// El cupo de `models` está lleno. El servicio lo devuelve como `Busy`
+    /// ([`crate::service::to_dbus`]); el texto es [`METADATA_BUSY`].
+    Busy,
+}
+
+impl BackendError {
+    /// El texto para la persona.
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Unavailable(text) | Self::Failed(text) | Self::NotAllowed(text) => text,
+            Self::NotLocal => NOT_LOCAL,
+            Self::Busy => METADATA_BUSY,
+        }
+    }
 }
 
 pub trait ModelBackend: Send + Sync {
@@ -51,7 +72,7 @@ pub trait ModelBackend: Send + Sync {
     /// decide la misma resolución que manda el pedido, así nada que haya
     /// pasado la puerta de la memoria sale por un cambio de modelo en el
     /// medio. Si no es local, o no se pudo saber, contesta
-    /// `Unavailable(NOT_LOCAL)` sin mandar nada. Por omisión decide
+    /// [`BackendError::NotLocal`] sin mandar nada. Por omisión decide
     /// [`Self::info`], que vale para un backend cuya dirección y modelo son
     /// fijos (el de OpenAI); el de Ollama lo resuelve por pedido.
     fn chat_local_only<'a>(
@@ -60,7 +81,7 @@ pub trait ModelBackend: Send + Sync {
     ) -> BoxFuture<'a, Result<String, BackendError>> {
         Box::pin(async move {
             if !self.info().local {
-                return Err(not_local());
+                return Err(BackendError::NotLocal);
             }
             self.chat(messages).await
         })
@@ -71,14 +92,9 @@ pub trait ModelBackend: Send + Sync {
 pub const NOT_LOCAL: &str =
     "El modelo que respondería no es local: lo que viene de la memoria no se le manda.";
 
-pub fn not_local() -> BackendError {
-    BackendError::Unavailable(NOT_LOCAL.into())
-}
-
-/// Si el error es el rechazo de [`ModelBackend::chat_local_only`].
-pub fn is_not_local(error: &BackendError) -> bool {
-    matches!(error, BackendError::Unavailable(text) if text == NOT_LOCAL)
-}
+/// El motivo de `models` cuando el cupo de modelos está lleno.
+pub const METADATA_BUSY: &str =
+    "Hay demasiados pedidos de la lista de modelos a la vez: volvé a intentarlo en un momento.";
 
 /// El backend que queda cuando la configuración no se puede usar (un remoto sin
 /// permiso, una dirección inválida…): responde siempre «no disponible» con el
@@ -122,11 +138,18 @@ pub const MAX_IN_FLIGHT: usize = 4;
 /// necesita enterarse de cada vez.
 pub const ACTIVE_MODEL_TTL: Duration = Duration::from_secs(5);
 
+/// Cuántos `models` y `active_model` puede haber en vuelo a la vez. Van con su
+/// propio cupo, aparte del de los chats: un `Status` o un `Models` no espera
+/// detrás de chats de hasta 300 s (#3).
+pub const MAX_METADATA_IN_FLIGHT: usize = 2;
+
 /// Envuelve un backend con un tope de pedidos simultáneos y una caché corta del
 /// modelo activo.
 pub struct Limited {
     inner: Arc<dyn ModelBackend>,
     permits: Semaphore,
+    /// El cupo de `models` y `active_model`, aparte del de los chats.
+    metadata_permits: Semaphore,
     active: parking_lot::Mutex<Option<(Instant, Result<ModelInfo, BackendError>)>>,
 }
 
@@ -135,16 +158,17 @@ impl Limited {
         Self {
             inner,
             permits: Semaphore::new(MAX_IN_FLIGHT),
+            metadata_permits: Semaphore::new(MAX_METADATA_IN_FLIGHT),
             active: parking_lot::Mutex::new(None),
         }
     }
 
     async fn permit(&self) -> Result<SemaphorePermit<'_>, BackendError> {
-        // El semáforo sólo se cierra a mano, y acá nadie lo cierra.
-        self.permits
-            .acquire()
-            .await
-            .map_err(|_| BackendError::Failed("el servicio se está cerrando".into()))
+        acquire(&self.permits).await
+    }
+
+    async fn metadata_permit(&self) -> Result<SemaphorePermit<'_>, BackendError> {
+        acquire(&self.metadata_permits).await
     }
 }
 
@@ -155,7 +179,12 @@ impl ModelBackend for Limited {
 
     fn models(&self) -> BoxFuture<'_, Result<Vec<String>, BackendError>> {
         Box::pin(async move {
-            let _permit = self.permit().await?;
+            // Sin fila: si el cupo de modelos está lleno, `Busy` en el acto.
+            // Esperar dejaría que un cliente que inunda `Models` haga esperar
+            // a todos los demás (#3).
+            let Ok(_permit) = self.metadata_permits.try_acquire() else {
+                return Err(BackendError::Busy);
+            };
             let started = Instant::now();
             let result = self.inner.models().await;
             log_request(&self.inner, "models", started, &result);
@@ -170,8 +199,27 @@ impl ModelBackend for Limited {
                     return cached.clone();
                 }
             }
+            // Sin lugar libre, lo último que se supo aunque esté vencido: el
+            // estado no tiene que esperar. Sin nada guardado, se espera el
+            // turno, en el cupo propio, que no compite con los chats.
+            let permit = match self.metadata_permits.try_acquire() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    if let Some((_, cached)) = &*self.active.lock() {
+                        return cached.clone();
+                    }
+                    self.metadata_permit().await?
+                }
+            };
+            // Mientras se esperaba el lugar, otro llamador pudo haber guardado
+            // la respuesta: no se repite el pedido al backend.
+            if let Some((at, cached)) = &*self.active.lock() {
+                if at.elapsed() < ACTIVE_MODEL_TTL {
+                    return cached.clone();
+                }
+            }
             let result = {
-                let _permit = self.permit().await?;
+                let _permit = permit;
                 let started = Instant::now();
                 let result = self.inner.active_model().await;
                 log_request(&self.inner, "active_model", started, &result);
@@ -206,6 +254,14 @@ impl ModelBackend for Limited {
     }
 }
 
+async fn acquire(semaphore: &Semaphore) -> Result<SemaphorePermit<'_>, BackendError> {
+    // Los semáforos sólo se cierran a mano, y acá nadie los cierra.
+    semaphore
+        .acquire()
+        .await
+        .map_err(|_| BackendError::Failed("el servicio se está cerrando".into()))
+}
+
 /// Una línea por pedido a un backend: el proveedor, la operación y cuánto
 /// tardó (`debug`), y el motivo si falló (`warn`; el rechazo de
 /// `chat_local_only` es esperable y va en `debug`). Nunca los mensajes ni la
@@ -226,13 +282,13 @@ fn log_request<T>(
             ms,
             "pedido al modelo"
         ),
-        Err(error) if is_not_local(error) => tracing::debug!(
+        Err(BackendError::NotLocal) => tracing::debug!(
             backend = provider.as_str(),
             operation,
             ms,
             "el modelo no es local: no se mandó"
         ),
-        Err(BackendError::Unavailable(text)) => tracing::warn!(
+        Err(BackendError::Unavailable(text) | BackendError::NotAllowed(text)) => tracing::warn!(
             backend = provider.as_str(),
             operation,
             ms,
@@ -246,6 +302,13 @@ fn log_request<T>(
             error = "Failed",
             "el pedido al modelo falló: {text}"
         ),
+        Err(BackendError::Busy) => tracing::warn!(
+            backend = provider.as_str(),
+            operation,
+            ms,
+            error = "Busy",
+            "{METADATA_BUSY}"
+        ),
     }
 }
 
@@ -253,6 +316,19 @@ fn log_request<T>(
 mod tests {
     use super::*;
     use crate::test_support::model_info;
+
+    #[test]
+    fn el_texto_de_cada_variante_es_el_que_le_toca() {
+        for (error, text) in [
+            (BackendError::Unavailable("a".into()), "a"),
+            (BackendError::Failed("b".into()), "b"),
+            (BackendError::NotAllowed("c".into()), "c"),
+            (BackendError::NotLocal, NOT_LOCAL),
+            (BackendError::Busy, METADATA_BUSY),
+        ] {
+            assert_eq!(error.text(), text, "{error:?}");
+        }
+    }
 
     fn rejected() -> RejectedBackend {
         RejectedBackend {
@@ -414,23 +490,15 @@ mod tests {
             reason: "se mandó".into(),
         };
         let error = remote.chat_local_only(&hello()).await.unwrap_err();
-        assert!(is_not_local(&error), "{error:?}");
-        assert_eq!(error, not_local());
+        assert_eq!(error, BackendError::NotLocal);
 
         // Local: pasa a `chat` (acá, el error propio del backend rechazado).
         let error = rejected().chat_local_only(&hello()).await.unwrap_err();
-        assert!(!is_not_local(&error), "{error:?}");
+        assert!(!matches!(error, BackendError::NotLocal), "{error:?}");
         assert_eq!(
             error,
             BackendError::Unavailable("No se puede usar esta configuración.".into())
         );
-    }
-
-    #[test]
-    fn solo_el_rechazo_de_chat_local_only_cuenta_como_no_local() {
-        assert!(is_not_local(&not_local()));
-        assert!(!is_not_local(&BackendError::Failed(NOT_LOCAL.into())));
-        assert!(!is_not_local(&BackendError::Unavailable("otro".into())));
     }
 
     #[tokio::test]
@@ -441,7 +509,7 @@ mod tests {
         // Aunque el modelo activo quede en caché, chat_local_only vuelve a resolver.
         limited.active_model().await.unwrap();
         let error = limited.chat_local_only(&hello()).await.unwrap_err();
-        assert!(is_not_local(&error), "{error:?}");
+        assert!(matches!(error, BackendError::NotLocal), "{error:?}");
         assert!(cloud.seen.lock().is_empty(), "no se mandó nada");
 
         let local = ScriptedBackend::new(["ok"]);
@@ -618,7 +686,7 @@ mod log_tests {
 
         let error = backend.chat_local_only(&user("hola")).await.unwrap_err();
 
-        assert!(is_not_local(&error));
+        assert!(matches!(error, BackendError::NotLocal));
         let l = line(
             &log,
             &[
@@ -748,5 +816,423 @@ mod log_tests {
         for part in ["cuentacanaria", "tokencanario", "/v1/"] {
             assert!(!log.text().contains(part), "{part}: {}", log.text());
         }
+    }
+}
+
+/// El cupo de `models` y `active_model`, aparte del de los chats (#3).
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use crate::test_support::{model_info, FakeBackend};
+    use std::time::Duration;
+    use vasak_assistant_protocol::Role;
+
+    fn hello() -> Vec<Message> {
+        vec![Message {
+            role: Role::User,
+            content: "hola".into(),
+        }]
+    }
+
+    /// Una prueba que se cuelga falla a los 5 s en vez de bloquear el CI.
+    async fn quickly<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), future)
+            .await
+            .expect("la llamada se colgó")
+    }
+
+    /// Ocupa los `MAX_IN_FLIGHT` lugares de los chats con pedidos que esperan la
+    /// compuerta. Devuelve las tareas y la compuerta.
+    async fn fill_chats(
+        limited: &Arc<Limited>,
+        backend: &Arc<FakeBackend>,
+        gate: &Arc<tokio::sync::Notify>,
+    ) -> Vec<tokio::task::JoinHandle<Result<String, BackendError>>> {
+        let _ = gate;
+        let mut tasks = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT {
+            let limited = limited.clone();
+            tasks.push(tokio::spawn(async move { limited.chat(&hello()).await }));
+            quickly(backend.entered.notified()).await;
+        }
+        assert_eq!(limited.permits.available_permits(), 0);
+        tasks
+    }
+
+    #[tokio::test]
+    async fn con_los_cuatro_lugares_de_chat_ocupados_models_y_active_model_responden() {
+        let (fake, gate) = FakeBackend::gated("hola");
+        let backend = Arc::new(fake);
+        let limited = Arc::new(Limited::new(backend.clone()));
+        let tasks = fill_chats(&limited, &backend, &gate).await;
+
+        let models = quickly(limited.models()).await.unwrap();
+        let active = quickly(limited.active_model()).await.unwrap();
+
+        assert_eq!(models, ["modelo-de-prueba"]);
+        assert_eq!(active, model_info("modelo-de-prueba"));
+        // Los chats siguen esperando: nada se liberó para contestar.
+        assert_eq!(limited.permits.available_permits(), 0);
+        for _ in 0..MAX_IN_FLIGHT {
+            gate.notify_one();
+        }
+        for task in tasks {
+            assert_eq!(quickly(task).await.unwrap().unwrap(), "hola");
+        }
+    }
+
+    #[tokio::test]
+    async fn un_chat_nuevo_con_el_cupo_lleno_espera_pero_los_modelos_no() {
+        let (fake, gate) = FakeBackend::gated("hola");
+        let backend = Arc::new(fake);
+        let limited = Arc::new(Limited::new(backend.clone()));
+        let tasks = fill_chats(&limited, &backend, &gate).await;
+        let waiting = {
+            let limited = limited.clone();
+            tokio::spawn(async move { limited.chat(&hello()).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(!waiting.is_finished());
+        quickly(limited.models()).await.unwrap();
+        quickly(limited.active_model()).await.unwrap();
+
+        for _ in 0..(MAX_IN_FLIGHT + 1) {
+            gate.notify_one();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        quickly(waiting).await.unwrap().unwrap();
+        for task in tasks {
+            quickly(task).await.unwrap().unwrap();
+        }
+    }
+
+    /// Una caché vencida: lo último que se supo, de hace más del TTL.
+    fn expire(limited: &Limited, result: Result<ModelInfo, BackendError>) {
+        *limited.active.lock() = Some((
+            Instant::now()
+                .checked_sub(ACTIVE_MODEL_TTL * 2)
+                .expect("el reloj tiene que tener más de 10 s"),
+            result,
+        ));
+    }
+
+    #[tokio::test]
+    async fn con_el_cupo_de_modelos_agotado_active_model_devuelve_la_cache_vencida() {
+        let backend = Arc::new(FakeBackend::replying("hola"));
+        let limited = Limited::new(backend);
+        expire(&limited, Ok(model_info("viejo")));
+        let held: Vec<_> = (0..MAX_METADATA_IN_FLIGHT)
+            .map(|_| limited.metadata_permits.try_acquire().unwrap())
+            .collect();
+        assert_eq!(limited.metadata_permits.available_permits(), 0);
+
+        let stale = quickly(limited.active_model()).await.unwrap();
+
+        assert_eq!(stale, model_info("viejo"));
+        // No consultó al backend ni renovó la caché.
+        assert!(limited.active.lock().as_ref().unwrap().0.elapsed() > ACTIVE_MODEL_TTL);
+        drop(held);
+        // Con lugar otra vez, se renueva.
+        let fresh = quickly(limited.active_model()).await.unwrap();
+        assert_eq!(fresh, model_info("modelo-de-prueba"));
+        assert!(limited.active.lock().as_ref().unwrap().0.elapsed() < ACTIVE_MODEL_TTL);
+    }
+
+    #[tokio::test]
+    async fn la_cache_vencida_con_error_tambien_se_devuelve_sin_lugar() {
+        let limited = Limited::new(Arc::new(FakeBackend::replying("hola")));
+        expire(
+            &limited,
+            Err(BackendError::Unavailable("sin modelo".into())),
+        );
+        let _held: Vec<_> = (0..MAX_METADATA_IN_FLIGHT)
+            .map(|_| limited.metadata_permits.try_acquire().unwrap())
+            .collect();
+
+        let result = quickly(limited.active_model()).await;
+
+        assert_eq!(result, Err(BackendError::Unavailable("sin modelo".into())));
+    }
+
+    #[tokio::test]
+    async fn sin_cache_y_sin_lugar_active_model_espera_y_da_la_respuesta_de_siempre() {
+        let limited = Arc::new(Limited::new(Arc::new(FakeBackend::replying("hola"))));
+        let held: Vec<_> = (0..MAX_METADATA_IN_FLIGHT)
+            .map(|_| limited.metadata_permits.try_acquire().unwrap())
+            .collect();
+        let pending = {
+            let limited = limited.clone();
+            tokio::spawn(async move { limited.active_model().await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!pending.is_finished(), "no hay caché: espera su turno");
+
+        drop(held);
+
+        assert_eq!(
+            quickly(pending).await.unwrap().unwrap(),
+            model_info("modelo-de-prueba")
+        );
+    }
+
+    #[tokio::test]
+    async fn sin_cache_y_sin_lugar_el_error_del_backend_es_el_de_siempre() {
+        let mut fake = FakeBackend::replying("hola");
+        fake.active_result = Err(BackendError::Unavailable("apagado".into()));
+        let limited = Arc::new(Limited::new(Arc::new(fake)));
+        let held: Vec<_> = (0..MAX_METADATA_IN_FLIGHT)
+            .map(|_| limited.metadata_permits.try_acquire().unwrap())
+            .collect();
+        let pending = {
+            let limited = limited.clone();
+            tokio::spawn(async move { limited.active_model().await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(held);
+
+        let result = quickly(pending).await.unwrap();
+
+        assert_eq!(result, Err(BackendError::Unavailable("apagado".into())));
+    }
+
+    #[tokio::test]
+    async fn models_con_el_cupo_agotado_da_busy_sin_esperar_y_no_usa_el_de_los_chats() {
+        let limited = Arc::new(Limited::new(Arc::new(FakeBackend::replying("hola"))));
+        let held: Vec<_> = (0..MAX_METADATA_IN_FLIGHT)
+            .map(|_| limited.metadata_permits.try_acquire().unwrap())
+            .collect();
+        // Sin fila: con el cupo lleno, `Busy` en el acto (#3).
+        let busy = quickly(limited.models()).await.unwrap_err();
+        assert_eq!(busy, BackendError::Busy);
+        assert!(matches!(
+            crate::service::to_dbus(busy),
+            vasak_assistant_protocol::Error::Busy(_)
+        ));
+        // Los chats no están bloqueados por el cupo de modelos.
+        assert_eq!(quickly(limited.chat(&hello())).await.unwrap(), "hola");
+
+        drop(held);
+
+        assert_eq!(
+            quickly(limited.models()).await.unwrap(),
+            ["modelo-de-prueba"]
+        );
+    }
+
+    #[tokio::test]
+    async fn los_modelos_no_gastan_lugares_de_chat_ni_los_chats_los_de_modelos() {
+        let limited = Limited::new(Arc::new(FakeBackend::replying("hola")));
+        // Los topes del contrato: 4 chats y 2 consultas de modelos a la vez.
+        assert_eq!((MAX_IN_FLIGHT, MAX_METADATA_IN_FLIGHT), (4, 2));
+
+        limited.models().await.unwrap();
+        limited.active_model().await.unwrap();
+        limited.chat(&hello()).await.unwrap();
+
+        assert_eq!(limited.permits.available_permits(), MAX_IN_FLIGHT);
+        assert_eq!(
+            limited.metadata_permits.available_permits(),
+            MAX_METADATA_IN_FLIGHT
+        );
+    }
+
+    // ── La caché fría con varios llamadores y la concurrencia de metadatos ────
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Un backend que cuenta cuántos `models` y `active_model` hay a la vez (y el
+    /// pico) y cuántos pedidos de `active_model` le llegaron. Con `hold`, cada
+    /// pedido espera a que lo liberen.
+    struct Meta {
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+        active_calls: AtomicUsize,
+        models_calls: AtomicUsize,
+        hold: bool,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl Meta {
+        fn new(hold: bool) -> Arc<Self> {
+            Arc::new(Self {
+                in_flight: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+                active_calls: AtomicUsize::new(0),
+                models_calls: AtomicUsize::new(0),
+                hold,
+                release: tokio::sync::Semaphore::new(0),
+            })
+        }
+
+        async fn pass(&self) {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            if self.hold {
+                self.release.acquire().await.unwrap().forget();
+            }
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl ModelBackend for Meta {
+        fn info(&self) -> ModelInfo {
+            model_info("")
+        }
+
+        fn models(&self) -> BoxFuture<'_, Result<Vec<String>, BackendError>> {
+            Box::pin(async move {
+                self.models_calls.fetch_add(1, Ordering::SeqCst);
+                self.pass().await;
+                Ok(vec!["modelo".into()])
+            })
+        }
+
+        fn active_model(&self) -> BoxFuture<'_, Result<ModelInfo, BackendError>> {
+            Box::pin(async move {
+                self.active_calls.fetch_add(1, Ordering::SeqCst);
+                self.pass().await;
+                Ok(model_info("modelo"))
+            })
+        }
+
+        fn chat<'a>(&'a self, _: &'a [Message]) -> BoxFuture<'a, Result<String, BackendError>> {
+            Box::pin(async { Ok("hola".into()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn varios_active_model_con_la_cache_fria_y_el_cupo_lleno_hacen_un_solo_pedido_al_backend()
+    {
+        let meta = Meta::new(false);
+        let limited = Arc::new(Limited::new(meta.clone()));
+        // Todo el cupo de modelos ocupado y ninguna caché: todos hacen cola.
+        let held: Vec<_> = (0..MAX_METADATA_IN_FLIGHT)
+            .map(|_| limited.metadata_permits.try_acquire().unwrap())
+            .collect();
+        let callers: Vec<_> = (0..6)
+            .map(|_| {
+                let limited = limited.clone();
+                tokio::spawn(async move { limited.active_model().await })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(callers.iter().all(|task| !task.is_finished()));
+
+        // Se libera de a un lugar: el primero resuelve y guarda, y los que esperaban
+        // devuelven lo guardado en lugar de repetir el pedido.
+        let mut held = held.into_iter();
+        drop(held.next());
+        for task in callers {
+            assert_eq!(quickly(task).await.unwrap().unwrap(), model_info("modelo"));
+        }
+
+        assert_eq!(meta.active_calls.load(Ordering::SeqCst), 1);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn la_cache_que_se_llena_mientras_se_espera_no_se_usa_si_ya_vencio() {
+        let meta = Meta::new(false);
+        let limited = Arc::new(Limited::new(meta.clone()));
+        let held: Vec<_> = (0..MAX_METADATA_IN_FLIGHT)
+            .map(|_| limited.metadata_permits.try_acquire().unwrap())
+            .collect();
+        let waiting = {
+            let limited = limited.clone();
+            tokio::spawn(async move { limited.active_model().await })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // Alguien guardó algo, pero ya vencido: hay que preguntar de nuevo.
+        expire(&limited, Ok(model_info("viejo")));
+        drop(held);
+
+        let fresh = quickly(waiting).await.unwrap().unwrap();
+
+        assert_eq!(fresh, model_info("modelo"));
+        assert_eq!(meta.active_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn llamadas_mezcladas_de_models_y_active_model_no_pasan_del_cupo_de_metadatos() {
+        let meta = Meta::new(true);
+        let limited = Arc::new(Limited::new(meta.clone()));
+        let mut models = Vec::new();
+        let mut actives = Vec::new();
+        for _ in 0..4 {
+            let l = limited.clone();
+            models.push(tokio::spawn(async move { l.models().await }));
+            let l = limited.clone();
+            actives.push(tokio::spawn(async move { l.active_model().await }));
+        }
+        // Hasta llenar el cupo; el resto hace cola o recibe Busy.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while meta.in_flight.load(Ordering::SeqCst) < MAX_METADATA_IN_FLIGHT {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no se llenó el cupo"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Tiempo para que cualquiera que se hubiera colado, entre.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            meta.in_flight.load(Ordering::SeqCst),
+            MAX_METADATA_IN_FLIGHT
+        );
+        assert!(meta.peak.load(Ordering::SeqCst) <= MAX_METADATA_IN_FLIGHT);
+        meta.release.add_permits(100);
+
+        let mut accepted = 0;
+        let mut busy = 0;
+        for task in models {
+            match quickly(task).await.unwrap() {
+                Ok(_) => accepted += 1,
+                Err(error) => {
+                    assert_eq!(error, BackendError::Busy);
+                    busy += 1;
+                }
+            }
+        }
+        for task in actives {
+            assert_eq!(quickly(task).await.unwrap().unwrap(), model_info("modelo"));
+        }
+        assert!(meta.peak.load(Ordering::SeqCst) <= MAX_METADATA_IN_FLIGHT);
+        assert!(accepted <= 4 && accepted + busy == 4);
+        assert_eq!(
+            limited.metadata_permits.available_permits(),
+            MAX_METADATA_IN_FLIGHT
+        );
+    }
+
+    #[tokio::test]
+    async fn solo_models_mantenidos_abiertos_nunca_pasan_del_cupo_y_el_resto_recibe_busy() {
+        let meta = Meta::new(true);
+        let limited = Arc::new(Limited::new(meta.clone()));
+        let callers: Vec<_> = (0..6)
+            .map(|_| {
+                let l = limited.clone();
+                tokio::spawn(async move { l.models().await })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            meta.in_flight.load(Ordering::SeqCst),
+            MAX_METADATA_IN_FLIGHT
+        );
+        // Los demás ya respondieron Busy sin entrar al backend.
+        let finished = callers.iter().filter(|task| task.is_finished()).count();
+        assert_eq!(finished, 6 - MAX_METADATA_IN_FLIGHT);
+        assert_eq!(
+            meta.models_calls.load(Ordering::SeqCst),
+            MAX_METADATA_IN_FLIGHT
+        );
+        meta.release.add_permits(100);
+        for task in callers {
+            let _ = quickly(task).await.unwrap();
+        }
+        assert!(meta.peak.load(Ordering::SeqCst) <= MAX_METADATA_IN_FLIGHT);
     }
 }

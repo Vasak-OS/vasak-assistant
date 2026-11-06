@@ -89,6 +89,9 @@ pub const REASON_NO_KEYRING: &str = "El llavero no responde";
 pub const REASON_NO_PLACE: &str = "No hay una carpeta de estado donde guardar la memoria";
 pub const REASON_REMOTE: &str = "La memoria no se comparte con un proveedor remoto";
 pub const REASON_MODEL_UNREACHABLE: &str = "El modelo no responde";
+pub const REASON_CONFINED: &str = "No disponible para aplicaciones confinadas";
+pub const REASON_MODEL_NOT_ALLOWED: &str =
+    "El modelo no está permitido: corre en la nube y falta «allow_remote»";
 
 /// El tope de lo que ocupa la base en disco.
 pub const MAX_MEMORY_DISK_BYTES: u64 = 4 << 20;
@@ -385,6 +388,11 @@ impl Memory {
                 return;
             }
             let request = learn::extraction_request(&conversation, gate);
+            // La extracción no cuenta para el tope de chats del dueño (#3): hay
+            // una sola a la vez para todo el servicio (`learning`), así que
+            // ocupa como mucho un lugar del cupo global y ningún cliente la
+            // puede multiplicar. Contarla le sacaría a la persona uno de sus dos
+            // chats justo después de cada respuesta.
             // Sin permiso para el remoto, la extracción sólo va a un modelo
             // local, decidido con la misma resolución que manda el pedido.
             let sent = if memory.share_with_remote {

@@ -62,6 +62,12 @@ pub const MAX_CONVERSATIONS: usize = 32;
 /// Cuántas conversaciones abiertas puede tener una misma conexión.
 pub const MAX_CONVERSATIONS_PER_OWNER: usize = 8;
 
+/// Cuántos `Chat` puede tener una misma conexión esperando respuesta a la vez,
+/// entre todas sus conversaciones. Pasado eso, `Chat` da `Busy` sin ocupar
+/// lugar en el backend: así un solo cliente no acapara los pedidos al modelo
+/// y los demás no esperan hasta el plazo de D-Bus.
+pub const MAX_CHATS_IN_FLIGHT_PER_OWNER: usize = 2;
+
 /// Cuántos mensajes guarda una conversación. Pasado eso se olvidan los más
 /// viejos; el último intercambio se conserva siempre.
 pub const MAX_HISTORY_MESSAGES: usize = 100;
@@ -207,7 +213,9 @@ pub enum Error {
     NotFound(String),
     /// Se llegó a [`MAX_CONVERSATIONS`] o a [`MAX_CONVERSATIONS_PER_OWNER`].
     LimitExceeded(String),
-    /// La conversación ya está esperando una respuesta.
+    /// La conversación ya está esperando una respuesta, o quien llama ya tiene
+    /// [`MAX_CHATS_IN_FLIGHT_PER_OWNER`] chats esperando la suya. Es
+    /// pasajero: se puede volver a intentar cuando llegue una respuesta.
     Busy(String),
     /// Quien llama no puede hacer eso: una aplicación confinada (AppArmor) no
     /// enciende, apaga ni borra la memoria, ni guarda o consulta claves.
@@ -245,9 +253,14 @@ pub trait Assistant {
     /// la configuración permite un proveedor remoto, y `memory` está
     /// disponible si la memoria está encendida y abierta (si no, el motivo es
     /// el de [`Self::memory_status`], o «La memoria está apagada»).
+    ///
+    /// A una aplicación confinada (AppArmor), `memory` llega siempre no
+    /// disponible con el motivo «No disponible para aplicaciones confinadas»,
+    /// sin abrir la base ni preguntar al llavero.
     fn capabilities(&self) -> Result<Vec<Capability>, Error>;
 
     /// Los modelos instalados en el backend. `Unavailable` si no responde.
+    /// `Busy` si hay demasiados pedidos de la lista a la vez; es pasajero.
     fn models(&self) -> Result<Vec<String>, Error>;
 
     /// Abre una conversación nueva, de quien llama, y devuelve su id.
@@ -295,9 +308,14 @@ pub trait Assistant {
     /// `AccessDenied` si quien llama es una aplicación confinada (AppArmor).
     fn has_provider_key(&self, url: &str) -> Result<bool, Error>;
 
-    /// Cómo está la memoria. Nunca falla (salvo el bus): cualquier problema
-    /// llega como `available: false` con el motivo (también el de un
-    /// proveedor remoto sin permiso). `bytes` se mide sin abrir la base.
+    /// Cómo está la memoria. Para quien puede preguntar no falla (salvo el
+    /// bus): cualquier problema llega como `available: false` con el motivo
+    /// (también el de un proveedor remoto sin permiso, o el de un modelo por
+    /// omisión en la nube sin `allow_remote`). `bytes` se mide sin abrir la
+    /// base.
+    ///
+    /// `AccessDenied` si quien llama es una aplicación confinada (AppArmor):
+    /// lo que ocupa crece con el uso.
     fn memory_status(&self) -> Result<MemoryStatus, Error>;
 
     /// Enciende o apaga la memoria.

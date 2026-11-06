@@ -92,17 +92,25 @@ paquete instalado; no hay una excepción de desarrollo en el llavero.
 **Aplicaciones confinadas.** La memoria y las claves son de la persona, no de
 cada aplicación. Si quien llama está confinado por AppArmor (el bus informa su
 `LinuxSecurityLabel` y no es `unconfined`), `SetProviderKey`, `HasProviderKey`,
-`SetMemoryEnabled` y `ClearMemory` contestan
+`MemoryStatus`, `SetMemoryEnabled` y `ClearMemory` contestan
 `ar.net.vasak.os.Assistant.Error.AccessDenied`, y su `Chat` va sin memoria: no
-se le pasan notas ni se aprende de lo que dice. `MemoryStatus` y
-`Capabilities` siguen abiertos. Sin AppArmor no hay etiqueta y se deja pasar;
-una etiqueta vacía cuenta como confinada.
+se le pasan notas ni se aprende de lo que dice. `MemoryStatus` está cerrado
+porque lo que ocupa la memoria crece con el uso. `Capabilities` sigue abierto,
+pero a un confinado le informa `memory` como no disponible con un motivo fijo
+(«No disponible para aplicaciones confinadas»), sin abrir la base ni preguntar
+al llavero. Sin AppArmor no hay etiqueta y se deja pasar; una etiqueta vacía
+cuenta como confinada.
 
 Cuenta como confinado todo lo que tenga perfil, aunque esté en modo complain
 (por ejemplo `busctl` y `qdbus`) o sea un perfil `(unconfined)` con nombre
 (Flatpak, Firefox): `Chat` va sin memoria y los métodos de control dan
 `AccessDenied`. Sólo pasa la etiqueta `unconfined` a secas. Configuración, el
-chat y la CLI propia del asistente no tienen perfil.
+chat y la CLI propia del asistente no tienen perfil. Si Configuración
+(vasak-settings) llega a tener un perfil de AppArmor, el mismo cambio que lo
+agrega tiene que eximirlo en `is_confined` por su nombre exacto, revisado por
+seguridad, y nunca un perfil genérico como `vasak-appimage`: si no, pierde el
+control de la memoria y las claves. Hasta entonces, un perfil con ese nombre
+cuenta como confinado, igual que cualquier otro.
 
 **El límite.** La puerta mira a quien hace el llamado, y nada más. El perfil
 `vasak-appimage` permite `dbus,`, `file,` y `change_profile,`: con eso, un
@@ -196,12 +204,13 @@ systemd, `$STATE_DIRECTORY`). No va en el almacén de cuentas.
 
 | Método | Qué hace |
 |---|---|
-| `MemoryStatus() → (bbst)` | `enabled`, `available`, `reason` y `bytes` (lo que ocupa en disco, encendida o apagada, medido sin abrirla). Nunca falla: un problema llega como `available = false` con el motivo («La memoria está apagada», «El llavero está bloqueado», «La clave de la memoria no está en el llavero», «La memoria no se pudo abrir»). |
+| `MemoryStatus() → (bbst)` | `enabled`, `available`, `reason` y `bytes` (lo que ocupa en disco, encendida o apagada, medido sin abrirla). Un problema llega como `available = false` con el motivo («La memoria está apagada», «El llavero está bloqueado», «La clave de la memoria no está en el llavero», «La memoria no se pudo abrir», «El modelo no está permitido: corre en la nube y falta «allow_remote»»). `AccessDenied` para un llamador confinado. |
 | `SetMemoryEnabled(b enabled) → ()` | Encender: reabre la base que haya o, si no hay, llave nueva al llavero y base vacía. `Unavailable` si el llavero está bloqueado (no abre ningún diálogo), no responde o la base no abre. Apagar: deja de usarla, sin borrar nada. |
 | `ClearMemory() → ()` | La borra (llave y archivos) y, si estaba encendida, la recrea vacía con una llave nueva. `Unavailable` con el llavero bloqueado, sin tocar nada. |
 
 `Capabilities` informa `memory` como disponible cuando está encendida y
-abierta.
+abierta; a un llamador confinado, siempre no disponible con «No disponible para
+aplicaciones confinadas».
 
 ## Ver los errores
 
@@ -274,8 +283,8 @@ busctl --user call $d $p $d Chat ss "$id" "Hola, ¿quién sos?"
 ```
 
 Con AppArmor, `busctl` tiene perfil (en modo complain), así que cuenta como
-confinado: el `Chat` de arriba va **sin memoria** y `SetMemoryEnabled`,
-`ClearMemory`, `SetProviderKey` y `HasProviderKey` le contestan
+confinado: el `Chat` de arriba va **sin memoria** y `MemoryStatus`,
+`SetMemoryEnabled`, `ClearMemory`, `SetProviderKey` y `HasProviderKey` le contestan
 `AccessDenied`. Para la memoria y las claves, Configuración.
 
 Instalado, lo arranca systemd como servicio de usuario
