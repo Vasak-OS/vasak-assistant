@@ -14,7 +14,7 @@ Lo de un turno no se aprende en una memoria que se borró mientras se respondía
   no se anota en vuelo y no se toca la ventana de la conversación. Antes la
   época se tomaba recién con la respuesta, y lo dicho en ese turno podía
   guardarse en la memoria nueva. `store_at` sigue comparando contra la misma
-  época del comienzo del turno (#20).
+  época del comienzo del turno.
 
 ## vasak-assistant 0.3.8
 

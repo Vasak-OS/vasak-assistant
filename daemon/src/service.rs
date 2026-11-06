@@ -4334,11 +4334,13 @@ mod turn_epoch_tests {
     const EXTRACTION: &str =
         r#"{"items":[{"kind":"preference","text":"Prefiere el mate amargo"}],"summary":null}"#;
 
+    /// Un servicio con la memoria encendida, y su carpeta.
     struct Rig {
         _tmp: TempDir,
         service: Arc<AssistantService>,
     }
 
+    /// Un servicio con la memoria encendida sobre `backend`.
     async fn rig(backend: Arc<dyn ModelBackend>) -> Rig {
         let tmp = TempDir::new();
         let keys = FixedKey::new(None);
@@ -4355,6 +4357,7 @@ mod turn_epoch_tests {
         Rig { _tmp: tmp, service }
     }
 
+    /// Falla a los 5 s en vez de colgar la prueba.
     async fn quickly<T>(future: impl std::future::Future<Output = T>) -> T {
         tokio::time::timeout(std::time::Duration::from_secs(5), future)
             .await
@@ -4374,6 +4377,7 @@ mod turn_epoch_tests {
         })
     }
 
+    /// Comprueba que de ese turno no quedó nada en la memoria.
     async fn nothing_learned(rig: &Rig) {
         rig.service.memory.wait_until_idle().await;
         let notes = rig.service.memory.recall("mate amargo", true).await;
@@ -4383,61 +4387,89 @@ mod turn_epoch_tests {
         );
     }
 
-    #[tokio::test]
-    async fn borrar_la_memoria_mientras_el_modelo_responde_no_aprende_nada_del_turno() {
+    /// Un turno bloqueado en el modelo, con todo para soltarlo.
+    struct Blocked {
+        rig: Rig,
+        backend: Arc<FakeBackend>,
+        gate: Arc<tokio::sync::Notify>,
+        id: String,
+        turn: tokio::task::JoinHandle<Result<String, Error>>,
+    }
+
+    /// Deja un turno bloqueado en el modelo (ya entró, todavía no respondió).
+    async fn blocked_turn() -> Blocked {
         let (fake, gate) = FakeBackend::gated(EXTRACTION);
         let backend = Arc::new(fake);
         let rig = rig(backend.clone()).await;
         let id = rig.service.open(OWNER).unwrap();
         let turn = start_turn(&rig.service, &id);
         quickly(backend.entered.notified()).await;
+        Blocked {
+            rig,
+            backend,
+            gate,
+            id,
+            turn,
+        }
+    }
 
-        rig.service.memory.clear().await.unwrap();
-        gate.notify_one();
-        quickly(turn).await.unwrap().unwrap();
-        rig.service.memory.wait_until_idle().await;
+    impl Blocked {
+        /// Suelta el turno bloqueado y espera a que termine, con la extracción.
+        async fn release(self) -> Rig {
+            self.gate.notify_one();
+            quickly(self.turn).await.unwrap().unwrap();
+            self.rig.service.memory.wait_until_idle().await;
+            self.rig
+        }
 
-        // El chat sale; la extracción no: el backend recibió una sola llamada.
-        assert_eq!(backend.seen.lock().len(), 1);
-        nothing_learned(&rig).await;
+        /// Lo suelta y verifica que el turno no aprendió nada: el chat salió, la
+        /// extracción no, y la memoria no tiene lo dicho.
+        async fn finish_and_check(self) -> Rig {
+            let backend = self.backend.clone();
+            let rig = self.release().await;
+            assert_eq!(
+                backend.seen.lock().len(),
+                1,
+                "la extracción no tenía que salir"
+            );
+            nothing_learned(&rig).await;
+            rig
+        }
+    }
+
+    #[tokio::test]
+    async fn borrar_la_memoria_mientras_el_modelo_responde_no_aprende_nada_del_turno() {
+        let blocked = blocked_turn().await;
+        let memory = blocked.rig.service.memory.clone();
+
+        memory.clear().await.unwrap();
+        let _rig = blocked.finish_and_check().await;
+
         // La memoria nueva sigue encendida y vacía.
-        assert!(rig.service.memory.status().await.available);
+        assert!(memory.status().await.available);
     }
 
     #[tokio::test]
     async fn apagar_y_encender_la_memoria_mientras_el_modelo_responde_tampoco_aprende() {
-        let (fake, gate) = FakeBackend::gated(EXTRACTION);
-        let backend = Arc::new(fake);
-        let rig = rig(backend.clone()).await;
-        let id = rig.service.open(OWNER).unwrap();
-        let turn = start_turn(&rig.service, &id);
-        quickly(backend.entered.notified()).await;
+        let blocked = blocked_turn().await;
+        let memory = blocked.rig.service.memory.clone();
 
-        rig.service.memory.set_enabled(false).await.unwrap();
-        rig.service.memory.set_enabled(true).await.unwrap();
-        gate.notify_one();
-        quickly(turn).await.unwrap().unwrap();
+        memory.set_enabled(false).await.unwrap();
+        memory.set_enabled(true).await.unwrap();
 
-        assert_eq!(backend.seen.lock().len(), 1);
-        nothing_learned(&rig).await;
+        let _rig = blocked.finish_and_check().await;
     }
 
     #[tokio::test]
     async fn solo_apagar_la_memoria_mientras_el_modelo_responde_tampoco_aprende() {
-        let (fake, gate) = FakeBackend::gated(EXTRACTION);
-        let backend = Arc::new(fake);
-        let rig = rig(backend.clone()).await;
-        let id = rig.service.open(OWNER).unwrap();
-        let turn = start_turn(&rig.service, &id);
-        quickly(backend.entered.notified()).await;
+        let blocked = blocked_turn().await;
+        let memory = blocked.rig.service.memory.clone();
 
-        rig.service.memory.set_enabled(false).await.unwrap();
-        gate.notify_one();
-        quickly(turn).await.unwrap().unwrap();
-        rig.service.memory.wait_until_idle().await;
+        memory.set_enabled(false).await.unwrap();
+        let rig = blocked.finish_and_check().await;
 
-        assert_eq!(backend.seen.lock().len(), 1);
-        rig.service.memory.set_enabled(true).await.unwrap();
+        // Vuelve a encenderse y sigue sin haber nada de ese turno.
+        memory.set_enabled(true).await.unwrap();
         nothing_learned(&rig).await;
     }
 
@@ -4460,15 +4492,14 @@ mod turn_epoch_tests {
 
     #[tokio::test]
     async fn el_turno_siguiente_ya_con_la_epoca_nueva_aprende_con_normalidad() {
-        let (fake, gate) = FakeBackend::gated(EXTRACTION);
-        let backend = Arc::new(fake);
-        let rig = rig(backend.clone()).await;
-        let id = rig.service.open(OWNER).unwrap();
-        let first = start_turn(&rig.service, &id);
-        quickly(backend.entered.notified()).await;
-        rig.service.memory.clear().await.unwrap();
-        gate.notify_one();
-        quickly(first).await.unwrap().unwrap();
+        let blocked = blocked_turn().await;
+        let (backend, gate, id) = (
+            blocked.backend.clone(),
+            blocked.gate.clone(),
+            blocked.id.clone(),
+        );
+        blocked.rig.service.memory.clear().await.unwrap();
+        let rig = blocked.release().await;
         assert_eq!(backend.seen.lock().len(), 1);
 
         // Otro turno de la misma conversación, empezado después del borrado.

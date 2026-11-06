@@ -2145,7 +2145,7 @@ mod review_tests {
     use super::*;
     use crate::test_support::{FakeBackend, FixedKey, TempDir};
 
-    async fn enabled() -> (TempDir, Arc<Memory>) {
+    pub(super) async fn enabled() -> (TempDir, Arc<Memory>) {
         let tmp = TempDir::new();
         let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), FixedKey::new(None)));
         memory.set_enabled(true).await.unwrap();
@@ -2183,7 +2183,7 @@ mod review_tests {
         ];
         let epoch = memory.epoch();
 
-        memory.learn_after(backend.clone(), "c1", conversation, memory.epoch());
+        memory.learn_after(backend.clone(), "c1", conversation, epoch);
         backend.entered.notified().await;
         memory.set_enabled(true).await.unwrap();
         memory.set_enabled(true).await.unwrap();
@@ -3612,8 +3612,9 @@ mod canary_tests {
 /// `learn_after` con una época que ya pasó (#20).
 #[cfg(test)]
 mod stale_epoch_tests {
+    use super::review_tests::enabled;
     use super::*;
-    use crate::test_support::{FixedKey, ScriptedBackend, TempDir};
+    use crate::test_support::ScriptedBackend;
 
     const EXTRACTION: &str =
         r#"{"items":[{"kind":"preference","text":"Prefiere el mate amargo"}],"summary":null}"#;
@@ -3629,13 +3630,6 @@ mod stale_epoch_tests {
             say(Role::User, "prefiero el mate amargo"),
             say(Role::Assistant, "Anotado."),
         ]
-    }
-
-    async fn enabled() -> (TempDir, Arc<Memory>) {
-        let tmp = TempDir::new();
-        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), FixedKey::new(None)));
-        memory.set_enabled(true).await.unwrap();
-        (tmp, memory)
     }
 
     #[tokio::test]
