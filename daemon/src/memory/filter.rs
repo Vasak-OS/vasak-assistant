@@ -1082,3 +1082,102 @@ mod marker_groups_tests {
         }
     }
 }
+
+/// Los marcadores que se buscan dentro de cada palabra (`MARKER_INSIDE_WORD`).
+#[cfg(test)]
+mod inside_word_tests {
+    use super::*;
+
+    #[test]
+    fn los_marcadores_pegados_a_otra_palabra_o_dentro_de_ella_se_detectan() {
+        for text in [
+            "systemprompt",
+            "system_prompt",
+            "developer_mode",
+            "dontignore",
+            "forgeteverything",
+            "follow these instructions",
+            "just_ignore",
+            "disregardthis",
+            "assistantsays",
+            "reinstruccion",
+            "notprompt",
+            "Dont.Ignore.This",
+        ] {
+            assert!(has_injection_markers(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn las_palabras_legitimas_que_contienen_system_o_regla_pasan() {
+        for text in [
+            "Le interesa systemd",
+            "Usa systemd-boot",
+            "Trabaja con su filesystem",
+            "Prefiere arreglar",
+            "Toma notas en papel",
+            "Prefiere glaseado",
+            "Estudia ecosistemas",
+            "Le gusta el sistematico",
+            "Tiene un reglamento",
+        ] {
+            assert!(!has_injection_markers(text), "{text}");
+            assert!(is_clean_note(text), "{text}");
+        }
+    }
+
+    // Sobre-bloqueo aceptado y fijado a propósito: `instruct` también cae en
+    // «instructor», «instructora» e «instructivo», que son castellano legítimo.
+    // Se prefiere perder esas notas a dejar pasar «instructions».
+    #[test]
+    fn el_sobre_bloqueo_de_instruct_esta_aceptado_y_documentado() {
+        for text in [
+            "Su instructor de yoga",
+            "Tiene una instructora de baile",
+            "Lee el instructivo",
+        ] {
+            assert!(has_injection_markers(text), "{text}");
+            assert!(!is_clean_note(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn las_palabras_enteras_siguen_siendo_palabras_enteras() {
+        for text in ["system", "sistema", "regla", "las reglas", "the systems"] {
+            assert!(has_injection_markers(text), "{text}");
+        }
+        for text in [
+            "systemd",
+            "systematic",
+            "sistematico",
+            "reglamento",
+            "arreglar",
+        ] {
+            assert!(!has_injection_markers(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn cada_marcador_dentro_de_una_palabra_se_detecta_en_cualquier_posicion() {
+        for marker in MARKER_INSIDE_WORD {
+            for text in [
+                format!("{marker}"),
+                format!("pre{marker}"),
+                format!("{marker}post"),
+                format!("pre_{marker}_post"),
+                format!("PRE {}", marker.to_uppercase()),
+            ] {
+                assert!(has_injection_markers(&text), "{text}");
+            }
+        }
+        assert_eq!(MARKER_INSIDE_WORD.len(), 8);
+    }
+
+    #[test]
+    fn dos_palabras_distintas_no_forman_un_marcador_dentro_de_una_palabra() {
+        // «ignor» partida entre dos palabras no se junta.
+        assert!(!has_injection_markers("Come ign orar"));
+        assert!(!has_injection_markers("Toma pro mpt"));
+        assert!(!has_injection_markers("Le gusta instru cciones"));
+    }
+}
