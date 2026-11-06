@@ -2,6 +2,20 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-assistant 0.3.10
+
+Lo de un turno no se aprende en una memoria que se borró mientras se respondía
+(#20).
+
+- **`daemon`** — `chat_with` toma la época de la memoria al comienzo del turno,
+  antes de `recall`, y se la pasa a `learn_after`. Si mientras el modelo
+  respondía se borró (`ClearMemory`), se encendió o se apagó la memoria, de ese
+  turno no se aprende nada: ni recuerdos ni resumen, no se lanza la extracción,
+  no se anota en vuelo y no se toca la ventana de la conversación. Antes la
+  época se tomaba recién con la respuesta, y lo dicho en ese turno podía
+  guardarse en la memoria nueva. `store_at` sigue comparando contra la misma
+  época del comienzo del turno (#20).
+
 ## vasak-assistant 0.3.8
 
 La memoria, más dura frente a una base cambiada y a las notas con órdenes

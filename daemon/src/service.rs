@@ -485,6 +485,10 @@ impl AssistantService {
             reply: None,
         };
         let first_turn = context.iter().filter(|m| m.role == Role::User).count() == 1;
+        // La época del comienzo del turno, antes de leer la memoria: si un
+        // `ClearMemory` (o encender, apagar) llega mientras el modelo responde,
+        // de este turno no se aprende nada en la memoria nueva (#20).
+        let epoch = self.memory.epoch();
         // La puerta del remoto con el modelo que va a responder este pedido:
         // remoto y sin `share_memory_with_remote`, ni notas ni aprendizaje.
         // Filtro previo: no se lee la memoria si el modelo de ahora no la
@@ -537,7 +541,7 @@ impl AssistantService {
             let conversations = self.conversations.lock();
             if conversations.contains(owner, conversation_id) {
                 self.memory
-                    .learn_after(self.backend.clone(), conversation_id, context);
+                    .learn_after(self.backend.clone(), conversation_id, context, epoch);
             }
         }
         Ok(reply)
@@ -2548,9 +2552,12 @@ mod effective_model_tests {
 
         // La puerta (`allowed_for`, primera resolución) ve un modelo local y la
         // extracción (`chat_local_only`, segunda) lo ve en la nube.
-        rig.service
-            .memory
-            .learn_after(backend.clone(), "c1", conversation);
+        rig.service.memory.learn_after(
+            backend.clone(),
+            "c1",
+            conversation,
+            rig.service.memory.epoch(),
+        );
         rig.service.memory.wait_until_idle().await;
 
         assert!(backend.inner.seen.lock().is_empty(), "nada salió a la nube");
