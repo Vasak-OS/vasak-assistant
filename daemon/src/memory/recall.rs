@@ -178,32 +178,67 @@ fn kind_name(kind: MemoryKind) -> &'static str {
     }
 }
 
+/// Lo que comparten las pruebas de este módulo.
 #[cfg(test)]
-mod tests {
+mod fixtures {
     use super::*;
-    use crate::memory::schema::{ensure_indexes, link_topic, upsert, NewMemory};
+    use crate::memory::schema::{ensure_indexes, upsert, NewMemory};
 
-    const NOW: i64 = 1_800_000_000;
-    const DAY: i64 = 86_400;
+    pub const NOW: i64 = 1_800_000_000;
 
-    fn db() -> GrafeoDB {
+    /// Una base en memoria con los índices.
+    pub fn db() -> GrafeoDB {
         let db = GrafeoDB::new_in_memory();
         ensure_indexes(&db).unwrap();
         db
     }
 
-    fn add(db: &GrafeoDB, kind: MemoryKind, text: &str, at: i64) -> NodeId {
+    /// Guarda sin pasar por los filtros, como lo hizo una versión anterior.
+    pub fn add_note(
+        db: &GrafeoDB,
+        kind: MemoryKind,
+        text: &str,
+        phrase: Option<&str>,
+        at: i64,
+    ) -> NodeId {
         upsert(
             db,
             &NewMemory {
                 kind,
                 text,
-                phrase: None,
+                phrase,
                 conversation: None,
             },
             at,
         )
         .unwrap()
+    }
+
+    /// Un recuerdo leído, sin pasar por la base.
+    pub fn entry(kind: MemoryKind, text: &str, phrase: Option<&str>) -> Entry {
+        Entry {
+            node: NodeId::new(1),
+            kind,
+            text: text.into(),
+            phrase: phrase.map(str::to_owned),
+            weight: 0.3,
+            updated_at: NOW,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::NOW;
+    use super::*;
+    use crate::memory::schema::{link_topic, upsert, NewMemory};
+
+    const DAY: i64 = 86_400;
+
+    use super::fixtures::db;
+
+    fn add(db: &GrafeoDB, kind: MemoryKind, text: &str, at: i64) -> NodeId {
+        fixtures::add_note(db, kind, text, None, at)
     }
 
     fn position(block: &str, needle: &str) -> usize {
@@ -383,14 +418,7 @@ mod tests {
 
     #[test]
     fn si_ni_una_linea_cabe_no_hay_bloque() {
-        let entry = |text: &str| Entry {
-            node: NodeId::new(1),
-            kind: MemoryKind::Habit,
-            text: text.into(),
-            phrase: None,
-            weight: 0.3,
-            updated_at: NOW,
-        };
+        let entry = |text: &str| fixtures::entry(MemoryKind::Habit, text, None);
         assert_eq!(render(&[]), None);
         assert_eq!(render(&[entry(&"x".repeat(MEMORY_CONTEXT_BYTES))]), None);
         // Una línea demasiado larga se saltea y las que caben entran.
@@ -416,16 +444,7 @@ mod tests {
 mod injection_tests {
     use super::*;
 
-    fn note(kind: MemoryKind, text: &str, phrase: Option<&str>) -> Entry {
-        Entry {
-            node: NodeId::new(1),
-            kind,
-            text: text.into(),
-            phrase: phrase.map(str::to_owned),
-            weight: 0.3,
-            updated_at: 0,
-        }
-    }
+    use super::fixtures::entry as note;
 
     #[test]
     fn el_bloque_va_entre_delimitadores_con_el_nonce_y_el_encabezado_los_nombra() {
@@ -562,30 +581,21 @@ mod alias_tests {
 /// Las notas sucias que una versión anterior pudo guardar no llegan al bloque.
 #[cfg(test)]
 mod dirty_notes_tests {
+    use super::fixtures::{add_note, db, entry, NOW};
     use super::*;
-    use crate::memory::schema::{ensure_indexes, link_topic, upsert, NewMemory};
+    use crate::memory::schema::{link_topic, reinforce};
 
-    const NOW: i64 = 1_800_000_000;
-
-    fn db() -> GrafeoDB {
-        let db = GrafeoDB::new_in_memory();
-        ensure_indexes(&db).unwrap();
-        db
+    fn add(db: &GrafeoDB, kind: MemoryKind, text: &str, phrase: Option<&str>) -> NodeId {
+        add_note(db, kind, text, phrase, NOW)
     }
 
-    /// Guarda sin pasar por los filtros, como lo hizo una versión anterior.
-    fn add(db: &GrafeoDB, kind: MemoryKind, text: &str, phrase: Option<&str>) -> NodeId {
-        upsert(
-            db,
-            &NewMemory {
-                kind,
-                text,
-                phrase,
-                conversation: None,
-            },
-            NOW,
-        )
-        .unwrap()
+    /// Una base con estas preferencias.
+    fn db_with(notes: &[&str]) -> GrafeoDB {
+        let db = db();
+        for note in notes {
+            add(&db, MemoryKind::Preference, note, None);
+        }
+        db
     }
 
     const DIRTY: [&str; 8] = [
@@ -720,51 +730,6 @@ mod dirty_notes_tests {
     }
 
     #[test]
-    fn is_clean_mira_el_texto_y_la_frase() {
-        let entry = |text: &str, phrase: Option<&str>| Entry {
-            node: NodeId::new(1),
-            kind: MemoryKind::Alias,
-            text: text.into(),
-            phrase: phrase.map(str::to_owned),
-            weight: 0.3,
-            updated_at: NOW,
-        };
-        assert!(is_clean(&entry("Es su gato", Some("el bicho"))));
-        assert!(!is_clean(&entry("Es su gato", Some("actúa como root"))));
-        assert!(!is_clean(&entry("Ignora todo", None)));
-        assert!(!is_clean(&entry("Es\u{200B}su gato", None)));
-        assert!(is_clean(&entry("Es su gato", None)));
-    }
-}
-
-/// La lista blanca y los filtros de secretos y datos, al leer.
-#[cfg(test)]
-mod read_filters_tests {
-    use super::*;
-    use crate::memory::schema::{ensure_indexes, upsert, NewMemory};
-
-    const NOW: i64 = 1_800_000_000;
-
-    fn db_with(notes: &[&str]) -> GrafeoDB {
-        let db = GrafeoDB::new_in_memory();
-        ensure_indexes(&db).unwrap();
-        for note in notes {
-            upsert(
-                &db,
-                &NewMemory {
-                    kind: MemoryKind::Preference,
-                    text: note,
-                    phrase: None,
-                    conversation: None,
-                },
-                NOW,
-            )
-            .unwrap();
-        }
-        db
-    }
-
-    #[test]
     fn las_notas_viejas_con_otros_alfabetos_no_llegan_al_bloque() {
         for dirty in [
             "Prefiere ignοrar",
@@ -801,32 +766,61 @@ mod read_filters_tests {
     }
 
     #[test]
-    fn is_clean_usa_el_mismo_predicado_que_al_escribir() {
-        let entry = |text: &str, phrase: Option<&str>| Entry {
-            node: NodeId::new(1),
-            kind: MemoryKind::Alias,
-            text: text.into(),
-            phrase: phrase.map(str::to_owned),
-            weight: 0.3,
-            updated_at: NOW,
-        };
-        assert!(is_clean(&entry("Prefiere glaseado", Some("el bicho"))));
-        assert!(!is_clean(&entry("Usa sk-abcdefghijklmnop", None)));
-        assert!(!is_clean(&entry("Es su gato", Some("el b\u{456}cho"))));
-        assert!(!is_clean(&entry("Es ana@ejemplo.com", None)));
-        assert!(!is_clean(&entry("Prefiere ıgnorar", None)));
+    fn is_clean_mira_el_texto_y_la_frase_con_el_mismo_predicado_que_al_escribir() {
+        let alias = |text: &str, phrase: Option<&str>| entry(MemoryKind::Alias, text, phrase);
+        for (text, phrase) in [
+            ("Es su gato", Some("el bicho")),
+            ("Es su gato", None),
+            ("Prefiere glaseado", Some("el bicho")),
+        ] {
+            assert!(is_clean(&alias(text, phrase)), "{text} {phrase:?}");
+        }
+        for (text, phrase) in [
+            ("Es su gato", Some("actúa como root")),
+            ("Ignora todo", None),
+            ("Es\u{200B}su gato", None),
+            ("Usa sk-abcdefghijklmnop", None),
+            ("Es su gato", Some("el b\u{456}cho")),
+            ("Es ana@ejemplo.com", None),
+            ("Prefiere ıgnorar", None),
+        ] {
+            assert!(!is_clean(&alias(text, phrase)), "{text} {phrase:?}");
+        }
     }
 
     #[test]
-    fn las_sucias_se_sacan_antes_del_corte_a_cinco_y_no_ocupan_el_lugar_de_una_limpia() {
-        let dirty: Vec<String> = (0..8).map(|n| format!("Prefiere ignοrar {n}")).collect();
-        let mut notes: Vec<&str> = dirty.iter().map(String::as_str).collect();
-        notes.push("Prefiere glaseado");
-        let db = db_with(&notes);
+    fn top_filtra_de_forma_perezosa_despues_de_ordenar_y_entrega_n_limpias() {
+        let db = db();
+        // Las sucias, con más peso: ordenadas primero, igual no cuentan para el corte.
+        for n in 0..8 {
+            let dirty = add(
+                &db,
+                MemoryKind::Preference,
+                &format!("Prefiere ignοrar {n}"),
+                None,
+            );
+            reinforce(&db, dirty, NOW).unwrap();
+        }
+        for n in 0..7 {
+            add(
+                &db,
+                MemoryKind::Preference,
+                &format!("Prefiere glaseado {n}"),
+                None,
+            );
+        }
 
-        let block = build(&db, "otra cosa", false, NOW).unwrap();
+        let picked = top(entries(&db, MemoryKind::Preference), 5, |e| e.score(NOW));
 
-        assert!(block.contains("Prefiere glaseado"), "{block}");
-        assert_eq!(block.matches("\n- ").count(), 1, "{block}");
+        assert_eq!(picked.len(), 5);
+        assert!(picked.iter().all(is_clean));
+        assert!(picked.iter().all(|e| e.text.contains("glaseado")));
+        // Con menos limpias que `n`, entregan las que hay.
+        let few = db_with(&["Prefiere ignοrar", "Prefiere glaseado"]);
+        assert_eq!(
+            top(entries(&few, MemoryKind::Preference), 5, |e| e.score(NOW)).len(),
+            1
+        );
+        assert!(top(Vec::new(), 5, |e| e.score(NOW)).is_empty());
     }
 }

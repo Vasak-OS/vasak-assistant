@@ -1048,7 +1048,7 @@ mod truncation_tests {
 
 /// La lista blanca al escribir.
 #[cfg(test)]
-mod whitelist_tests {
+mod clean_note_tests {
     use super::*;
 
     fn parse_text(text: &str) -> Vec<String> {
