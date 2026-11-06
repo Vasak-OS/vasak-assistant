@@ -943,4 +943,33 @@ mod tests {
         );
         assert!(parse_chat(CHAT.as_bytes()).unwrap().remote_host.is_empty());
     }
+    #[tokio::test]
+    async fn el_estado_de_un_alias_rechazado_dice_que_no_es_local_y_vuelve_a_local_si_deja_de_serlo(
+    ) {
+        let remote = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = remote.clone();
+        let server = FakeServer::start(move |pedido| match pedido.path.as_str() {
+            "/api/tags" if flag.load(std::sync::atomic::Ordering::SeqCst) => {
+                Reply::json(&alias_tags())
+            }
+            "/api/tags" => Reply::json(r#"{"models":[{"name":"mio:latest"}]}"#),
+            "/api/chat" => Reply::json(CHAT),
+            _ => Reply::status(404),
+        })
+        .await;
+        let backend = configured_backend(&server, None, false);
+        assert!(backend.info().local, "antes de preguntar vale la dirección");
+
+        assert!(matches!(
+            backend.active_model().await,
+            Err(BackendError::NotAllowed(_))
+        ));
+        assert!(!backend.info().local, "el alias rechazado no es local");
+        assert_eq!(chats(&server), 0);
+
+        remote.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(backend.active_model().await.unwrap().local);
+        assert!(backend.info().local, "la lista ya no trae remote_host");
+        assert_eq!(chats(&server), 0);
+    }
 }

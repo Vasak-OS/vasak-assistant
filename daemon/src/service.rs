@@ -2676,18 +2676,39 @@ mod effective_model_tests {
     }
 
     #[tokio::test]
+    async fn un_remote_after_send_se_reintenta_sin_notas_y_no_se_aprende() {
+        let backend = ScriptedBackend::new(["Hola.", EXTRACTION]);
+        *backend.reject_local_only.lock() = Some(BackendError::RemoteAfterSend);
+        let rig = rig(backend.clone(), false).await;
+
+        chat(&rig, "prefiero el mate amargo, ¿qué tal?").await;
+
+        let seen = backend.seen.lock().clone();
+        assert_eq!(seen.len(), 1, "sólo el reintento: {seen:?}");
+        assert!(seen[0].iter().all(|m| m.role != Role::System));
+        assert!(!remembers(&rig, "mate amargo").await);
+    }
+
+    #[tokio::test]
     async fn con_allow_remote_una_respuesta_con_remote_host_se_reintenta_sin_notas_y_no_se_aprende()
     {
         use crate::test_support::{ollama_backend, FakeServer, Reply, REMOTE_HOST};
 
-        let chat = serde_json::json!({
-            "message": {"role": "assistant", "content": "Hola."},
+        // Cada pedido recibe un texto distinto: el primero, con `remote_host`,
+        // se descarta; el segundo es el que la persona tiene que ver.
+        let discarded = serde_json::json!({
+            "message": {"role": "assistant", "content": "Descartada."},
             "remote_host": REMOTE_HOST,
         })
         .to_string();
+        let accepted = r#"{"message":{"role":"assistant","content":"Segunda."}}"#;
+        let calls = std::sync::atomic::AtomicUsize::new(0);
         let server = FakeServer::start(move |pedido| match pedido.path.as_str() {
             "/api/tags" => Reply::json(r#"{"models":[{"name":"llama3.2:latest"}]}"#),
-            "/api/chat" => Reply::json(&chat),
+            "/api/chat" if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 => {
+                Reply::json(&discarded)
+            }
+            "/api/chat" => Reply::json(accepted),
             _ => Reply::status(404),
         })
         .await;
@@ -2702,7 +2723,7 @@ mod effective_model_tests {
             .unwrap();
         rig.service.memory.wait_until_idle().await;
 
-        assert_eq!(reply, "Hola.");
+        assert_eq!(reply, "Segunda.");
         let bodies: Vec<String> = server
             .captured()
             .iter()
@@ -2723,7 +2744,12 @@ mod effective_model_tests {
         );
         assert!(!bodies[1].contains("\"system\""), "{}", bodies[1]);
         assert!(!remembers(&rig, "mate amargo").await);
-        assert_eq!(rig.service.history_of(OWNER, &id).unwrap().len(), 2);
+        // El historial guarda la respuesta aceptada, no la descartada.
+        let history = rig.service.history_of(OWNER, &id).unwrap();
+        assert_eq!(history.len(), 2, "{history:?}");
+        assert_eq!(history[1].role, Role::Assistant);
+        assert_eq!(history[1].content, "Segunda.");
+        assert!(history.iter().all(|m| !m.content.contains("Descartada.")));
     }
 
     #[tokio::test]
@@ -4429,6 +4455,10 @@ mod owner_chat_limit_tests {
         assert!(matches!(
             to_dbus(BackendError::NotAllowed("en la nube".into())),
             Error::Unavailable(text) if text == "en la nube"
+        ));
+        assert!(matches!(
+            to_dbus(BackendError::RemoteAfterSend),
+            Error::Unavailable(text) if text == crate::backend::REMOTE_AFTER_SEND
         ));
         // El texto del cupo lleno en un `Unavailable` no es el cupo lleno.
         assert!(matches!(

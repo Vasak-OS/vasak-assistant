@@ -339,6 +339,7 @@ mod tests {
             (BackendError::Failed("b".into()), "b"),
             (BackendError::NotAllowed("c".into()), "c"),
             (BackendError::NotLocal, NOT_LOCAL),
+            (BackendError::RemoteAfterSend, REMOTE_AFTER_SEND),
             (BackendError::Busy, METADATA_BUSY),
         ] {
             assert_eq!(error.text(), text, "{error:?}");
@@ -711,6 +712,30 @@ mod log_tests {
         );
         assert!(l.contains("DEBUG"), "{l}");
         assert!(!log.text().contains(" WARN "), "{}", log.text());
+    }
+
+    #[tokio::test]
+    async fn un_remote_after_send_deja_una_advertencia_sin_contenido_ni_host() {
+        let inner = ScriptedBackend::new(["respuesta-canario-qzx"]);
+        *inner.reject_local_only.lock() = Some(BackendError::RemoteAfterSend);
+        let backend = Limited::new(inner);
+        let (log, _guard) = capture_logs();
+
+        let error = backend
+            .chat_local_only(&user("mensaje-canario-qzx"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, BackendError::RemoteAfterSend));
+        let l = line(
+            &log,
+            &[
+                "el modelo resultó remoto: se mandó y se descartó la respuesta",
+                "operation=\"chat_local_only\"",
+            ],
+        );
+        assert!(l.contains("WARN"), "{l}");
+        assert!(!log.text().contains("canario"), "{}", log.text());
     }
 
     #[tokio::test]
