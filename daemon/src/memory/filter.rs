@@ -1023,6 +1023,9 @@ mod marker_groups_tests {
             assert!(has_injection_markers(text), "raíz: {text}");
         }
         assert!(!has_injection_markers("designado"));
+        // La raíz tiene que estar al comienzo, no en medio de otra palabra.
+        assert!(!has_injection_markers("malignorado"));
+        assert!(!has_injection_markers("autoinstrucciones"));
         // Palabras enteras.
         for text in [
             "system", "systems", "sistema", "sistemas", "regla", "reglas", "prompt", "forget",
