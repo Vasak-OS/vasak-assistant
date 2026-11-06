@@ -1895,6 +1895,11 @@ mod gate_tests {
             (Some(&b"unconfined\0"[..]), false),
             (Some(&b" unconfined \0"[..]), false),
             (Some(CONFINED), true),
+            // Configuración no tiene perfil y no se exime: si algún día lo
+            // tiene, la excepción va por nombre exacto y con security.
+            (Some(&b"vasak-settings (enforce)\0"[..]), true),
+            (Some(&b"vasak-settings (complain)\0"[..]), true),
+            (Some(&b"/usr/bin/vasak-settings (enforce)\0"[..]), true),
             (Some(&b"vasak-appimage (enforce)"[..]), true),
             (Some(&b"docker-default (enforce)\0"[..]), true),
             (Some(&b"/usr/bin/firefox (complain)\0"[..]), true),
