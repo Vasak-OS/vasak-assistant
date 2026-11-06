@@ -1161,7 +1161,7 @@ mod inside_word_tests {
     fn cada_marcador_dentro_de_una_palabra_se_detecta_en_cualquier_posicion() {
         for marker in MARKER_INSIDE_WORD {
             for text in [
-                format!("{marker}"),
+                marker.to_string(),
                 format!("pre{marker}"),
                 format!("{marker}post"),
                 format!("pre_{marker}_post"),
