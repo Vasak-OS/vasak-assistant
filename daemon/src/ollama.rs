@@ -33,7 +33,7 @@ impl OllamaBackend {
         &self.selection.url
     }
 
-    async fn installed_models(&self) -> Result<Vec<String>, BackendError> {
+    async fn installed_models(&self) -> Result<Vec<TagsModel>, BackendError> {
         let response = self
             .client
             .get(http::endpoint(self.base(), "api/tags")?)
@@ -56,18 +56,21 @@ impl OllamaBackend {
         parse_tags(&http::read_capped(self.base(), response).await?)
     }
 
-    async fn resolve_model(&self) -> Result<String, BackendError> {
+    /// El modelo con el que responder y si corre fuera de la máquina.
+    async fn resolve_model(&self) -> Result<(String, bool), BackendError> {
         let installed = self.installed_models().await?;
-        let model = pick_model(self.selection.model.as_deref(), &installed)?;
-        // El modelo por omisión puede ser uno `cloud`: sale de la máquina, así
-        // que sin `allow_remote` no se usa. El configurado ya se filtró al
-        // elegir el backend (`select_backend`).
-        if !self.allow_remote && crate::config::is_ollama_cloud_model(&model) {
+        let names: Vec<String> = installed.iter().map(|row| row.name.clone()).collect();
+        let model = pick_model(self.selection.model.as_deref(), &names)?;
+        let remote = is_remote(&model, &installed);
+        // El modelo puede correr afuera aunque el nombre no lo diga (un alias
+        // de `ollama create` con `remote_host`), y el por omisión también:
+        // sin `allow_remote` no se usa. `select_backend` sólo vio el nombre.
+        if !self.allow_remote && remote {
             return Err(BackendError::NotAllowed(format!(
-                "El modelo «{model}» de Ollama corre en la nube: la conversación saldría de la máquina. Para usarlo hay que permitirlo con «allow_remote»."
+                "El modelo «{model}» de Ollama corre en la nube o en otro host: la conversación saldría de la máquina. Para usarlo hay que permitirlo con «allow_remote»."
             )));
         }
-        Ok(model)
+        Ok((model, remote))
     }
 
     /// Una sola resolución del modelo para decidir y mandar. Con
@@ -78,8 +81,8 @@ impl OllamaBackend {
         messages: &[Message],
         require_local: bool,
     ) -> Result<String, BackendError> {
-        let model = self.resolve_model().await?;
-        if require_local && !(self.info().local && !crate::config::is_ollama_cloud_model(&model)) {
+        let (model, remote) = self.resolve_model().await?;
+        if require_local && !(self.info().local && !remote) {
             return Err(BackendError::NotLocal);
         }
         let response = self
@@ -122,16 +125,19 @@ impl ModelBackend for OllamaBackend {
     }
 
     fn models(&self) -> BoxFuture<'_, Result<Vec<String>, BackendError>> {
-        Box::pin(self.installed_models())
+        Box::pin(async move {
+            let installed = self.installed_models().await?;
+            Ok(installed.into_iter().map(|row| row.name).collect())
+        })
     }
 
     fn active_model(&self) -> BoxFuture<'_, Result<ModelInfo, BackendError>> {
         Box::pin(async move {
-            let name = self.resolve_model().await?;
-            // Un modelo por omisión que resultó `cloud` no es local aunque la
-            // dirección sea el loopback: que el estado lo diga.
+            let (name, remote) = self.resolve_model().await?;
+            // Un modelo que corre afuera no es local aunque la dirección sea el
+            // loopback: que el estado lo diga.
             let mut info = self.info();
-            info.local = info.local && !crate::config::is_ollama_cloud_model(&name);
+            info.local = info.local && !remote;
             info.name = name;
             Ok(info)
         })
@@ -173,9 +179,14 @@ struct TagsResponse {
     models: Vec<TagsModel>,
 }
 
-#[derive(Deserialize)]
-struct TagsModel {
-    name: String,
+/// Una fila de `/api/tags`. Ollama manda `remote_host` (con `omitempty`) en
+/// los modelos que corren en otro host: los `:cloud` y los alias que
+/// `ollama create` deja apuntando a uno.
+#[derive(Debug, Deserialize)]
+pub struct TagsModel {
+    pub name: String,
+    #[serde(default)]
+    pub remote_host: String,
 }
 
 /// La respuesta de `/api/chat`: el texto del modelo.
@@ -185,23 +196,36 @@ pub fn parse_chat(body: &[u8]) -> Result<String, BackendError> {
         .map_err(|_| BackendError::Failed("respuesta de Ollama ilegible".into()))
 }
 
-/// La respuesta de `/api/tags`: los nombres de los modelos instalados.
-pub fn parse_tags(body: &[u8]) -> Result<Vec<String>, BackendError> {
+/// La respuesta de `/api/tags`: los modelos instalados.
+pub fn parse_tags(body: &[u8]) -> Result<Vec<TagsModel>, BackendError> {
     serde_json::from_slice::<TagsResponse>(body)
-        .map(|tags| tags.models.into_iter().map(|model| model.name).collect())
+        .map(|tags| tags.models)
         .map_err(|_| BackendError::Failed("lista de modelos ilegible".into()))
+}
+
+/// Si `model` corre fuera de la máquina: por el nombre (`:cloud`/`-cloud`, que
+/// el servidor manda a ollama.com aunque no figure en la lista) o porque su
+/// fila trae `remote_host`. Falla cerrado: un modelo sin fila cuenta como remoto.
+pub fn is_remote(model: &str, installed: &[TagsModel]) -> bool {
+    crate::config::is_ollama_cloud_model(model)
+        || installed
+            .iter()
+            .find(|row| row.name == model)
+            .is_none_or(|row| !row.remote_host.is_empty())
 }
 
 /// Con qué modelo responder. Si hay uno configurado tiene que estar instalado;
 /// Ollama le agrega `:latest` al nombre sin etiqueta, así que `llama3.2`
 /// encuentra a `llama3.2:latest`. Si no hay ninguno configurado, el primero
-/// instalado.
+/// instalado. Un `:cloud`/`-cloud` configurado se usa aunque no figure: el
+/// servidor lo resuelve contra ollama.com sin haber bajado nada.
 pub fn pick_model(configured: Option<&str>, installed: &[String]) -> Result<String, BackendError> {
     match configured {
         Some(wanted) => installed
             .iter()
             .find(|name| *name == wanted || name.strip_suffix(":latest") == Some(wanted))
             .cloned()
+            .or_else(|| crate::config::is_ollama_cloud_model(wanted).then(|| wanted.to_owned()))
             .ok_or_else(|| model_missing(wanted)),
         None => installed.first().cloned().ok_or_else(|| {
             BackendError::Unavailable(
@@ -350,10 +374,12 @@ mod tests {
 
     #[test]
     fn parse_tags_lee_los_nombres_y_rechaza_lo_ilegible() {
-        assert_eq!(
-            parse_tags(TAGS.as_bytes()).unwrap(),
-            ["llama3.2:latest", "qwen2.5:7b"]
-        );
+        let names: Vec<_> = parse_tags(TAGS.as_bytes())
+            .unwrap()
+            .into_iter()
+            .map(|row| row.name)
+            .collect();
+        assert_eq!(names, ["llama3.2:latest", "qwen2.5:7b"]);
         assert!(matches!(
             parse_tags(b"no es json"),
             Err(BackendError::Failed(_))

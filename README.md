@@ -66,6 +66,15 @@ elegido; si no, queda no disponible con el motivo. `Status` informa en
 `model.local` y `model.host` si la conversación sale de la máquina y hacia
 dónde.
 
+Con Ollama, además, un modelo puede correr fuera de la máquina aunque se le
+hable al Ollama local, y cuenta como **remoto**: si su fila de `/api/tags` trae
+`remote_host` (los `:cloud` y los alias que `ollama create` deja apuntando a
+uno, con un nombre cualquiera) o si el nombre termina en `:cloud` o `-cloud`,
+figure o no en la lista. Se decide en cada pedido con esa lista: si Ollama no
+la da, no se manda nada, y un modelo que no figura en ella sólo se usa si es
+`:cloud`/`-cloud`, como remoto. Al arrancar, con la configuración sola, sólo
+se ve el nombre.
+
 **La clave del proveedor nunca va en la configuración.** Se lee de
 `vasak-keyring` (el Secret Service de la sesión), del ítem con los atributos
 `service=ar.net.vasak.os.Assistant`, `url=` la dirección base terminada en `/`,
@@ -199,8 +208,8 @@ systemd, `$STATE_DIRECTORY`). No va en el almacén de cuentas.
   `assistant` de `vasak.conf`; si no, `MemoryStatus` dice «La memoria no se
   comparte con un proveedor remoto». Se decide en cada pedido con el modelo que
   de verdad va a responder: sin modelo configurado, Ollama toma el primero
-  instalado, y si es uno `:cloud` cuenta como remoto aunque se le hable al
-  Ollama local.
+  instalado, y si corre afuera (`remote_host` en `/api/tags`, o `:cloud`)
+  cuenta como remoto aunque se le hable al Ollama local.
 
 | Método | Qué hace |
 |---|---|

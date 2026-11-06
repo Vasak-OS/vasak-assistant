@@ -213,7 +213,10 @@ pub fn select_backend(settings: &Settings) -> Result<Selection, Rejection> {
 }
 
 /// Un modelo de Ollama con sufijo `:cloud` o `-cloud` corre en ollama.com
-/// aunque se le hable al Ollama local: su conversación sale de la máquina. Sin
+/// aunque se le hable al Ollama local: su conversación sale de la máquina.
+/// Es sólo lo que dice el nombre, lo único que hay al leer la configuración:
+/// un alias sin sufijo lo detecta el backend por `remote_host`
+/// ([`crate::ollama::is_remote`]) en cada pedido. Sin
 /// distinguir mayúsculas: el gate decide si la conversación sale de la caja, no
 /// se apoya en que Ollama normalice los nombres.
 pub fn is_ollama_cloud_model(model: &str) -> bool {

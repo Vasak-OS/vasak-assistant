@@ -2,6 +2,23 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-assistant 0.3.9
+
+Un modelo de Ollama que corre afuera se reconoce por `remote_host`, no sólo
+por el nombre (#23).
+
+- **`daemon`** — un alias de `ollama create` (`FROM gpt-oss:120b-cloud`, o con
+  `remote_host`) corre en la nube con un nombre sin sufijo, y se trataba como
+  local: la conversación y la memoria salían de la máquina sin `allow_remote`
+  ni `share_memory_with_remote`. Ahora el modelo efectivo es remoto si su fila
+  de `/api/tags` trae `remote_host`, o si el nombre termina en `:cloud` o
+  `-cloud`. Vale para el chat, `chat_local_only`, la puerta de la memoria y
+  `model.local` de `Status`.
+- **`daemon`** — falla cerrado: sin `/api/tags` no se manda nada, y un modelo
+  que no figura en la lista cuenta como remoto. Un `:cloud`/`-cloud`
+  configurado se usa aunque no figure (el servidor lo resuelve contra
+  ollama.com sin haberlo bajado), como remoto.
+
 ## vasak-assistant 0.3.7
 
 La puerta de AppArmor alcanza a `MemoryStatus` y los errores del backend dejan
