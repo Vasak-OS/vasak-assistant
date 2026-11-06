@@ -17,6 +17,9 @@ de reconocerse por el texto (#22, #24).
 - **`daemon`** — con el modelo por omisión de Ollama en la nube y sin
   `allow_remote`, `MemoryStatus` dice «El modelo no está permitido: corre en la
   nube y falta «allow_remote»» en lugar de «El modelo no responde» (#24).
+  También con `share_memory_with_remote`: antes ese caso la daba por
+  disponible aunque el chat rechazara el modelo; ahora siempre se mira el
+  modelo efectivo, y si no responde, «El modelo no responde».
 - **`daemon`** — `BackendError` suma `NotAllowed`, `NotLocal` y `Busy`: el
   rechazo de `chat_local_only` y el cupo de modelos lleno ya no se reconocen
   comparando el texto del error. En el bus no cambia nada (#24).

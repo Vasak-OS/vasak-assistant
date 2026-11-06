@@ -355,12 +355,14 @@ impl AssistantService {
 
 impl AssistantService {
     /// El estado de la memoria con la misma puerta que los pedidos: si está
-    /// disponible pero el modelo efectivo es remoto sin permiso, no lo está.
+    /// disponible, se mira el modelo efectivo. Remoto sin
+    /// `share_memory_with_remote`, no permitido por la configuración (aunque se
+    /// comparta: el chat igual lo rechaza) o sin respuesta, no lo está.
     pub async fn memory_status_now(&self) -> MemoryStatus {
         let mut status = self.memory.status().await;
-        if status.available && !self.memory.shares_with_remote() {
+        if status.available {
             let reason = match self.backend.active_model().await {
-                Ok(model) if model.local => None,
+                Ok(model) if model.local || self.memory.shares_with_remote() => None,
                 Ok(_) => Some(crate::memory::REASON_REMOTE),
                 Err(BackendError::NotAllowed(_)) => Some(crate::memory::REASON_MODEL_NOT_ALLOWED),
                 Err(_) => Some(crate::memory::REASON_MODEL_UNREACHABLE),
@@ -2615,16 +2617,15 @@ mod effective_model_tests {
         assert_eq!(status.reason, REASON_MODEL_UNREACHABLE);
         assert_ne!(REASON_MODEL_UNREACHABLE, REASON_REMOTE);
 
-        // Con permiso para compartir, ni la nube ni el silencio la apagan.
+        // Con permiso para compartir, la nube no la apaga; el silencio sí.
+        let shared = rig(ScriptedBackend::cloud_by_default([]), true).await;
+        assert!(shared.service.memory_status_now().await.available);
         let mut fake = FakeBackend::replying("");
         fake.active_result = Err(crate::backend::BackendError::Unavailable("apagado".into()));
-        for backend in [
-            Arc::new(fake) as Arc<dyn ModelBackend>,
-            ScriptedBackend::cloud_by_default([]),
-        ] {
-            let shared = rig(backend, true).await;
-            assert!(shared.service.memory_status_now().await.available);
-        }
+        let shared = rig(Arc::new(fake), true).await;
+        let status = shared.service.memory_status_now().await;
+        assert!(!status.available && status.enabled);
+        assert_eq!(status.reason, REASON_MODEL_UNREACHABLE);
 
         // Apagada, el motivo sigue siendo el de apagada.
         let off = rig(ScriptedBackend::cloud_by_default([]), false).await;
