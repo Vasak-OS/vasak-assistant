@@ -2627,6 +2627,40 @@ mod effective_model_tests {
     }
 
     #[tokio::test]
+    async fn un_alias_con_remote_host_y_allow_remote_sin_compartir_no_ve_la_memoria() {
+        use crate::ollama::OllamaBackend;
+        use crate::test_support::{client, FakeServer, Reply};
+
+        let server = FakeServer::start(|pedido| match pedido.path.as_str() {
+            "/api/tags" => Reply::json(
+                r#"{"models":[{"name":"mio:latest","remote_host":"https://ollama.com:443"}]}"#,
+            ),
+            "/api/chat" => Reply::json(r#"{"message":{"role":"assistant","content":"Hola."}}"#),
+            _ => Reply::status(404),
+        })
+        .await;
+        let selection = crate::config::select_backend(&crate::config::Settings {
+            backend: Some("ollama".into()),
+            url: Some(server.url("")),
+            model: None,
+            allow_remote: true,
+            share_memory_with_remote: false,
+        })
+        .unwrap_or_else(|rejection| panic!("{}", rejection.reason));
+        let ollama = Arc::new(Limited::new(Arc::new(OllamaBackend::new(
+            client(),
+            selection,
+            true,
+        ))));
+        let rig = rig(ollama.clone(), false).await;
+
+        assert!(!rig.service.memory.allowed_for(&*ollama).await);
+        let status = rig.service.memory_status_now().await;
+        assert!(!status.available && status.enabled, "{status:?}");
+        assert_eq!(status.reason, REASON_REMOTE);
+    }
+
+    #[tokio::test]
     async fn compartiendo_con_remotos_un_modelo_remoto_que_responde_sigue_disponible() {
         let rig = rig(ScriptedBackend::cloud_by_default([]), true).await;
 

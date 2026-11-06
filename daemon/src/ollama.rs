@@ -631,4 +631,189 @@ mod tests {
         assert!(matches!(error, BackendError::NotLocal), "{error:?}");
         assert_eq!(chats(&server), 0);
     }
+
+    // ── #23: remoto por `remote_host`, por nombre o por no figurar ────────────
+
+    const ALIAS_TAGS: &str =
+        r#"{"models":[{"name":"mio:latest","remote_host":"https://ollama.com:443"}]}"#;
+
+    /// Un Ollama con estas filas de `/api/tags` que contesta el chat.
+    async fn ollama_with_tags(tags: &'static str) -> FakeServer {
+        FakeServer::start(move |pedido| match pedido.path.as_str() {
+            "/api/tags" => Reply::json(tags),
+            "/api/chat" => Reply::json(CHAT),
+            _ => Reply::status(404),
+        })
+        .await
+    }
+
+    /// Como `cloud_backend`, con un modelo configurado. La selección se acepta
+    /// con `allow_remote` (el arranque no mira la red); el backend recibe el suyo.
+    fn configured_backend(
+        server: &FakeServer,
+        model: Option<&str>,
+        allow_remote: bool,
+    ) -> OllamaBackend {
+        let selection = crate::config::select_backend(&crate::config::Settings {
+            backend: Some("ollama".into()),
+            url: Some(server.url("")),
+            model: model.map(str::to_owned),
+            allow_remote: true,
+            share_memory_with_remote: false,
+        })
+        .unwrap_or_else(|rejection| panic!("{}", rejection.reason));
+        OllamaBackend::new(client(), selection, allow_remote)
+    }
+
+    #[tokio::test]
+    async fn un_alias_sin_sufijo_con_remote_host_sin_allow_remote_no_se_usa_ni_manda_nada() {
+        for model in [None, Some("mio"), Some("mio:latest")] {
+            let server = ollama_with_tags(ALIAS_TAGS).await;
+            let backend = configured_backend(&server, model, false);
+
+            assert!(
+                matches!(
+                    backend.active_model().await,
+                    Err(BackendError::NotAllowed(_))
+                ),
+                "{model:?}"
+            );
+            assert!(
+                matches!(
+                    backend.chat(&[user("hola")]).await,
+                    Err(BackendError::NotAllowed(_))
+                ),
+                "{model:?}"
+            );
+            assert_eq!(chats(&server), 0, "{model:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn un_alias_con_remote_host_y_allow_remote_es_remoto_chatea_pero_no_sale_por_chat_local_only(
+    ) {
+        for model in [None, Some("mio"), Some("mio:latest")] {
+            let server = ollama_with_tags(ALIAS_TAGS).await;
+            let backend = configured_backend(&server, model, true);
+
+            let active = backend.active_model().await.unwrap();
+            assert_eq!(active.name, "mio:latest", "{model:?}");
+            assert!(!active.local, "{model:?}");
+
+            let error = backend.chat_local_only(&[user("hola")]).await.unwrap_err();
+            assert!(
+                matches!(error, BackendError::NotLocal),
+                "{model:?}: {error:?}"
+            );
+            assert_eq!(chats(&server), 0, "{model:?}");
+
+            backend.chat(&[user("hola")]).await.unwrap();
+            assert_eq!(chats(&server), 1, "{model:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn un_remote_host_vacio_o_ausente_es_un_modelo_local() {
+        for tags in [
+            r#"{"models":[{"name":"mio:latest","remote_host":""}]}"#,
+            r#"{"models":[{"name":"mio:latest"}]}"#,
+        ] {
+            let server = ollama_with_tags(tags).await;
+            let backend = configured_backend(&server, None, false);
+
+            assert!(backend.active_model().await.unwrap().local, "{tags}");
+            backend.chat_local_only(&[user("hola")]).await.unwrap();
+            assert_eq!(chats(&server), 1, "{tags}");
+        }
+    }
+
+    #[tokio::test]
+    async fn un_cloud_configurado_que_no_figura_en_la_lista_es_remoto() {
+        let server = ollama_with_tags(TAGS).await;
+
+        let sin_permiso = configured_backend(&server, Some("qwen3:cloud"), false);
+        assert!(matches!(
+            sin_permiso.active_model().await,
+            Err(BackendError::NotAllowed(_))
+        ));
+        assert!(matches!(
+            sin_permiso.chat(&[user("hola")]).await,
+            Err(BackendError::NotAllowed(_))
+        ));
+
+        let con_permiso = configured_backend(&server, Some("qwen3:cloud"), true);
+        let active = con_permiso.active_model().await.unwrap();
+        assert_eq!(active.name, "qwen3:cloud");
+        assert!(!active.local);
+        assert!(matches!(
+            con_permiso.chat_local_only(&[user("hola")]).await,
+            Err(BackendError::NotLocal)
+        ));
+        assert_eq!(chats(&server), 0);
+    }
+
+    #[tokio::test]
+    async fn un_nombre_que_no_figura_y_no_es_cloud_sigue_siendo_no_disponible() {
+        let server = ollama_with_tags(TAGS).await;
+        let backend = configured_backend(&server, Some("fantasma"), true);
+
+        assert!(matches!(
+            backend.active_model().await,
+            Err(BackendError::Unavailable(_))
+        ));
+        assert_eq!(chats(&server), 0);
+    }
+
+    #[tokio::test]
+    async fn con_la_lista_de_modelos_caida_ilegible_o_con_remote_host_que_no_es_texto_no_sale_nada()
+    {
+        async fn caida(allow_remote: bool) -> (FakeServer, OllamaBackend) {
+            let server = FakeServer::start(|pedido| match pedido.path.as_str() {
+                "/api/tags" => Reply::status(503),
+                _ => Reply::json(CHAT),
+            })
+            .await;
+            let backend = configured_backend(&server, None, allow_remote);
+            (server, backend)
+        }
+
+        let (server, backend) = caida(true).await;
+        assert!(backend.chat(&[user("hola")]).await.is_err());
+        assert!(backend.chat_local_only(&[user("hola")]).await.is_err());
+        assert_eq!(chats(&server), 0);
+
+        for tags in [
+            "no es json",
+            r#"{"models":[{"name":"mio:latest","remote_host":42}]}"#,
+            r#"{"models":[{"name":"mio:latest","remote_host":null}]}"#,
+        ] {
+            let server = ollama_with_tags(tags).await;
+            let backend = configured_backend(&server, None, true);
+            assert!(backend.chat(&[user("hola")]).await.is_err(), "{tags}");
+            assert!(
+                backend.chat_local_only(&[user("hola")]).await.is_err(),
+                "{tags}"
+            );
+            assert_eq!(chats(&server), 0, "{tags}");
+        }
+    }
+
+    #[test]
+    fn is_remote_sin_fila_falla_cerrado_y_el_sufijo_cloud_cuenta_con_mayusculas() {
+        let installed = vec![
+            TagsModel {
+                name: "local:latest".into(),
+                remote_host: String::new(),
+            },
+            TagsModel {
+                name: "alias:latest".into(),
+                remote_host: "https://ollama.com:443".into(),
+            },
+        ];
+        assert!(!is_remote("local:latest", &installed));
+        assert!(is_remote("alias:latest", &installed));
+        assert!(is_remote("desconocido:1b", &installed));
+        assert!(is_remote("Qwen3:Cloud", &[]));
+        assert!(is_remote("Qwen3:Cloud", &installed));
+    }
 }
