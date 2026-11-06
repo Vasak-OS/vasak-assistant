@@ -30,7 +30,7 @@ use vasak_assistant_protocol::{
     DOMAIN_REMOTE_BACKENDS,
 };
 
-use crate::backend::{is_not_local, BackendError, BoxFuture, ModelBackend};
+use crate::backend::{BackendError, BoxFuture, ModelBackend};
 use crate::config::{is_local, normalize_url};
 use crate::conversations::Conversations;
 use crate::keyring::{ApiKey, SecretSource};
@@ -125,10 +125,26 @@ impl AssistantService {
 
     /// Las capacidades sobre cada dominio. Las de datos del usuario no están
     /// en esta fase: se dicen no disponibles, nunca rotas. `memory`, según la
-    /// memoria esté encendida y abierta.
-    async fn capabilities(&self, #[zbus(header)] header: Header<'_>) -> Vec<Capability> {
+    /// memoria esté encendida y abierta; a un llamador confinado, no
+    /// disponible con un motivo fijo, sin abrir la base ni preguntar al
+    /// llavero: si no, sabría si está encendida y cómo está el llavero.
+    async fn capabilities(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> Vec<Capability> {
         let call = Call::new("Capabilities", &header);
-        let all = capabilities(self.remote_allowed, &self.memory_status_now().await);
+        let memory = if self.confined(connection, &header).await {
+            MemoryStatus {
+                enabled: false,
+                available: false,
+                reason: crate::memory::REASON_CONFINED.to_owned(),
+                bytes: 0,
+            }
+        } else {
+            self.memory_status_now().await
+        };
+        let all = capabilities(self.remote_allowed, &memory);
         call.done();
         all
     }
@@ -255,12 +271,21 @@ impl AssistantService {
         call.finish(result)
     }
 
-    /// Cómo está la memoria. Nunca falla: el problema va en el motivo.
-    async fn memory_status(&self, #[zbus(header)] header: Header<'_>) -> MemoryStatus {
+    /// Cómo está la memoria. Fuera de la puerta no falla: el problema va en el
+    /// motivo. `AccessDenied` para un llamador confinado: lo que ocupa crece
+    /// con el uso y deja inferir cuánto se usa el asistente (#22).
+    async fn memory_status(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> Result<MemoryStatus, Error> {
         let call = Call::new("MemoryStatus", &header);
-        let status = self.memory_status_now().await;
-        call.done();
-        status
+        let result = async {
+            self.deny_confined(connection, &header).await?;
+            Ok(self.memory_status_now().await)
+        }
+        .await;
+        call.finish(result)
     }
 
     /// Enciende o apaga la memoria. Encender reabre la base que haya (o la
@@ -330,13 +355,16 @@ impl AssistantService {
 
 impl AssistantService {
     /// El estado de la memoria con la misma puerta que los pedidos: si está
-    /// disponible pero el modelo efectivo es remoto sin permiso, no lo está.
+    /// disponible, se mira el modelo efectivo. Remoto sin
+    /// `share_memory_with_remote`, no permitido por la configuración (aunque se
+    /// comparta: el chat igual lo rechaza) o sin respuesta, no lo está.
     pub async fn memory_status_now(&self) -> MemoryStatus {
         let mut status = self.memory.status().await;
-        if status.available && !self.memory.shares_with_remote() {
+        if status.available {
             let reason = match self.backend.active_model().await {
-                Ok(model) if model.local => None,
+                Ok(model) if model.local || self.memory.shares_with_remote() => None,
                 Ok(_) => Some(crate::memory::REASON_REMOTE),
+                Err(BackendError::NotAllowed(_)) => Some(crate::memory::REASON_MODEL_NOT_ALLOWED),
                 Err(_) => Some(crate::memory::REASON_MODEL_UNREACHABLE),
             };
             if let Some(reason) = reason {
@@ -404,7 +432,7 @@ impl AssistantService {
             },
             Err(error) => ServiceStatus {
                 backend_available: false,
-                reason: reason(&error).to_owned(),
+                reason: error.text().to_owned(),
                 model: self.backend.info(),
                 conversations,
             },
@@ -486,7 +514,7 @@ impl AssistantService {
                     // se reintenta sin notas (la persona igual tiene respuesta,
                     // y la conversación ya podía ir a ese modelo) y ese turno
                     // no se aprende.
-                    Err(error) if is_not_local(&error) => {
+                    Err(BackendError::NotLocal) => {
                         use_memory = false;
                         self.backend.chat(&context).await
                     }
@@ -660,18 +688,13 @@ pub fn capabilities(remote_allowed: bool, memory: &MemoryStatus) -> Vec<Capabili
         .collect()
 }
 
-fn reason(error: &BackendError) -> &str {
-    match error {
-        BackendError::Unavailable(text) | BackendError::Failed(text) => text,
-    }
-}
-
 pub fn to_dbus(error: BackendError) -> Error {
     match error {
-        BackendError::Unavailable(text) if text == crate::backend::METADATA_BUSY => {
-            Error::Busy(text)
+        BackendError::Busy => Error::Busy(error.text().to_owned()),
+        BackendError::NotLocal => Error::Unavailable(error.text().to_owned()),
+        BackendError::Unavailable(text) | BackendError::NotAllowed(text) => {
+            Error::Unavailable(text)
         }
-        BackendError::Unavailable(text) => Error::Unavailable(text),
         BackendError::Failed(text) => Error::Backend(text),
     }
 }
@@ -789,9 +812,7 @@ mod tests {
             BackendError::Unavailable("no hay modelo".into()),
             BackendError::Failed("respuesta rota".into()),
         ] {
-            let texto = match &error {
-                BackendError::Unavailable(t) | BackendError::Failed(t) => t.clone(),
-            };
+            let texto = error.text().to_owned();
             let mut backend = FakeBackend::replying("");
             backend.active_result = Err(error);
             let status = service(backend, false).status_for(OWNER).await;
@@ -1678,6 +1699,7 @@ mod memory_tests {
             seen: parking_lot::Mutex::default(),
             local: false,
             effective_local: None,
+            reject_local_only: parking_lot::Mutex::default(),
         });
         let remote =
             Memory::new(Some(world.tmp.memory_dir()), world.keys.clone()).with_remote_blocked(true);
@@ -1875,6 +1897,11 @@ mod gate_tests {
             (Some(&b"unconfined\0"[..]), false),
             (Some(&b" unconfined \0"[..]), false),
             (Some(CONFINED), true),
+            // Configuración no tiene perfil y no se exime: si algún día lo
+            // tiene, la excepción va por nombre exacto y con security.
+            (Some(&b"vasak-settings (enforce)\0"[..]), true),
+            (Some(&b"vasak-settings (complain)\0"[..]), true),
+            (Some(&b"/usr/bin/vasak-settings (enforce)\0"[..]), true),
             (Some(&b"vasak-appimage (enforce)"[..]), true),
             (Some(&b"docker-default (enforce)\0"[..]), true),
             (Some(&b"/usr/bin/firefox (complain)\0"[..]), true),
@@ -1992,6 +2019,21 @@ mod gate_tests {
     }
 
     #[tokio::test]
+    async fn un_llamador_confinado_no_puede_preguntar_el_estado_de_la_memoria() {
+        for (name, label) in labels() {
+            let gate = gate(label, []).await;
+            gate.memory.set_enabled(true).await.unwrap();
+
+            denied(gate.proxy.memory_status().await);
+
+            assert!(
+                *gate.label.asked.lock() >= 1,
+                "{name}: se preguntó la etiqueta"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn un_llamador_confinado_no_guarda_ni_consulta_claves_del_proveedor() {
         for (name, label) in labels() {
             let gate = gate(label, []).await;
@@ -2013,7 +2055,7 @@ mod gate_tests {
     }
 
     #[tokio::test]
-    async fn sin_etiqueta_o_unconfined_los_cuatro_metodos_funcionan() {
+    async fn sin_etiqueta_o_unconfined_los_cinco_metodos_funcionan() {
         for (name, label) in [
             ("sin AppArmor", FixedLabel::none()),
             ("unconfined", FixedLabel::of(b"unconfined\0")),
@@ -2031,10 +2073,12 @@ mod gate_tests {
                 .has_provider_key("https://api.openai.com/v1")
                 .await
                 .unwrap());
+            let status = gate.proxy.memory_status().await.unwrap();
+            assert!(status.enabled && status.available, "{name}");
             gate.proxy.clear_memory().await.unwrap();
             gate.proxy.set_memory_enabled(false).await.unwrap();
             assert!(!gate.memory.status().await.enabled, "{name}");
-            assert!(*gate.label.asked.lock() >= 5, "se pregunta en cada pedido");
+            assert!(*gate.label.asked.lock() >= 6, "se pregunta en cada pedido");
         }
     }
 
@@ -2043,21 +2087,124 @@ mod gate_tests {
         let gate = gate(FixedLabel::of(CONFINED), []).await;
         gate.memory.set_enabled(true).await.unwrap();
 
-        let status = gate.proxy.memory_status().await.unwrap();
-        assert!(status.enabled && status.available);
+        // `MemoryStatus` ya no: da `AccessDenied` a un confinado (#22).
+        // `Capabilities` sigue abierto, pero no le cuenta cómo está la memoria.
         let capabilities = gate.proxy.capabilities().await.unwrap();
-        assert!(
-            capabilities
-                .iter()
-                .find(|c| c.domain == DOMAIN_MEMORY)
-                .unwrap()
-                .available
-        );
+        let memory = capabilities
+            .iter()
+            .find(|c| c.domain == DOMAIN_MEMORY)
+            .unwrap();
+        assert!(!memory.available);
+        assert_eq!(memory.reason, crate::memory::REASON_CONFINED);
         let id = gate.proxy.new_conversation().await.unwrap();
         gate.proxy.conversations().await.unwrap();
         gate.proxy.status().await.unwrap();
         gate.proxy.history(&id).await.unwrap();
         gate.proxy.delete_conversation(&id).await.unwrap();
+    }
+
+    fn memory_capability(capabilities: &[Capability]) -> &Capability {
+        capabilities
+            .iter()
+            .find(|c| c.domain == DOMAIN_MEMORY)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sin_confinar_y_con_la_memoria_encendida_las_capacidades_dicen_que_esta_disponible() {
+        for (name, label) in [
+            ("sin AppArmor", FixedLabel::none()),
+            ("unconfined", FixedLabel::of(b"unconfined\0")),
+        ] {
+            let gate = gate(label, []).await;
+            gate.memory.set_enabled(true).await.unwrap();
+
+            let capabilities = gate.proxy.capabilities().await.unwrap();
+
+            let memory = memory_capability(&capabilities);
+            assert!(memory.available, "{name}: {memory:?}");
+            assert_ne!(memory.reason, crate::memory::REASON_CONFINED, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_un_confinado_las_capacidades_no_le_consultan_el_llavero_ni_dicen_si_esta_encendida()
+    {
+        for (name, label) in labels() {
+            for enabled in [true, false] {
+                for unreachable in [false, true] {
+                    let gate = gate(label.clone(), []).await;
+                    if enabled {
+                        gate.memory.set_enabled(true).await.unwrap();
+                    }
+                    *gate.keys.unreachable.lock() = unreachable;
+                    let calls = gate.keys.calls.lock().len();
+
+                    let capabilities = gate.proxy.capabilities().await.unwrap();
+
+                    let memory = memory_capability(&capabilities);
+                    let caso = format!("{name}, encendida={enabled}, llavero caído={unreachable}");
+                    assert!(!memory.available, "{caso}");
+                    assert_eq!(memory.reason, crate::memory::REASON_CONFINED, "{caso}");
+                    assert_eq!(
+                        gate.keys.calls.lock().len(),
+                        calls,
+                        "{caso}: tocó el llavero"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn compartiendo_con_remotos_un_modelo_cloud_sin_allow_remote_sigue_no_disponible_por_el_bus(
+    ) {
+        use crate::ollama::OllamaBackend;
+        use crate::test_support::{client, local_selection, FakeServer, Reply};
+
+        let server = FakeServer::start(|pedido| match pedido.path.as_str() {
+            "/api/tags" => Reply::json(r#"{"models":[{"name":"gpt-oss:120b-cloud"}]}"#),
+            _ => Reply::status(404),
+        })
+        .await;
+        let ollama = OllamaBackend::new(
+            client(),
+            local_selection("ollama", &server.url(""), None),
+            false,
+        );
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        let memory = Arc::new(
+            Memory::new(Some(tmp.memory_dir()), keys.clone()).with_share_with_remote(true),
+        );
+        memory.set_enabled(true).await.unwrap();
+        let service = AssistantService {
+            backend: Arc::new(crate::backend::Limited::new(Arc::new(ollama))),
+            conversations: Arc::default(),
+            remote_allowed: false,
+            secrets: keys,
+            memory,
+            labels: FixedLabel::none(),
+        };
+        let (_server, client) = crate::test_support::p2p_pair_as(":1.1", |builder| {
+            builder.serve_at(SERVICE_PATH, service)
+        })
+        .await
+        .unwrap();
+        let proxy = AssistantProxy::builder(&client)
+            .path(SERVICE_PATH)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let status = proxy.memory_status().await.unwrap();
+        assert!(!status.available && status.enabled, "{status:?}");
+        assert_eq!(status.reason, crate::memory::REASON_MODEL_NOT_ALLOWED);
+        let capabilities = proxy.capabilities().await.unwrap();
+        let memory = memory_capability(&capabilities);
+        assert!(!memory.available, "{memory:?}");
+        assert_eq!(memory.reason, crate::memory::REASON_MODEL_NOT_ALLOWED);
     }
 
     fn remembered() -> Extraction {
@@ -2337,7 +2484,7 @@ mod effective_model_tests {
     // ── La carrera entre la puerta y el envío ─────────────────────────────────
 
     use crate::backend::Limited;
-    use crate::memory::REASON_MODEL_UNREACHABLE;
+    use crate::memory::{REASON_MODEL_NOT_ALLOWED, REASON_MODEL_UNREACHABLE};
     use crate::test_support::FlippingBackend;
 
     /// El modelo se resuelve local en la puerta y `:cloud` al mandar el chat.
@@ -2444,6 +2591,106 @@ mod effective_model_tests {
     }
 
     #[tokio::test]
+    async fn un_modelo_no_permitido_da_su_propio_motivo_y_no_el_de_que_no_responde() {
+        let mut fake = FakeBackend::replying("");
+        fake.active_result = Err(BackendError::NotAllowed("no permitido".into()));
+        let rig = rig(Arc::new(fake), false).await;
+
+        let status = rig.service.memory_status_now().await;
+
+        assert!(!status.available && status.enabled, "{status:?}");
+        assert_eq!(status.reason, REASON_MODEL_NOT_ALLOWED);
+        assert_ne!(REASON_MODEL_NOT_ALLOWED, REASON_MODEL_UNREACHABLE);
+    }
+
+    #[tokio::test]
+    async fn compartiendo_con_remotos_un_modelo_cloud_sin_allow_remote_no_esta_disponible() {
+        use crate::ollama::OllamaBackend;
+        use crate::test_support::{client, local_selection, FakeServer, Reply};
+
+        let server = FakeServer::start(|pedido| match pedido.path.as_str() {
+            "/api/tags" => Reply::json(r#"{"models":[{"name":"gpt-oss:120b-cloud"}]}"#),
+            _ => Reply::status(404),
+        })
+        .await;
+        let ollama = OllamaBackend::new(
+            client(),
+            local_selection("ollama", &server.url(""), None),
+            false,
+        );
+        let rig = rig(Arc::new(Limited::new(Arc::new(ollama))), true).await;
+
+        let status = rig.service.memory_status_now().await;
+
+        assert!(!status.available && status.enabled, "{status:?}");
+        assert_eq!(status.reason, REASON_MODEL_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn compartiendo_con_remotos_un_modelo_remoto_que_responde_sigue_disponible() {
+        let rig = rig(ScriptedBackend::cloud_by_default([]), true).await;
+
+        let status = rig.service.memory_status_now().await;
+
+        assert!(status.available && status.reason.is_empty(), "{status:?}");
+    }
+
+    #[tokio::test]
+    async fn compartiendo_con_remotos_un_backend_caido_da_el_motivo_de_que_no_responde() {
+        let mut fake = FakeBackend::replying("");
+        fake.active_result = Err(BackendError::Failed("caído".into()));
+        let rig = rig(Arc::new(fake), true).await;
+
+        let status = rig.service.memory_status_now().await;
+
+        assert!(!status.available && status.enabled, "{status:?}");
+        assert_eq!(status.reason, REASON_MODEL_UNREACHABLE);
+    }
+
+    #[tokio::test]
+    async fn un_ollama_con_modelo_por_omision_cloud_sin_allow_remote_explica_el_motivo_en_el_estado(
+    ) {
+        use crate::ollama::OllamaBackend;
+        use crate::test_support::{client, local_selection, FakeServer, Reply};
+
+        let server = FakeServer::start(|pedido| match pedido.path.as_str() {
+            "/api/tags" => Reply::json(r#"{"models":[{"name":"gpt-oss:120b-cloud"}]}"#),
+            _ => Reply::status(404),
+        })
+        .await;
+        let ollama = OllamaBackend::new(
+            client(),
+            local_selection("ollama", &server.url(""), None),
+            false,
+        );
+        let rig = rig(Arc::new(Limited::new(Arc::new(ollama))), false).await;
+
+        let status = rig.service.memory_status_now().await;
+
+        assert!(!status.available && status.enabled, "{status:?}");
+        assert_eq!(status.reason, REASON_MODEL_NOT_ALLOWED);
+    }
+
+    /// Un backend que rechaza `chat_local_only` con el mismo texto que
+    /// `NotLocal` pero como `Unavailable`: no es el rechazo, no se reintenta.
+    #[tokio::test]
+    async fn un_unavailable_con_el_texto_de_no_local_no_reintenta_sin_notas() {
+        let inner = ScriptedBackend::new(["Hola."]);
+        *inner.reject_local_only.lock() =
+            Some(BackendError::Unavailable(crate::backend::NOT_LOCAL.into()));
+        let rig = rig(inner.clone(), false).await;
+        let id = rig.service.open(OWNER).unwrap();
+
+        let result = rig
+            .service
+            .chat_as(OWNER, &id, "prefiero el mate amargo, ¿qué tal?")
+            .await;
+
+        assert!(matches!(result, Err(Error::Unavailable(_))), "{result:?}");
+        assert!(inner.seen.lock().is_empty(), "no se mandó ningún pedido");
+    }
+
+    #[tokio::test]
     async fn el_estado_de_la_memoria_dice_por_que_no_esta_disponible_segun_el_modelo() {
         // Local: disponible.
         let local = rig(ScriptedBackend::new([]), false).await;
@@ -2465,16 +2712,15 @@ mod effective_model_tests {
         assert_eq!(status.reason, REASON_MODEL_UNREACHABLE);
         assert_ne!(REASON_MODEL_UNREACHABLE, REASON_REMOTE);
 
-        // Con permiso para compartir, ni la nube ni el silencio la apagan.
+        // Con permiso para compartir, la nube no la apaga; el silencio sí.
+        let shared = rig(ScriptedBackend::cloud_by_default([]), true).await;
+        assert!(shared.service.memory_status_now().await.available);
         let mut fake = FakeBackend::replying("");
         fake.active_result = Err(crate::backend::BackendError::Unavailable("apagado".into()));
-        for backend in [
-            Arc::new(fake) as Arc<dyn ModelBackend>,
-            ScriptedBackend::cloud_by_default([]),
-        ] {
-            let shared = rig(backend, true).await;
-            assert!(shared.service.memory_status_now().await.available);
-        }
+        let shared = rig(Arc::new(fake), true).await;
+        let status = shared.service.memory_status_now().await;
+        assert!(!status.available && status.enabled);
+        assert_eq!(status.reason, REASON_MODEL_UNREACHABLE);
 
         // Apagada, el motivo sigue siendo el de apagada.
         let off = rig(ScriptedBackend::cloud_by_default([]), false).await;
@@ -2528,7 +2774,7 @@ mod effective_model_tests {
             messages: &'a [Message],
         ) -> BoxFuture<'a, Result<String, BackendError>> {
             if !self.local_now() {
-                return Box::pin(async { Err(crate::backend::not_local()) });
+                return Box::pin(async { Err(BackendError::NotLocal) });
             }
             self.inner.chat(messages)
         }
@@ -4037,7 +4283,7 @@ mod owner_chat_limit_tests {
     fn el_cupo_de_modelos_lleno_llega_como_busy_y_cualquier_otro_unavailable_sigue_siendo_unavailable(
     ) {
         assert!(matches!(
-            to_dbus(crate::backend::metadata_busy()),
+            to_dbus(BackendError::Busy),
             Error::Busy(text) if text == crate::backend::METADATA_BUSY
         ));
         assert!(matches!(
@@ -4047,6 +4293,25 @@ mod owner_chat_limit_tests {
         assert!(matches!(
             to_dbus(BackendError::Failed(crate::backend::METADATA_BUSY.into())),
             Error::Backend(_)
+        ));
+    }
+
+    #[test]
+    fn to_dbus_decide_por_variante_y_no_por_el_texto() {
+        assert!(matches!(
+            to_dbus(BackendError::NotLocal),
+            Error::Unavailable(text) if text == crate::backend::NOT_LOCAL
+        ));
+        assert!(matches!(
+            to_dbus(BackendError::NotAllowed("en la nube".into())),
+            Error::Unavailable(text) if text == "en la nube"
+        ));
+        // El texto del cupo lleno en un `Unavailable` no es el cupo lleno.
+        assert!(matches!(
+            to_dbus(BackendError::Unavailable(
+                crate::backend::METADATA_BUSY.into()
+            )),
+            Error::Unavailable(_)
         ));
     }
 }

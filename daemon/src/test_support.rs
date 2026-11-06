@@ -562,6 +562,9 @@ pub struct ScriptedBackend {
     /// difiere de lo configurado (`info`). `Some(false)` con `local: true`
     /// simula Ollama sin modelo configurado cuyo primer instalado es `:cloud`.
     pub effective_local: Option<bool>,
+    /// Si está, `chat_local_only` contesta este error sin mandar nada, sea
+    /// cual sea el modelo.
+    pub reject_local_only: Mutex<Option<BackendError>>,
 }
 
 impl ScriptedBackend {
@@ -571,6 +574,7 @@ impl ScriptedBackend {
             seen: Mutex::default(),
             local: true,
             effective_local: None,
+            reject_local_only: Mutex::default(),
         })
     }
 
@@ -582,6 +586,7 @@ impl ScriptedBackend {
             seen: Mutex::default(),
             local: true,
             effective_local: Some(false),
+            reject_local_only: Mutex::default(),
         })
     }
 
@@ -636,8 +641,11 @@ impl ModelBackend for ScriptedBackend {
         messages: &'a [Message],
     ) -> BoxFuture<'a, Result<String, BackendError>> {
         Box::pin(async move {
+            if let Some(error) = self.reject_local_only.lock().clone() {
+                return Err(error);
+            }
             if !self.effective_local.unwrap_or(self.local) {
-                return Err(crate::backend::not_local());
+                return Err(crate::backend::BackendError::NotLocal);
             }
             self.chat(messages).await
         })
@@ -701,7 +709,7 @@ impl ModelBackend for FlippingBackend {
         messages: &'a [Message],
     ) -> BoxFuture<'a, Result<String, BackendError>> {
         if !self.resolve_local() {
-            return Box::pin(async { Err(crate::backend::not_local()) });
+            return Box::pin(async { Err(crate::backend::BackendError::NotLocal) });
         }
         self.inner.chat(messages)
     }

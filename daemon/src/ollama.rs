@@ -63,7 +63,7 @@ impl OllamaBackend {
         // que sin `allow_remote` no se usa. El configurado ya se filtró al
         // elegir el backend (`select_backend`).
         if !self.allow_remote && crate::config::is_ollama_cloud_model(&model) {
-            return Err(BackendError::Unavailable(format!(
+            return Err(BackendError::NotAllowed(format!(
                 "El modelo «{model}» de Ollama corre en la nube: la conversación saldría de la máquina. Para usarlo hay que permitirlo con «allow_remote»."
             )));
         }
@@ -80,7 +80,7 @@ impl OllamaBackend {
     ) -> Result<String, BackendError> {
         let model = self.resolve_model().await?;
         if require_local && !(self.info().local && !crate::config::is_ollama_cloud_model(&model)) {
-            return Err(crate::backend::not_local());
+            return Err(BackendError::NotLocal);
         }
         let response = self
             .client
@@ -282,16 +282,16 @@ mod tests {
         let server = ollama_cloud().await;
         let backend = cloud_backend(&server, false);
         match backend.active_model().await {
-            Err(BackendError::Unavailable(text)) => {
+            Err(BackendError::NotAllowed(text)) => {
                 assert!(
                     text.contains("nube") && text.contains("allow_remote"),
                     "{text}"
                 );
             }
-            other => panic!("se esperaba Unavailable, dio {other:?}"),
+            other => panic!("se esperaba NotAllowed, dio {other:?}"),
         }
         match backend.chat(&[user("hola")]).await {
-            Err(BackendError::Unavailable(_)) => {}
+            Err(BackendError::NotAllowed(_)) => {}
             other => panic!("el chat tenía que rechazarse, dio {other:?}"),
         }
     }
@@ -525,8 +525,6 @@ mod tests {
 
     // ── chat_local_only: una sola resolución decide y manda ───────────────────
 
-    use crate::backend::is_not_local;
-
     fn chats(server: &FakeServer) -> usize {
         server
             .captured()
@@ -558,7 +556,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(is_not_local(&error), "{error:?}");
+        assert!(matches!(error, BackendError::NotLocal), "{error:?}");
         assert_eq!(chats(&server), 0);
         // El mismo modelo por `chat` común sí sale (allow_remote lo permite).
         cloud_backend(&server, true)
@@ -588,7 +586,7 @@ mod tests {
         assert!(info.local, "{info:?}");
         let error = ollama.chat_local_only(&[user("hola")]).await.unwrap_err();
 
-        assert!(is_not_local(&error), "{error:?}");
+        assert!(matches!(error, BackendError::NotLocal), "{error:?}");
         assert_eq!(chats(&server), 0);
         assert_eq!(tags_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
@@ -604,7 +602,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(is_not_local(&error), "{error:?}");
+        assert!(matches!(error, BackendError::NotLocal), "{error:?}");
         assert_eq!(chats(&server), 0);
     }
 }

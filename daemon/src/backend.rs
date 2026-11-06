@@ -29,6 +29,27 @@ pub enum BackendError {
     /// Respondió, pero algo que no sirve: un estado HTTP de error, un cuerpo
     /// ilegible o demasiado grande, o tardó más de la cuenta.
     Failed(String),
+    /// El modelo responde, pero la configuración no deja usarlo: el modelo por
+    /// omisión de Ollama corre en la nube y no hay `allow_remote`. El texto es
+    /// para la persona.
+    NotAllowed(String),
+    /// El rechazo de [`ModelBackend::chat_local_only`]: el modelo que
+    /// respondería no es local, y no se mandó nada. El texto es [`NOT_LOCAL`].
+    NotLocal,
+    /// El cupo de `models` está lleno. El servicio lo devuelve como `Busy`
+    /// ([`crate::service::to_dbus`]); el texto es [`METADATA_BUSY`].
+    Busy,
+}
+
+impl BackendError {
+    /// El texto para la persona.
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Unavailable(text) | Self::Failed(text) | Self::NotAllowed(text) => text,
+            Self::NotLocal => NOT_LOCAL,
+            Self::Busy => METADATA_BUSY,
+        }
+    }
 }
 
 pub trait ModelBackend: Send + Sync {
@@ -51,7 +72,7 @@ pub trait ModelBackend: Send + Sync {
     /// decide la misma resolución que manda el pedido, así nada que haya
     /// pasado la puerta de la memoria sale por un cambio de modelo en el
     /// medio. Si no es local, o no se pudo saber, contesta
-    /// `Unavailable(NOT_LOCAL)` sin mandar nada. Por omisión decide
+    /// [`BackendError::NotLocal`] sin mandar nada. Por omisión decide
     /// [`Self::info`], que vale para un backend cuya dirección y modelo son
     /// fijos (el de OpenAI); el de Ollama lo resuelve por pedido.
     fn chat_local_only<'a>(
@@ -60,7 +81,7 @@ pub trait ModelBackend: Send + Sync {
     ) -> BoxFuture<'a, Result<String, BackendError>> {
         Box::pin(async move {
             if !self.info().local {
-                return Err(not_local());
+                return Err(BackendError::NotLocal);
             }
             self.chat(messages).await
         })
@@ -71,23 +92,9 @@ pub trait ModelBackend: Send + Sync {
 pub const NOT_LOCAL: &str =
     "El modelo que respondería no es local: lo que viene de la memoria no se le manda.";
 
-pub fn not_local() -> BackendError {
-    BackendError::Unavailable(NOT_LOCAL.into())
-}
-
-/// El motivo de `models` cuando el cupo de modelos está lleno. El servicio lo
-/// devuelve como `Busy` ([`crate::service::to_dbus`]).
+/// El motivo de `models` cuando el cupo de modelos está lleno.
 pub const METADATA_BUSY: &str =
     "Hay demasiados pedidos de la lista de modelos a la vez: volvé a intentarlo en un momento.";
-
-pub fn metadata_busy() -> BackendError {
-    BackendError::Unavailable(METADATA_BUSY.into())
-}
-
-/// Si el error es el rechazo de [`ModelBackend::chat_local_only`].
-pub fn is_not_local(error: &BackendError) -> bool {
-    matches!(error, BackendError::Unavailable(text) if text == NOT_LOCAL)
-}
 
 /// El backend que queda cuando la configuración no se puede usar (un remoto sin
 /// permiso, una dirección inválida…): responde siempre «no disponible» con el
@@ -176,7 +183,7 @@ impl ModelBackend for Limited {
             // Esperar dejaría que un cliente que inunda `Models` haga esperar
             // a todos los demás (#3).
             let Ok(_permit) = self.metadata_permits.try_acquire() else {
-                return Err(metadata_busy());
+                return Err(BackendError::Busy);
             };
             let started = Instant::now();
             let result = self.inner.models().await;
@@ -275,13 +282,13 @@ fn log_request<T>(
             ms,
             "pedido al modelo"
         ),
-        Err(error) if is_not_local(error) => tracing::debug!(
+        Err(BackendError::NotLocal) => tracing::debug!(
             backend = provider.as_str(),
             operation,
             ms,
             "el modelo no es local: no se mandó"
         ),
-        Err(BackendError::Unavailable(text)) => tracing::warn!(
+        Err(BackendError::Unavailable(text) | BackendError::NotAllowed(text)) => tracing::warn!(
             backend = provider.as_str(),
             operation,
             ms,
@@ -295,6 +302,13 @@ fn log_request<T>(
             error = "Failed",
             "el pedido al modelo falló: {text}"
         ),
+        Err(BackendError::Busy) => tracing::warn!(
+            backend = provider.as_str(),
+            operation,
+            ms,
+            error = "Busy",
+            "{METADATA_BUSY}"
+        ),
     }
 }
 
@@ -302,6 +316,19 @@ fn log_request<T>(
 mod tests {
     use super::*;
     use crate::test_support::model_info;
+
+    #[test]
+    fn el_texto_de_cada_variante_es_el_que_le_toca() {
+        for (error, text) in [
+            (BackendError::Unavailable("a".into()), "a"),
+            (BackendError::Failed("b".into()), "b"),
+            (BackendError::NotAllowed("c".into()), "c"),
+            (BackendError::NotLocal, NOT_LOCAL),
+            (BackendError::Busy, METADATA_BUSY),
+        ] {
+            assert_eq!(error.text(), text, "{error:?}");
+        }
+    }
 
     fn rejected() -> RejectedBackend {
         RejectedBackend {
@@ -463,23 +490,15 @@ mod tests {
             reason: "se mandó".into(),
         };
         let error = remote.chat_local_only(&hello()).await.unwrap_err();
-        assert!(is_not_local(&error), "{error:?}");
-        assert_eq!(error, not_local());
+        assert_eq!(error, BackendError::NotLocal);
 
         // Local: pasa a `chat` (acá, el error propio del backend rechazado).
         let error = rejected().chat_local_only(&hello()).await.unwrap_err();
-        assert!(!is_not_local(&error), "{error:?}");
+        assert!(!matches!(error, BackendError::NotLocal), "{error:?}");
         assert_eq!(
             error,
             BackendError::Unavailable("No se puede usar esta configuración.".into())
         );
-    }
-
-    #[test]
-    fn solo_el_rechazo_de_chat_local_only_cuenta_como_no_local() {
-        assert!(is_not_local(&not_local()));
-        assert!(!is_not_local(&BackendError::Failed(NOT_LOCAL.into())));
-        assert!(!is_not_local(&BackendError::Unavailable("otro".into())));
     }
 
     #[tokio::test]
@@ -490,7 +509,7 @@ mod tests {
         // Aunque el modelo activo quede en caché, chat_local_only vuelve a resolver.
         limited.active_model().await.unwrap();
         let error = limited.chat_local_only(&hello()).await.unwrap_err();
-        assert!(is_not_local(&error), "{error:?}");
+        assert!(matches!(error, BackendError::NotLocal), "{error:?}");
         assert!(cloud.seen.lock().is_empty(), "no se mandó nada");
 
         let local = ScriptedBackend::new(["ok"]);
@@ -667,7 +686,7 @@ mod log_tests {
 
         let error = backend.chat_local_only(&user("hola")).await.unwrap_err();
 
-        assert!(is_not_local(&error));
+        assert!(matches!(error, BackendError::NotLocal));
         let l = line(
             &log,
             &[
@@ -985,7 +1004,7 @@ mod metadata_tests {
             .collect();
         // Sin fila: con el cupo lleno, `Busy` en el acto (#3).
         let busy = quickly(limited.models()).await.unwrap_err();
-        assert_eq!(busy, metadata_busy());
+        assert_eq!(busy, BackendError::Busy);
         assert!(matches!(
             crate::service::to_dbus(busy),
             vasak_assistant_protocol::Error::Busy(_)
@@ -1171,7 +1190,7 @@ mod metadata_tests {
             match quickly(task).await.unwrap() {
                 Ok(_) => accepted += 1,
                 Err(error) => {
-                    assert_eq!(error, metadata_busy());
+                    assert_eq!(error, BackendError::Busy);
                     busy += 1;
                 }
             }
