@@ -2,6 +2,44 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-assistant 0.3.8
+
+La memoria, más dura frente a una base cambiada y a las notas con órdenes
+escondidas (#18, #19).
+
+- **`daemon`** — la base guarda en su único `:LinceMeta` un canario atado a la
+  llave (`SHA-256(llave ‖ "lince-canary")`, formato 2). Al abrir, si no hay
+  exactamente un `:LinceMeta` o el canario falta o no coincide (comparado en
+  tiempo constante), la base se cierra, no se usa y queda una línea en el
+  registro, sin la ruta ni el texto de Grafeo: si alguien cambió el archivo por
+  una base 0.5.x en claro entre mirar la cabecera y abrirla, Grafeo la migra con
+  nuestra llave pero no puede tener el canario. Una base sin canario se rechaza
+  y nunca se le agrega. Una de formato 1 no se migra: `MemoryStatus` dice «La
+  memoria no es de esta versión: borrala para empezar de nuevo», y `ClearMemory`
+  la borra y crea una nueva. Después de abrir se vuelven a mirar además los
+  restos de una migración (`lince.grafeo.pre-0.6`, `.migrating`) (#18). Abrir
+  por un descriptor ya validado no se puede con Grafeo 0.6.0-beta.1, que sólo
+  abre por ruta.
+- **`daemon`** — más marcadores de inyección: «olvidá lo anterior», «a partir
+  de ahora», «actuá como», «disregard», «forget», «developer» y las comillas
+  `'‘’‹›„`. Se buscan en NFKC, con los homoglifos cirílicos llevados a su letra
+  latina, palabra por palabra sin lo que no es letra o dígito (`i.g.n.o.r.a`) y
+  con las letras sueltas juntadas (`i g n o r a`), sin juntar palabras
+  distintas. Las raíces y palabras que no aparecen dentro de una palabra
+  legítima (`ignor`, `instrucci`, `instruct`, `prompt`, `disregard`, `forget`,
+  `developer`, `assistant`) se buscan en cualquier lugar de una palabra, así
+  `systemprompt` o `developer_mode` caen; `system`, `sistema` y `regla`, como
+  palabra entera (`systemd`, `filesystem`, `arreglar` y «toma notas» ya no se
+  descartan); las frases, seguidas o todo junto en una palabra
+  (`olvida-lo-anterior`); los signos (`<|`, `###`, `user:`), como subcadena. Los
+  selectores de variación y los rellenos de Hangul cuentan como caracteres
+  prohibidos, y una nota sólo puede tener letras latinas (ASCII, Latin-1 y Latin
+  Extended-A, sin `ı`) que sin tildes queden en ASCII (afuera `ø`, `ł`, `ß`,
+  `æ`, `œ`), dígitos, el espacio, la puntuación básica y `$ € ª º`. `recall`
+  aplica al leer los mismos filtros que al escribir, antes del corte a las 5 de
+  mayor puntaje, así las notas que guardó una versión anterior y hoy no
+  entrarían ya no llegan al modelo ni le quitan el lugar a una limpia (#19).
+
 ## vasak-assistant 0.3.7
 
 La puerta de AppArmor alcanza a `MemoryStatus` y los errores del backend dejan
