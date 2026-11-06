@@ -81,6 +81,10 @@ pub const REASON_LOCKED: &str = "El llavero está bloqueado";
 pub const REASON_MISSING_KEY: &str = "La clave de la memoria no está en el llavero";
 pub const REASON_DUPLICATED_KEY: &str = "Hay más de una clave de la memoria en el llavero";
 pub const REASON_NOT_OPENED: &str = "La memoria no se pudo abrir";
+/// Una base de formato 1: la creó una versión anterior o es una 0.5.x que
+/// Grafeo migró. No se migra (sin el canario no se sabe de dónde salió).
+pub const REASON_OLD_FORMAT: &str =
+    "La memoria no es de esta versión: borrala para empezar de nuevo";
 pub const REASON_NO_KEYRING: &str = "El llavero no responde";
 pub const REASON_NO_PLACE: &str = "No hay una carpeta de estado donde guardar la memoria";
 pub const REASON_REMOTE: &str = "La memoria no se comparte con un proveedor remoto";
@@ -690,6 +694,7 @@ impl Memory {
                 *db = Some(Arc::new(opened));
                 Ok(())
             }
+            Err(error) if error == OLD_FORMAT => Err(REASON_OLD_FORMAT),
             Err(error) => {
                 // El detalle, en cada intento; el aviso, una vez por motivo, lo
                 // deja `ensure_open`.
@@ -821,11 +826,8 @@ fn config(path: &Path, key: &[u8; MEMORY_KEY_BYTES]) -> Config {
 /// fd ya validado no se puede: `Config::persistent` toma una ruta, y Grafeo
 /// arma con ella la del WAL y la de la migración.
 fn open_existing(path: &Path, key: &[u8; MEMORY_KEY_BYTES]) -> Result<GrafeoDB, String> {
-    if let Some(leftover) = migration_leftover(path) {
-        return Err(format!(
-            "hay restos de una migración: {}",
-            leftover.display()
-        ));
+    if migration_leftover(path).is_some() {
+        return Err("hay restos de una migración".to_owned());
     }
     let mut header = [0u8; HEADER_PREFIX_BYTES];
     std::fs::File::open(path)
@@ -840,10 +842,19 @@ fn open_existing(path: &Path, key: &[u8; MEMORY_KEY_BYTES]) -> Result<GrafeoDB, 
     // calcular. Los restos de migración quedan como un chequeo más, que se
     // esquiva borrándolos.
     if !has_canary(&db, key) || migration_leftover(path).is_some() {
+        let old = meta(&db).is_some_and(|(format, _)| format == Some(1));
+        // Se rechaza igual aunque no cierre bien, y del error no se cuenta nada
+        // que no sea el código: lo que importa es no usarla.
+        if let Err(error) = db.close() {
+            tracing::debug!("no se pudo cerrar la base rechazada: {}", db_error(error));
+        }
         // Sin la ruta ni el texto de Grafeo: sólo que pasó y qué se hizo.
-        let _ = db.close();
         tracing::warn!("la base no es la que creó el servicio: se cerró y no se usa");
-        return Err("la base no es la que creó el servicio".to_owned());
+        return Err(if old {
+            OLD_FORMAT.to_owned()
+        } else {
+            "la base no es la que creó el servicio".to_owned()
+        });
     }
     schema::ensure_indexes(&db).map_err(db_error)?;
     Ok(db)
@@ -861,28 +872,44 @@ fn canary(key: &[u8; MEMORY_KEY_BYTES]) -> String {
         .collect()
 }
 
-/// Si la base tiene un `:LinceMeta` con este formato y el canario de esta
-/// llave. Se compara en tiempo constante: el largo es fijo y público.
-fn has_canary(db: &GrafeoDB, key: &[u8; MEMORY_KEY_BYTES]) -> bool {
-    let expected = canary(key);
-    db.store()
+/// El error de [`open_existing`] para una base de formato 1, que `open_now`
+/// lleva a [`REASON_OLD_FORMAT`].
+const OLD_FORMAT: &str = "la base es de formato 1";
+
+/// El formato y el canario del único `:LinceMeta` de la base; `None` si no hay
+/// exactamente uno (dos podrían traer uno el canario y otro el formato).
+fn meta(db: &GrafeoDB) -> Option<(Option<i64>, String)> {
+    let mut metas = db
+        .store()
         .nodes_by_label("LinceMeta")
         .into_iter()
-        .filter_map(|node| db.get_node(node))
-        .any(|meta| {
-            let format = meta.get_property("format").and_then(Value::as_int64);
-            let found = meta
-                .get_property("canary")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            format == Some(FORMAT_VERSION)
-                && found.len() == expected.len()
-                && found
-                    .bytes()
-                    .zip(expected.bytes())
-                    .fold(0u8, |diff, (a, b)| diff | (a ^ b))
-                    == 0
-        })
+        .filter_map(|node| db.get_node(node));
+    let only = metas.next()?;
+    if metas.next().is_some() {
+        return None;
+    }
+    let format = only.get_property("format").and_then(Value::as_int64);
+    let canary = only
+        .get_property("canary")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    Some((format, canary))
+}
+
+/// Si la base tiene un solo `:LinceMeta`, con este formato y el canario de
+/// esta llave. Se compara en tiempo constante: el largo es fijo y público.
+fn has_canary(db: &GrafeoDB, key: &[u8; MEMORY_KEY_BYTES]) -> bool {
+    let expected = canary(key);
+    meta(db).is_some_and(|(format, found)| {
+        format == Some(FORMAT_VERSION)
+            && found.len() == expected.len()
+            && found
+                .bytes()
+                .zip(expected.bytes())
+                .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+                == 0
+    })
 }
 
 /// El primer resto de una migración de Grafeo al lado de `path`, si hay.
@@ -3352,14 +3379,19 @@ mod canary_tests {
 
     #[tokio::test]
     async fn una_base_con_formato_1_o_distinto_de_2_se_rechaza_aunque_el_canario_sea_el_correcto() {
-        for format in [1, 0, 3, -1] {
+        for (format, reason) in [
+            (1, REASON_OLD_FORMAT),
+            (0, REASON_NOT_OPENED),
+            (3, REASON_NOT_OPENED),
+            (-1, REASON_NOT_OPENED),
+        ] {
             let tmp = TempDir::new();
             build(&tmp, &KEY, Some((format, Some(canary(&KEY)))));
 
             let status = memory_with(&tmp, &KEY).status().await;
 
             assert!(!status.available, "formato {format}");
-            assert_eq!(status.reason, REASON_NOT_OPENED, "formato {format}");
+            assert_eq!(status.reason, reason, "formato {format}");
         }
     }
 

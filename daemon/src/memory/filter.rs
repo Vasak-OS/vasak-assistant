@@ -143,17 +143,25 @@ pub fn has_forbidden_chars(text: &str) -> bool {
         .any(|c| c.is_control() || is_format_or_private(c))
 }
 
+/// Signos que puede llevar una nota además de letras y dígitos.
+const ALLOWED_SIGNS: &str = ".,;:¡!¿?()-/&%+*#=–—°$€ªº ";
+
 /// Si el texto tiene sólo lo que puede llevar una nota: letras latinas (ASCII,
 /// Latin-1 y Latin Extended-A, sin la `ı` sin punto, que se confunde con la
-/// `i`), dígitos ASCII, el espacio y la puntuación básica. Todo lo demás
-/// (griego, armenio, cirílico, IPA como `ɡ`, otras comillas y separadores) puede
-/// imitar una letra o un delimitador, y una nota en español no lo necesita.
+/// `i`), dígitos ASCII, el espacio y [`ALLOWED_SIGNS`]. Además, sin tildes
+/// (`normalize_terms`) las letras tienen que quedar en ASCII: `ø`, `ł`, `ß` o
+/// `æ` no se descomponen y esquivarían los marcadores. Todo lo demás (griego,
+/// armenio, cirílico, IPA como `ɡ`, `@ _ < > [ ] | ~`, otras comillas y
+/// separadores) puede imitar una letra o un delimitador, y una nota en español
+/// no lo necesita.
 pub fn has_only_allowed_chars(text: &str) -> bool {
     text.chars().all(|c| {
         c.is_ascii_alphanumeric()
-            || ".,;:¡!¿?()-/&%+*#=–—° ".contains(c)
+            || ALLOWED_SIGNS.contains(c)
             || matches!(c, '\u{C0}'..='\u{17F}') && !matches!(c, '×' | '÷' | 'ı')
-    })
+    }) && normalize_terms(text)
+        .chars()
+        .all(|c| c.is_ascii() || ALLOWED_SIGNS.contains(c))
 }
 
 /// Lo que tiene que cumplir una nota, al escribirla y al leerla: no vacía, sólo
@@ -169,6 +177,9 @@ pub fn is_clean_note(text: &str) -> bool {
         && !is_user_data(text)
 }
 
+/// Si `c` es de formato (Cf), separador de línea o de párrafo (Zl, Zp), de uso
+/// privado (Co), selector de variación o relleno de Hangul. Las tablas son las
+/// de Unicode 15; los de control los mira aparte `char::is_control`.
 fn is_format_or_private(c: char) -> bool {
     matches!(
         u32::from(c),
@@ -189,33 +200,60 @@ fn is_format_or_private(c: char) -> bool {
 }
 
 /// Marcadores de rol o de instrucciones, para que una nota no se lea como un
-/// mensaje del sistema o del asistente. Se buscan en minúsculas y sin tildes,
-/// como subcadenas, igual que el resto de la lista: las notas son frases
-/// cortas en español en tercera persona («Prefiere…»), así que una palabra en
-/// inglés como «forget» casi nunca es una nota legítima, y perder un recuerdo
-/// cuesta menos que dejar pasar una orden.
-const INJECTION_MARKERS: &[&str] = &[
-    "ignor",
+/// mensaje del sistema o del asistente. Se buscan en minúsculas, sin tildes y
+/// con los homoglifos cirílicos pasados a latín. Cómo coincide cada grupo, sobre
+/// las palabras ya limpias (sin lo que no es letra o dígito, y con las letras
+/// sueltas juntadas):
+///
+/// | Grupo | Coincide con | Por qué |
+/// |---|---|---|
+/// | [`MARKER_STEMS`] | el comienzo de una palabra | raíces a propósito: `ignora`, `ignore`, `instrucciones` |
+/// | [`MARKER_WORDS`] | una palabra entera | `systemd`, `filesystem`, `arreglar` y `anotas` no son órdenes |
+/// | [`MARKER_PHRASES`] | esas palabras seguidas, o todo junto dentro de una sola (`olvida-lo-anterior`) | nunca juntando palabras distintas |
+/// | [`MARKER_SYMBOLS`] | una subcadena del texto, sin limpiar | son los signos lo que marca |
+///
+/// Las notas son frases cortas en español en tercera persona («Prefiere…»):
+/// una palabra en inglés como «forget» casi nunca es una nota legítima, y
+/// perder un recuerdo cuesta menos que dejar pasar una orden.
+const MARKER_STEMS: &[&str] = &["ignor", "instrucci"];
+
+/// Ver [`MARKER_STEMS`]. Con su plural u otra forma obvia.
+const MARKER_WORDS: &[&str] = &[
     "disregard",
     "forget",
+    "forgets",
     "developer",
+    "developers",
+    "sistema",
+    "sistemas",
+    "system",
+    "systems",
+    "prompt",
+    "prompts",
+    "regla",
+    "reglas",
+    "assistant",
+    "assistants",
+];
+
+/// Ver [`MARKER_STEMS`]. «notas tuyas» abre el encabezado del bloque.
+const MARKER_PHRASES: &[&str] = &[
     "olvida lo anterior",
     "a partir de ahora",
     "actua como",
-    "instrucci",
-    "sistema",
-    "system",
-    "prompt",
-    "regla",
+    "notas tuyas",
+];
+
+/// Ver [`MARKER_STEMS`].
+const MARKER_SYMBOLS: &[&str] = &[
     "asistente:",
-    "assistant",
     "user:",
     "<|",
     "[inst]",
     "```",
     "###",
     "</",
-    "notas",
+    "notas-",
     // Comillas que pueden abrir o cerrar un texto citado en el bloque.
     "'",
     "‘",
@@ -225,13 +263,11 @@ const INJECTION_MARKERS: &[&str] = &[
     "„",
 ];
 
-/// Si el texto trae marcadores de rol o de instrucciones. Se mira en NFKC
-/// (ancho completo), con los homoglifos cirílicos llevados a su letra latina,
-/// y además con las letras sueltas juntadas (`i g n o r a` es `ignora`). Los
-/// marcadores que son sólo letras se buscan también palabra por palabra, sin lo
-/// que no es letra o dígito dentro de cada una (`i.g.n.o.r.a` e `i_g_n_o_r_a`
-/// son `ignora`), sin juntar palabras distintas («prefiere glaseado» no es
-/// `regla`).
+/// Si el texto trae marcadores de rol o de instrucciones, según la tabla de
+/// [`MARKER_STEMS`]. Se mira en NFKC (ancho completo), con los homoglifos
+/// cirílicos llevados a su letra latina. Las palabras se limpian una por una:
+/// `i.g.n.o.r.a` e `i_g_n_o_r_a` son `ignora`, e `i g n o r a`, con las letras
+/// sueltas juntadas, también.
 ///
 /// shortcut: una palabra partida en dos (`ign ora`) o en leetspeak pasa, y la
 /// defensa de fondo es el escapado JSON con nonce del bloque; mejorarlo si
@@ -244,22 +280,33 @@ pub fn has_injection_markers(text: &str) -> bool {
     // `user :` cuenta como `user:` (normalize_terms ya colapsó los espacios).
     let joined = join_single_letters(&latin).replace(" :", ":");
     let folded = latin.replace(" :", ":");
-    let words = latin
+    let cleaned = latin
         .split(' ')
         .map(|word| word.chars().filter(|c| c.is_alphanumeric()).collect())
         .collect::<Vec<String>>()
         .join(" ");
     // `i. g. n. o. r. a` también: las palabras ya limpias, con las sueltas juntas.
-    let words = join_single_letters(&words);
-    INJECTION_MARKERS.iter().any(|marker| {
-        folded.contains(marker)
-            || joined.contains(marker)
-            || marker.chars().all(|c| c.is_alphabetic() || c == ' ') && words.contains(marker)
-    })
+    let cleaned = join_single_letters(&cleaned);
+    let words: Vec<&str> = cleaned.split(' ').filter(|w| !w.is_empty()).collect();
+    let spaced = format!(" {} ", words.join(" "));
+    MARKER_SYMBOLS
+        .iter()
+        .any(|marker| folded.contains(marker) || joined.contains(marker))
+        || words.iter().any(|word| {
+            MARKER_STEMS.iter().any(|stem| word.starts_with(stem))
+                || MARKER_WORDS.contains(word)
+                || MARKER_PHRASES
+                    .iter()
+                    .any(|phrase| word.contains(&phrase.replace(' ', "")))
+        })
+        || MARKER_PHRASES
+            .iter()
+            .any(|phrase| spaced.contains(&format!(" {phrase} ")))
 }
 
 /// La letra latina que se ve igual, para las cirílicas que tienen una (ya en
 /// minúsculas: `Н` y `В` quedan `н` y `в`, que en mayúscula son `H` y `B`).
+/// Redundante con la lista blanca; queda por si se usa solo.
 fn cyrillic_to_latin(c: char) -> char {
     match c {
         'а' => 'a',
@@ -804,7 +851,8 @@ mod whitelist_tests {
             "¿Cómo está? ¡Muy bien!",
             "Año 2024 (ñandú) – y — otra cosa: sí; no, quizá.",
             "Usa 100% de batería & 50° de calor + 2 * 3 = 6 #1 a/b",
-            "ÀÉÎÕÜ àéîõü ÿ Œ œ Ž ž Ł ł Ğ ğ",
+            // Las que NFD descompone; `Œ œ Ł ł` no, y quedan afuera.
+            "ÀÉÎÕÜ àéîõü ÿ Ž ž Ğ ğ",
             "Prefiere glaseado",
             "",
         ] {

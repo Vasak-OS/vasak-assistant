@@ -36,8 +36,10 @@ const SUMMARIES: usize = 2;
 pub fn build(db: &GrafeoDB, message: &str, first_turn: bool, now: i64) -> Option<String> {
     let mut picked: Vec<Entry> = Vec::new();
     let mut seen: HashSet<NodeId> = HashSet::new();
+    // Sin filtrar: lo que viene de `top` ya está limpio, y lo relacionado se
+    // filtra antes de llegar acá.
     let mut push = |found: Entry, picked: &mut Vec<Entry>| {
-        if is_clean(&found) && seen.insert(found.node) {
+        if seen.insert(found.node) {
             picked.push(found);
         }
     };
@@ -78,7 +80,7 @@ pub fn build(db: &GrafeoDB, message: &str, first_turn: bool, now: i64) -> Option
             .map(normalize_terms)
             .is_some_and(|phrase| !phrase.is_empty() && contains_words(&terms, &phrase))
     }));
-    for found in related {
+    for found in related.into_iter().filter(is_clean) {
         push(found, &mut picked);
     }
 
@@ -107,11 +109,11 @@ fn is_clean(found: &Entry) -> bool {
 
 /// Los `n` limpios de mayor `key`. Las sucias se sacan antes del corte, así no
 /// ocupan el lugar de una limpia.
+/// Se ordena primero y se filtra al tomar, así el predicado corre sólo hasta
+/// juntar `n`.
 fn top(mut all: Vec<Entry>, n: usize, key: impl Fn(&Entry) -> f64) -> Vec<Entry> {
-    all.retain(is_clean);
     all.sort_by(|a, b| key(b).total_cmp(&key(a)));
-    all.truncate(n);
-    all
+    all.into_iter().filter(is_clean).take(n).collect()
 }
 
 /// Si `phrase` aparece en `text` como palabras enteras (los dos normalizados).
