@@ -214,13 +214,13 @@ systemd, `$STATE_DIRECTORY`). No va en el almacén de cuentas.
   **Límite:** entre la lista de modelos y el chat, un proceso local puede
   reapuntar el nombre a un modelo remoto (`/api/create`), y eso no se puede
   evitar desde el cliente: se detecta y se descarta, no se evita; el pedido ya
-  salió. Se detecta por el `remote_host` de la respuesta del chat: lo mandado (con las notas, si las llevaba) ya salió,
-  pero la respuesta se descarta, ese turno no se aprende y queda el aviso «el
-  modelo cambió a uno remoto durante el pedido» en el registro (sin el host ni
-  el contenido). La respuesta descartada tampoco queda en el historial: el
-  turno termina en error y guarda sólo el mensaje de la persona, como con
-  cualquier otro error. Sin `allow_remote` el pedido da error y no se reintenta: la
-  persona no recibe nada del remoto. Con `allow_remote`, un pedido con notas se
+  salió. Se detecta por el `remote_host` de la respuesta del chat: lo mandado
+  (con las notas, si las llevaba) ya salió, pero la respuesta se descarta, ese
+  turno no se aprende y queda el aviso «el modelo cambió a uno remoto durante
+  el pedido» en el registro (sin el host ni el contenido). El turno tampoco
+  queda en el historial: termina en error y, como con cualquier otro error, no
+  se guarda ni el mensaje de la persona ni la respuesta. Sin `allow_remote` el
+  pedido da error y no se reintenta: la persona no recibe nada del remoto. Con `allow_remote`, un pedido con notas se
   repite sin ellas; uno sin notas devuelve la respuesta, porque el remoto está
   permitido.
 
