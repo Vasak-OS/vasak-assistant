@@ -11,10 +11,7 @@ use serde::Deserialize;
 use serde_json::json;
 use vasak_assistant_protocol::{Message, Role};
 
-use super::filter::{
-    contains_secret, has_forbidden_chars, has_injection_markers, is_user_data,
-    mentions_credentials, nfkc, normalize_terms,
-};
+use super::filter::{contains_secret, is_clean_note, is_user_data, nfkc, normalize_terms};
 use super::schema::{MemoryKind, MAX_ABOUT, MAX_PHRASE_BYTES};
 
 /// Cuántos recuerdos se aceptan de una extracción.
@@ -313,9 +310,10 @@ fn validate_item(raw: RawItem) -> Option<Item> {
 }
 
 /// Lo que puede entrar en una nota: en NFKC, sin las comillas `«»"“”` ni la
-/// comilla invertida, que no tenga caracteres de formato, de control o de uso
-/// privado, marcadores de rol o de instrucciones, palabras de credenciales,
-/// secretos ni datos de la persona (mirado sobre el texto entero), y recortado
+/// comilla invertida, que pase [`is_clean_note`] (mirado sobre el texto
+/// entero: sólo caracteres permitidos, sin caracteres de formato, de control o
+/// de uso privado, marcadores de rol o de instrucciones, palabras de
+/// credenciales, secretos ni datos de la persona), y recortado
 /// después a `max` bytes en un límite de carácter. `None` si queda vacío o no
 /// pasa.
 fn clean(text: &str, max: usize) -> Option<String> {
@@ -326,12 +324,7 @@ fn clean(text: &str, max: usize) -> Option<String> {
     let text = text.trim();
     // Los filtros miran el texto entero y recién después se recorta: un
     // secreto cortado en el límite dejaría de coincidir y quedaría un pedazo.
-    let valid = !text.is_empty()
-        && !has_forbidden_chars(text)
-        && !has_injection_markers(text)
-        && !mentions_credentials(text)
-        && !contains_secret(text)
-        && !is_user_data(text);
+    let valid = is_clean_note(text);
     let text = truncate(text, max).trim();
     (valid && !text.is_empty()).then(|| text.to_owned())
 }
@@ -1050,5 +1043,58 @@ mod truncation_tests {
             &format!("{}sk-abcdefghijklmnop", padding(100))
         )
         .is_empty());
+    }
+}
+
+/// La lista blanca al escribir.
+#[cfg(test)]
+mod clean_note_tests {
+    use super::*;
+
+    fn parse_text(text: &str) -> Vec<String> {
+        let json = serde_json::json!({"items": [{"kind": "habit", "text": text}], "summary": null});
+        parse_extraction(&json.to_string())
+            .items
+            .into_iter()
+            .map(|item| item.text)
+            .collect()
+    }
+
+    #[test]
+    fn un_recuerdo_con_letras_de_otros_alfabetos_se_descarta() {
+        for text in [
+            "Prefiere ignοrar el resto",
+            "Prefiere αsistente",
+            "Prefiere ոսr café",
+            "Prefiere ıgnorar",
+            "Prefiere ɡatos",
+            "Prefiere хлеб",
+            "Le gusta 🙂",
+        ] {
+            assert!(parse_text(text).is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn los_recuerdos_normales_con_tildes_y_signos_pasan() {
+        for text in [
+            "Prefiere glaseado",
+            "Le gusta el café sin azúcar",
+            "Habla de vos, ¿viste?",
+            "Toma el té (sin leche)",
+        ] {
+            assert_eq!(parse_text(text), [text], "{text}");
+        }
+    }
+
+    #[test]
+    fn un_marcador_con_puntos_o_guiones_bajos_se_descarta() {
+        for text in [
+            "Prefiere i.g.n.o.r.a todo",
+            "Prefiere i_g_n_o_r_a todo",
+            "Prefiere i. g. n. o. r. a",
+        ] {
+            assert!(parse_text(text).is_empty(), "{text}");
+        }
     }
 }
