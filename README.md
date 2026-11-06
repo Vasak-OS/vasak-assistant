@@ -62,9 +62,11 @@ arrancar: después de cambiarla, `systemctl --user restart vasak-assistant`.
 **Local o remoto.** Lo decide la dirección, no una declaración: un host
 `localhost` o una IP de loopback es **local**; cualquier otro es **remoto**. Un
 remoto sólo se usa con `allow_remote: true`, sólo por `https` y con el modelo
-elegido; si no, queda no disponible con el motivo. `Status` informa en
-`model.local` y `model.host` si la conversación sale de la máquina y hacia
-dónde.
+elegido; si no, queda no disponible con el motivo. En `Status`,
+`model.local` dice si la conversación sale de la máquina (también con el
+modelo rechazado: un alias remoto sin `allow_remote` figura no local), y
+`model.host` identifica el backend configurado, no necesariamente el host
+donde corre el modelo.
 
 Con Ollama, además, un modelo puede correr fuera de la máquina aunque se le
 hable al Ollama local, y cuenta como **remoto**: si su fila de `/api/tags` trae
@@ -217,12 +219,14 @@ systemd, `$STATE_DIRECTORY`). No va en el almacén de cuentas.
   salió. Se detecta por el `remote_host` de la respuesta del chat: lo mandado
   (con las notas, si las llevaba) ya salió, pero la respuesta se descarta, ese
   turno no se aprende y queda el aviso «el modelo cambió a uno remoto durante
-  el pedido» en el registro (sin el host ni el contenido). El turno tampoco
-  queda en el historial: termina en error y, como con cualquier otro error, no
-  se guarda ni el mensaje de la persona ni la respuesta. Sin `allow_remote` el
-  pedido da error y no se reintenta: la persona no recibe nada del remoto. Con `allow_remote`, un pedido con notas se
-  repite sin ellas; uno sin notas devuelve la respuesta, porque el remoto está
-  permitido.
+  el pedido» en el registro (sin el host ni el contenido). Sin
+  `allow_remote` el pedido da error y no se reintenta: la persona no recibe
+  nada del remoto, y el turno no queda en el historial (como con cualquier
+  otro error, no se guarda ni el mensaje de la persona ni la respuesta). Lo
+  mismo si el reintento falla. Con `allow_remote` y sin
+  `share_memory_with_remote`, un pedido con notas se repite sin ellas; si ese
+  reintento sale bien, o si el pedido no llevaba notas, se devuelve la
+  respuesta y el intercambio se guarda, porque el remoto está permitido.
 
 | Método | Qué hace |
 |---|---|

@@ -20,11 +20,16 @@ por el nombre (#23).
   ollama.com sin haberlo bajado), como remoto.
 - **`daemon`** — si la respuesta de un chat trae `remote_host` (el nombre se
   reapuntó a un remoto durante el pedido), sin `allow_remote` se descarta, da
-  error y no se reintenta; con `allow_remote`, la de un chat con notas de la
-  memoria se descarta y se repite sin ellas. Lo descartado no se aprende y
-  queda un aviso en el registro. La línea de arranque
-  dice «local según la dirección» con Ollama: un alias se confirma en cada
-  pedido.
+  error y no se reintenta. Con `allow_remote` y sin
+  `share_memory_with_remote`, la de un chat con notas de la memoria se descarta
+  y se repite sin ellas; con los dos permisos, el chat con notas acepta la
+  respuesta remota. Lo descartado no se aprende y queda un aviso en el
+  registro. `BackendError` suma `RemoteAfterSend` para ese descarte: a
+  diferencia de `NotLocal`, el pedido ya había salido.
+- **`daemon`** — con un modelo remoto rechazado por falta de `allow_remote`,
+  `Status` informa `model.local = false` en vez de `true`.
+- **`daemon`** — la línea de arranque dice «local según la dirección» con
+  Ollama: un alias se confirma en cada pedido.
 
 ## vasak-assistant 0.3.8
 

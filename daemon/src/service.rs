@@ -514,7 +514,7 @@ impl AssistantService {
                     // se reintenta sin notas (la persona igual tiene respuesta,
                     // y la conversación ya podía ir a ese modelo) y ese turno
                     // no se aprende.
-                    Err(BackendError::NotLocal) => {
+                    Err(BackendError::NotLocal | BackendError::RemoteAfterSend) => {
                         use_memory = false;
                         self.backend.chat(&context).await
                     }
@@ -691,7 +691,9 @@ pub fn capabilities(remote_allowed: bool, memory: &MemoryStatus) -> Vec<Capabili
 pub fn to_dbus(error: BackendError) -> Error {
     match error {
         BackendError::Busy => Error::Busy(error.text().to_owned()),
-        BackendError::NotLocal => Error::Unavailable(error.text().to_owned()),
+        BackendError::NotLocal | BackendError::RemoteAfterSend => {
+            Error::Unavailable(error.text().to_owned())
+        }
         BackendError::Unavailable(text) | BackendError::NotAllowed(text) => {
             Error::Unavailable(text)
         }

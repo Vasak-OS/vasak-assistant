@@ -4,6 +4,8 @@
 //! `/api/chat` sin streaming (la respuesta entera de una vez). Las defensas
 //! comunes —tiempos, tope, sin redirecciones ni proxy— están en [`crate::http`].
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use vasak_assistant_protocol::{Message, ModelInfo};
@@ -18,6 +20,9 @@ pub struct OllamaBackend {
     /// Si la configuración permite que la conversación salga de la máquina: lo
     /// decide el modelo por omisión, que puede resultar ser uno `cloud`.
     allow_remote: bool,
+    /// Si la última resolución del modelo dio uno que corre afuera: así el
+    /// estado de un modelo rechazado no lo informa local ([`Self::info`]).
+    last_remote: AtomicBool,
 }
 
 impl OllamaBackend {
@@ -26,6 +31,7 @@ impl OllamaBackend {
             client,
             selection,
             allow_remote,
+            last_remote: AtomicBool::new(false),
         }
     }
 
@@ -64,6 +70,7 @@ impl OllamaBackend {
         let names: Vec<String> = installed.iter().map(|row| row.name.clone()).collect();
         let model = pick_model(self.selection.model.as_deref(), &names)?;
         let remote = is_remote(&model, &installed);
+        self.last_remote.store(remote, Ordering::Relaxed);
         // El modelo puede correr afuera aunque el nombre no lo diga (un alias
         // de `ollama create` con `remote_host`), y el por omisión también:
         // sin `allow_remote` no se usa. `select_backend` sólo vio el nombre.
@@ -82,7 +89,9 @@ impl OllamaBackend {
         require_local: bool,
     ) -> Result<String, BackendError> {
         let (model, remote) = self.resolve_model().await?;
-        if require_local && !(self.info().local && !remote) {
+        // La selección y no `info`: ésta decide con la resolución de este
+        // pedido, no con la última de cualquiera.
+        if require_local && !(self.selection.local && !remote) {
             return Err(BackendError::NotLocal);
         }
         let response = self
@@ -119,7 +128,7 @@ impl OllamaBackend {
         // Entre `/api/tags` y `/api/chat` un proceso local puede reapuntar el
         // nombre a un modelo remoto (`/api/create`): no se evita, se detecta.
         // Lo mandado ya salió; la respuesta se descarta. Sin `allow_remote`,
-        // `NotAllowed` para que nadie reintente; con él, `NotLocal` deja
+        // `NotAllowed` para que nadie reintente; con él, `RemoteAfterSend` deja
         // reintentar sin las notas.
         if !reply.remote_host.is_empty() && (require_local || !self.allow_remote) {
             tracing::warn!(
@@ -127,7 +136,7 @@ impl OllamaBackend {
                 "el modelo cambió a uno remoto durante el pedido"
             );
             return Err(if self.allow_remote {
-                BackendError::NotLocal
+                BackendError::RemoteAfterSend
             } else {
                 remote_not_allowed(&model)
             });
@@ -138,7 +147,9 @@ impl OllamaBackend {
 
 impl ModelBackend for OllamaBackend {
     fn info(&self) -> ModelInfo {
-        self.selection.info()
+        let mut info = self.selection.info();
+        info.local = info.local && !self.last_remote.load(Ordering::Relaxed);
+        info
     }
 
     fn models(&self) -> BoxFuture<'_, Result<Vec<String>, BackendError>> {
@@ -869,7 +880,10 @@ mod tests {
 
         let result = backend.chat_local_only(&[user("hola")]).await;
 
-        assert!(matches!(result, Err(BackendError::NotLocal)), "{result:?}");
+        assert!(
+            matches!(result, Err(BackendError::RemoteAfterSend)),
+            "{result:?}"
+        );
         assert_eq!(chats(&server), 1, "las notas ya habían salido");
         let text = log.text();
         assert!(
