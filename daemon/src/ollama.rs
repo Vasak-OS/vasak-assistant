@@ -882,6 +882,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sin_allow_remote_chat_y_chat_local_only_dan_not_allowed_ante_remote_host_y_no_dejan_el_host_en_el_registro(
+    ) {
+        for local_only in [false, true] {
+            let server = ollama_replying_from_remote().await;
+            let backend = configured_backend(&server, None, false);
+            let (log, _guard) = crate::test_support::capture_logs();
+
+            let result = if local_only {
+                backend.chat_local_only(&[user("hola")]).await
+            } else {
+                backend.chat(&[user("hola")]).await
+            };
+
+            assert!(
+                matches!(result, Err(BackendError::NotAllowed(_))),
+                "local_only={local_only}: {result:?}"
+            );
+            assert_eq!(chats(&server), 1, "local_only={local_only}");
+            let text = log.text();
+            assert!(
+                text.contains("el modelo cambió a uno remoto durante el pedido"),
+                "{text}"
+            );
+            assert!(!text.contains("host-canario"), "{text}");
+            assert!(!text.contains("texto-canario"), "{text}");
+        }
+    }
+
+    #[tokio::test]
     async fn chat_comun_con_allow_remote_devuelve_el_texto_aunque_la_respuesta_traiga_remote_host()
     {
         let server = ollama_replying_from_remote().await;

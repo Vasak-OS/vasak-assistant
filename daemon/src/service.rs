@@ -2667,6 +2667,61 @@ mod effective_model_tests {
             bodies[0]
         );
         assert!(!remembers(&rig, "mate amargo").await);
+        // Un turno que falla no deja nada en el historial: ni la respuesta
+        // descartada ni la pregunta (`finish_turn` sólo guarda con respuesta).
+        let history = rig.service.history_of(OWNER, &id).unwrap();
+        assert!(history.is_empty(), "{history:?}");
+    }
+
+    #[tokio::test]
+    async fn con_allow_remote_una_respuesta_con_remote_host_se_reintenta_sin_notas_y_no_se_aprende()
+    {
+        use crate::test_support::{ollama_backend, FakeServer, Reply, REMOTE_HOST};
+
+        let chat = serde_json::json!({
+            "message": {"role": "assistant", "content": "Hola."},
+            "remote_host": REMOTE_HOST,
+        })
+        .to_string();
+        let server = FakeServer::start(move |pedido| match pedido.path.as_str() {
+            "/api/tags" => Reply::json(r#"{"models":[{"name":"llama3.2:latest"}]}"#),
+            "/api/chat" => Reply::json(&chat),
+            _ => Reply::status(404),
+        })
+        .await;
+        let ollama = ollama_backend(&server.url(""), None, true);
+        let rig = rig(Arc::new(Limited::new(Arc::new(ollama))), false).await;
+        let id = rig.service.open(OWNER).unwrap();
+
+        let reply = rig
+            .service
+            .chat_as(OWNER, &id, "prefiero el mate amargo, ¿qué tal?")
+            .await
+            .unwrap();
+        rig.service.memory.wait_until_idle().await;
+
+        assert_eq!(reply, "Hola.");
+        let bodies: Vec<String> = server
+            .captured()
+            .iter()
+            .filter(|r| r.path == "/api/chat")
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        // Uno con las notas (descartado) y uno sin ellas; ninguno de extracción.
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+        assert!(
+            bodies[0].contains("Prefiere respuestas cortas"),
+            "{}",
+            bodies[0]
+        );
+        assert!(
+            !bodies[1].contains("Prefiere respuestas cortas"),
+            "{}",
+            bodies[1]
+        );
+        assert!(!bodies[1].contains("\"system\""), "{}", bodies[1]);
+        assert!(!remembers(&rig, "mate amargo").await);
+        assert_eq!(rig.service.history_of(OWNER, &id).unwrap().len(), 2);
     }
 
     #[tokio::test]
