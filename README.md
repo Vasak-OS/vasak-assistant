@@ -106,8 +106,11 @@ Cuenta como confinado todo lo que tenga perfil, aunque esté en modo complain
 (Flatpak, Firefox): `Chat` va sin memoria y los métodos de control dan
 `AccessDenied`. Sólo pasa la etiqueta `unconfined` a secas. Configuración, el
 chat y la CLI propia del asistente no tienen perfil. Si Configuración
-(vasak-settings) llega a tener un perfil de AppArmor, tiene que contar como sin
-confinar para esta puerta: si no, pierde el control de la memoria y las claves.
+(vasak-settings) llega a tener un perfil de AppArmor, el mismo cambio que lo
+agrega tiene que eximirlo en `is_confined` por su nombre exacto, revisado por
+seguridad, y nunca un perfil genérico como `vasak-appimage`: si no, pierde el
+control de la memoria y las claves. Hasta entonces, un perfil con ese nombre
+cuenta como confinado, igual que cualquier otro.
 
 **El límite.** La puerta mira a quien hace el llamado, y nada más. El perfil
 `vasak-appimage` permite `dbus,`, `file,` y `change_profile,`: con eso, un
