@@ -2156,6 +2156,57 @@ mod gate_tests {
         }
     }
 
+    #[tokio::test]
+    async fn compartiendo_con_remotos_un_modelo_cloud_sin_allow_remote_sigue_no_disponible_por_el_bus(
+    ) {
+        use crate::ollama::OllamaBackend;
+        use crate::test_support::{client, local_selection, FakeServer, Reply};
+
+        let server = FakeServer::start(|pedido| match pedido.path.as_str() {
+            "/api/tags" => Reply::json(r#"{"models":[{"name":"gpt-oss:120b-cloud"}]}"#),
+            _ => Reply::status(404),
+        })
+        .await;
+        let ollama = OllamaBackend::new(
+            client(),
+            local_selection("ollama", &server.url(""), None),
+            false,
+        );
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        let memory = Arc::new(
+            Memory::new(Some(tmp.memory_dir()), keys.clone()).with_share_with_remote(true),
+        );
+        memory.set_enabled(true).await.unwrap();
+        let service = AssistantService {
+            backend: Arc::new(crate::backend::Limited::new(Arc::new(ollama))),
+            conversations: Arc::default(),
+            remote_allowed: false,
+            secrets: keys,
+            memory,
+            labels: FixedLabel::none(),
+        };
+        let (_server, client) = crate::test_support::p2p_pair_as(":1.1", |builder| {
+            builder.serve_at(SERVICE_PATH, service)
+        })
+        .await
+        .unwrap();
+        let proxy = AssistantProxy::builder(&client)
+            .path(SERVICE_PATH)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let status = proxy.memory_status().await.unwrap();
+        assert!(!status.available && status.enabled, "{status:?}");
+        assert_eq!(status.reason, crate::memory::REASON_MODEL_NOT_ALLOWED);
+        let capabilities = proxy.capabilities().await.unwrap();
+        let memory = memory_capability(&capabilities);
+        assert!(!memory.available, "{memory:?}");
+        assert_eq!(memory.reason, crate::memory::REASON_MODEL_NOT_ALLOWED);
+    }
+
     fn remembered() -> Extraction {
         Extraction {
             items: vec![Item {
@@ -2550,6 +2601,50 @@ mod effective_model_tests {
         assert!(!status.available && status.enabled, "{status:?}");
         assert_eq!(status.reason, REASON_MODEL_NOT_ALLOWED);
         assert_ne!(REASON_MODEL_NOT_ALLOWED, REASON_MODEL_UNREACHABLE);
+    }
+
+    #[tokio::test]
+    async fn compartiendo_con_remotos_un_modelo_cloud_sin_allow_remote_no_esta_disponible() {
+        use crate::ollama::OllamaBackend;
+        use crate::test_support::{client, local_selection, FakeServer, Reply};
+
+        let server = FakeServer::start(|pedido| match pedido.path.as_str() {
+            "/api/tags" => Reply::json(r#"{"models":[{"name":"gpt-oss:120b-cloud"}]}"#),
+            _ => Reply::status(404),
+        })
+        .await;
+        let ollama = OllamaBackend::new(
+            client(),
+            local_selection("ollama", &server.url(""), None),
+            false,
+        );
+        let rig = rig(Arc::new(Limited::new(Arc::new(ollama))), true).await;
+
+        let status = rig.service.memory_status_now().await;
+
+        assert!(!status.available && status.enabled, "{status:?}");
+        assert_eq!(status.reason, REASON_MODEL_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn compartiendo_con_remotos_un_modelo_remoto_que_responde_sigue_disponible() {
+        let rig = rig(ScriptedBackend::cloud_by_default([]), true).await;
+
+        let status = rig.service.memory_status_now().await;
+
+        assert!(status.available && status.reason.is_empty(), "{status:?}");
+    }
+
+    #[tokio::test]
+    async fn compartiendo_con_remotos_un_backend_caido_da_el_motivo_de_que_no_responde() {
+        let mut fake = FakeBackend::replying("");
+        fake.active_result = Err(BackendError::Failed("caído".into()));
+        let rig = rig(Arc::new(fake), true).await;
+
+        let status = rig.service.memory_status_now().await;
+
+        assert!(!status.available && status.enabled, "{status:?}");
+        assert_eq!(status.reason, REASON_MODEL_UNREACHABLE);
     }
 
     #[tokio::test]
