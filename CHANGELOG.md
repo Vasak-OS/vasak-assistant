@@ -18,6 +18,11 @@ por el nombre (#23).
   que no figura en la lista cuenta como remoto. Un `:cloud`/`-cloud`
   configurado se usa aunque no figure (el servidor lo resuelve contra
   ollama.com sin haberlo bajado), como remoto.
+- **`daemon`** — si la respuesta de un chat con notas de la memoria trae
+  `remote_host` (el nombre se reapuntó a un remoto durante el pedido), se
+  descarta, no se aprende y queda un aviso en el registro. La línea de arranque
+  dice «local según la dirección» con Ollama: un alias se confirma en cada
+  pedido.
 
 ## vasak-assistant 0.3.7
 

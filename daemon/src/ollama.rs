@@ -115,7 +115,18 @@ impl OllamaBackend {
                 )))
             }
         }
-        parse_chat(&http::read_capped(self.base(), response).await?)
+        let reply = parse_chat(&http::read_capped(self.base(), response).await?)?;
+        // Entre `/api/tags` y `/api/chat` un proceso local puede reapuntar el
+        // nombre a un modelo remoto (`/api/create`): no se evita, se detecta.
+        // Las notas ya salieron; la respuesta se descarta para no aprender de ella.
+        if require_local && !reply.remote_host.is_empty() {
+            tracing::warn!(
+                backend = "ollama",
+                "el modelo cambió a uno remoto durante el pedido"
+            );
+            return Err(BackendError::NotLocal);
+        }
+        Ok(reply.message.content)
     }
 }
 
@@ -164,14 +175,18 @@ struct ChatRequest<'a> {
     stream: bool,
 }
 
-#[derive(Deserialize)]
-struct ChatResponse {
-    message: ChatResponseMessage,
+/// La respuesta de `/api/chat`. `remote_host` (con `omitempty`) dice si la
+/// respondió un modelo que corre en otro host.
+#[derive(Debug, Deserialize)]
+pub struct ChatResponse {
+    pub message: ChatResponseMessage,
+    #[serde(default)]
+    pub remote_host: String,
 }
 
-#[derive(Deserialize)]
-struct ChatResponseMessage {
-    content: String,
+#[derive(Debug, Deserialize)]
+pub struct ChatResponseMessage {
+    pub content: String,
 }
 
 #[derive(Deserialize)]
@@ -189,10 +204,9 @@ pub struct TagsModel {
     pub remote_host: String,
 }
 
-/// La respuesta de `/api/chat`: el texto del modelo.
-pub fn parse_chat(body: &[u8]) -> Result<String, BackendError> {
+/// La respuesta de `/api/chat`: el texto del modelo y de dónde vino.
+pub fn parse_chat(body: &[u8]) -> Result<ChatResponse, BackendError> {
     serde_json::from_slice::<ChatResponse>(body)
-        .map(|response| response.message.content)
         .map_err(|_| BackendError::Failed("respuesta de Ollama ilegible".into()))
 }
 
@@ -389,7 +403,10 @@ mod tests {
 
     #[test]
     fn parse_chat_lee_el_texto_y_rechaza_lo_ilegible() {
-        assert_eq!(parse_chat(CHAT.as_bytes()).unwrap(), "Hola, soy Lince.");
+        assert_eq!(
+            parse_chat(CHAT.as_bytes()).unwrap().message.content,
+            "Hola, soy Lince."
+        );
         assert!(matches!(parse_chat(b"{}"), Err(BackendError::Failed(_))));
         assert!(matches!(
             parse_chat(br#"{"message":{"content":null}}"#),

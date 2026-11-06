@@ -211,6 +211,13 @@ systemd, `$STATE_DIRECTORY`). No va en el almacén de cuentas.
   instalado, y si corre afuera (`remote_host` en `/api/tags`, o `:cloud`)
   cuenta como remoto aunque se le hable al Ollama local.
 
+  **Límite:** entre la lista de modelos y el chat, un proceso local puede
+  reapuntar el nombre a un modelo remoto (`/api/create`), y eso no se puede
+  evitar desde el cliente. Se detecta después: si la respuesta del chat trae
+  `remote_host`, las notas de ese pedido ya salieron, pero la respuesta se
+  descarta, ese turno no se aprende y queda el aviso «el modelo cambió a uno
+  remoto durante el pedido» en el registro (sin el host ni el contenido).
+
 | Método | Qué hace |
 |---|---|
 | `MemoryStatus() → (bbst)` | `enabled`, `available`, `reason` y `bytes` (lo que ocupa en disco, encendida o apagada, medido sin abrirla). Un problema llega como `available = false` con el motivo («La memoria está apagada», «El llavero está bloqueado», «La clave de la memoria no está en el llavero», «La memoria no se pudo abrir», «El modelo no está permitido: corre en la nube y falta «allow_remote»»). `AccessDenied` para un llamador confinado. |
