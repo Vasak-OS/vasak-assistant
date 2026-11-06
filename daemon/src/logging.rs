@@ -495,6 +495,19 @@ mod startup_tests {
     }
 
     #[test]
+    fn solo_con_ollama_el_arranque_dice_local_segun_la_direccion() {
+        let openai = vasak_assistant_protocol::ModelInfo {
+            provider: "openai".into(),
+            ..model_info("gpt")
+        };
+        let line = startup_summary(&settings(false, false), &openai, false);
+        assert!(line.contains("openai (local)"), "{line}");
+        assert!(!line.contains("según la dirección"), "{line}");
+        let line = startup_summary(&settings(false, false), &model_info("llama"), false);
+        assert!(line.contains("ollama (local según la dirección)"), "{line}");
+    }
+
+    #[test]
     fn el_arranque_no_repite_la_direccion_ni_el_usuario_ni_la_clave_ni_la_ruta_ni_el_modelo() {
         for share in [false, true] {
             let line = startup_summary(&settings(true, share), &model_info("modelo-canario"), true);

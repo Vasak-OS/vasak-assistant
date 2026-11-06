@@ -833,4 +833,56 @@ mod tests {
         assert!(is_remote("Qwen3:Cloud", &[]));
         assert!(is_remote("Qwen3:Cloud", &installed));
     }
+    // ── La respuesta de /api/chat trae remote_host ────────────────────────────
+
+    const REMOTE_REPLY: &str = r#"{"message":{"role":"assistant","content":"texto-canario"},"remote_host":"https://host-canario.ejemplo:443"}"#;
+
+    async fn ollama_replying_from_remote() -> FakeServer {
+        FakeServer::start(|pedido| match pedido.path.as_str() {
+            "/api/tags" => Reply::json(TAGS),
+            "/api/chat" => Reply::json(REMOTE_REPLY),
+            _ => Reply::status(404),
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn chat_local_only_descarta_la_respuesta_que_trae_remote_host_y_no_deja_el_host_en_el_registro(
+    ) {
+        let server = ollama_replying_from_remote().await;
+        let backend = configured_backend(&server, None, false);
+        let (log, _guard) = crate::test_support::capture_logs();
+
+        let result = backend.chat_local_only(&[user("hola")]).await;
+
+        assert!(matches!(result, Err(BackendError::NotLocal)), "{result:?}");
+        assert_eq!(chats(&server), 1, "las notas ya habían salido");
+        let text = log.text();
+        assert!(
+            text.contains("el modelo cambió a uno remoto durante el pedido"),
+            "{text}"
+        );
+        assert!(text.contains("WARN"), "{text}");
+        assert!(!text.contains("host-canario"), "{text}");
+        assert!(!text.contains("texto-canario"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn chat_comun_devuelve_el_texto_aunque_la_respuesta_traiga_remote_host() {
+        let server = ollama_replying_from_remote().await;
+        let backend = configured_backend(&server, None, false);
+
+        let reply = backend.chat(&[user("hola")]).await.unwrap();
+
+        assert_eq!(reply, "texto-canario");
+    }
+
+    #[test]
+    fn parse_chat_lee_remote_host_y_lo_deja_vacio_si_falta() {
+        assert_eq!(
+            parse_chat(REMOTE_REPLY.as_bytes()).unwrap().remote_host,
+            "https://host-canario.ejemplo:443"
+        );
+        assert!(parse_chat(CHAT.as_bytes()).unwrap().remote_host.is_empty());
+    }
 }

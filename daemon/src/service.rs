@@ -2627,6 +2627,59 @@ mod effective_model_tests {
     }
 
     #[tokio::test]
+    async fn si_la_respuesta_de_ollama_llega_con_remote_host_se_reintenta_sin_notas_y_no_se_aprende(
+    ) {
+        use crate::ollama::OllamaBackend;
+        use crate::test_support::{client, local_selection, FakeServer, Reply};
+
+        let server = FakeServer::start(|pedido| match pedido.path.as_str() {
+            "/api/tags" => Reply::json(r#"{"models":[{"name":"llama3.2:latest"}]}"#),
+            "/api/chat" => Reply::json(
+                r#"{"message":{"role":"assistant","content":"Hola."},"remote_host":"https://ollama.com:443"}"#,
+            ),
+            _ => Reply::status(404),
+        })
+        .await;
+        let ollama = OllamaBackend::new(
+            client(),
+            local_selection("ollama", &server.url(""), None),
+            false,
+        );
+        let rig = rig(Arc::new(Limited::new(Arc::new(ollama))), false).await;
+        let id = rig.service.open(OWNER).unwrap();
+
+        let reply = rig
+            .service
+            .chat_as(OWNER, &id, "prefiero el mate amargo, ¿qué tal?")
+            .await
+            .unwrap();
+        rig.service.memory.wait_until_idle().await;
+
+        assert_eq!(reply, "Hola.");
+        let bodies: Vec<String> = server
+            .captured()
+            .iter()
+            .filter(|r| r.path == "/api/chat")
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        // Uno con las notas (rechazado) y uno sin ellas; ninguno de extracción.
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+        assert!(
+            bodies[0].contains("Prefiere respuestas cortas"),
+            "{}",
+            bodies[0]
+        );
+        assert!(
+            !bodies[1].contains("Prefiere respuestas cortas"),
+            "{}",
+            bodies[1]
+        );
+        // El segundo es el chat sin notas, no una extracción (que lleva un mensaje de sistema).
+        assert!(!bodies[1].contains("\"system\""), "{}", bodies[1]);
+        assert!(!remembers(&rig, "mate amargo").await);
+    }
+
+    #[tokio::test]
     async fn un_alias_con_remote_host_y_allow_remote_sin_compartir_no_ve_la_memoria() {
         use crate::ollama::OllamaBackend;
         use crate::test_support::{client, FakeServer, Reply};
