@@ -2627,82 +2627,62 @@ mod effective_model_tests {
     }
 
     #[tokio::test]
-    async fn si_la_respuesta_de_ollama_llega_con_remote_host_se_reintenta_sin_notas_y_no_se_aprende(
+    async fn si_la_respuesta_de_ollama_llega_con_remote_host_sin_allow_remote_da_error_no_se_reintenta_ni_se_aprende(
     ) {
-        use crate::ollama::OllamaBackend;
-        use crate::test_support::{client, local_selection, FakeServer, Reply};
+        use crate::test_support::{ollama_backend, FakeServer, Reply, REMOTE_HOST};
 
-        let server = FakeServer::start(|pedido| match pedido.path.as_str() {
+        let chat = serde_json::json!({
+            "message": {"role": "assistant", "content": "Hola."},
+            "remote_host": REMOTE_HOST,
+        })
+        .to_string();
+        let server = FakeServer::start(move |pedido| match pedido.path.as_str() {
             "/api/tags" => Reply::json(r#"{"models":[{"name":"llama3.2:latest"}]}"#),
-            "/api/chat" => Reply::json(
-                r#"{"message":{"role":"assistant","content":"Hola."},"remote_host":"https://ollama.com:443"}"#,
-            ),
+            "/api/chat" => Reply::json(&chat),
             _ => Reply::status(404),
         })
         .await;
-        let ollama = OllamaBackend::new(
-            client(),
-            local_selection("ollama", &server.url(""), None),
-            false,
-        );
+        let ollama = ollama_backend(&server.url(""), None, false);
         let rig = rig(Arc::new(Limited::new(Arc::new(ollama))), false).await;
         let id = rig.service.open(OWNER).unwrap();
 
-        let reply = rig
+        let result = rig
             .service
             .chat_as(OWNER, &id, "prefiero el mate amargo, ¿qué tal?")
-            .await
-            .unwrap();
+            .await;
         rig.service.memory.wait_until_idle().await;
 
-        assert_eq!(reply, "Hola.");
+        assert!(result.is_err(), "{result:?}");
         let bodies: Vec<String> = server
             .captured()
             .iter()
             .filter(|r| r.path == "/api/chat")
             .map(|r| String::from_utf8_lossy(&r.body).into_owned())
             .collect();
-        // Uno con las notas (rechazado) y uno sin ellas; ninguno de extracción.
-        assert_eq!(bodies.len(), 2, "{bodies:?}");
+        // Sólo el que llevaba las notas (descartado): sin reintento ni extracción.
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
         assert!(
             bodies[0].contains("Prefiere respuestas cortas"),
             "{}",
             bodies[0]
         );
-        assert!(
-            !bodies[1].contains("Prefiere respuestas cortas"),
-            "{}",
-            bodies[1]
-        );
-        // El segundo es el chat sin notas, no una extracción (que lleva un mensaje de sistema).
-        assert!(!bodies[1].contains("\"system\""), "{}", bodies[1]);
         assert!(!remembers(&rig, "mate amargo").await);
     }
 
     #[tokio::test]
     async fn un_alias_con_remote_host_y_allow_remote_sin_compartir_no_ve_la_memoria() {
-        use crate::ollama::OllamaBackend;
-        use crate::test_support::{client, FakeServer, Reply};
+        use crate::test_support::{ollama_backend, remote_tags, FakeServer, Reply};
 
-        let server = FakeServer::start(|pedido| match pedido.path.as_str() {
-            "/api/tags" => Reply::json(
-                r#"{"models":[{"name":"mio:latest","remote_host":"https://ollama.com:443"}]}"#,
-            ),
+        let tags = remote_tags("mio:latest");
+        let server = FakeServer::start(move |pedido| match pedido.path.as_str() {
+            "/api/tags" => Reply::json(&tags),
             "/api/chat" => Reply::json(r#"{"message":{"role":"assistant","content":"Hola."}}"#),
             _ => Reply::status(404),
         })
         .await;
-        let selection = crate::config::select_backend(&crate::config::Settings {
-            backend: Some("ollama".into()),
-            url: Some(server.url("")),
-            model: None,
-            allow_remote: true,
-            share_memory_with_remote: false,
-        })
-        .unwrap_or_else(|rejection| panic!("{}", rejection.reason));
-        let ollama = Arc::new(Limited::new(Arc::new(OllamaBackend::new(
-            client(),
-            selection,
+        let ollama = Arc::new(Limited::new(Arc::new(ollama_backend(
+            &server.url(""),
+            None,
             true,
         ))));
         let rig = rig(ollama.clone(), false).await;

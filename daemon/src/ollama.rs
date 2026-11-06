@@ -33,6 +33,8 @@ impl OllamaBackend {
         &self.selection.url
     }
 
+    /// Las filas de `/api/tags`: qué modelos hay y cuáles corren en otro host.
+    /// Un error acá no deja mandar nada: sin la lista no se sabe si es local.
     async fn installed_models(&self) -> Result<Vec<TagsModel>, BackendError> {
         let response = self
             .client
@@ -66,9 +68,7 @@ impl OllamaBackend {
         // de `ollama create` con `remote_host`), y el por omisión también:
         // sin `allow_remote` no se usa. `select_backend` sólo vio el nombre.
         if !self.allow_remote && remote {
-            return Err(BackendError::NotAllowed(format!(
-                "El modelo «{model}» de Ollama corre en la nube o en otro host: la conversación saldría de la máquina. Para usarlo hay que permitirlo con «allow_remote»."
-            )));
+            return Err(remote_not_allowed(&model));
         }
         Ok((model, remote))
     }
@@ -118,13 +118,19 @@ impl OllamaBackend {
         let reply = parse_chat(&http::read_capped(self.base(), response).await?)?;
         // Entre `/api/tags` y `/api/chat` un proceso local puede reapuntar el
         // nombre a un modelo remoto (`/api/create`): no se evita, se detecta.
-        // Las notas ya salieron; la respuesta se descarta para no aprender de ella.
-        if require_local && !reply.remote_host.is_empty() {
+        // Lo mandado ya salió; la respuesta se descarta. Sin `allow_remote`,
+        // `NotAllowed` para que nadie reintente; con él, `NotLocal` deja
+        // reintentar sin las notas.
+        if !reply.remote_host.is_empty() && (require_local || !self.allow_remote) {
             tracing::warn!(
                 backend = "ollama",
                 "el modelo cambió a uno remoto durante el pedido"
             );
-            return Err(BackendError::NotLocal);
+            return Err(if self.allow_remote {
+                BackendError::NotLocal
+            } else {
+                remote_not_allowed(&model)
+            });
         }
         Ok(reply.message.content)
     }
@@ -184,11 +190,13 @@ pub struct ChatResponse {
     pub remote_host: String,
 }
 
+/// El mensaje de la respuesta de `/api/chat`: sólo el texto.
 #[derive(Debug, Deserialize)]
 pub struct ChatResponseMessage {
     pub content: String,
 }
 
+/// La respuesta de `/api/tags`: una fila por modelo instalado.
 #[derive(Deserialize)]
 struct TagsResponse {
     models: Vec<TagsModel>,
@@ -220,12 +228,15 @@ pub fn parse_tags(body: &[u8]) -> Result<Vec<TagsModel>, BackendError> {
 /// Si `model` corre fuera de la máquina: por el nombre (`:cloud`/`-cloud`, que
 /// el servidor manda a ollama.com aunque no figure en la lista) o porque su
 /// fila trae `remote_host`. Falla cerrado: un modelo sin fila cuenta como remoto.
+///
+/// `model` se compara exacto contra el nombre de la fila, tal cual lo devuelve
+/// [`pick_model`] (que ya resolvió el `:latest`).
 pub fn is_remote(model: &str, installed: &[TagsModel]) -> bool {
     crate::config::is_ollama_cloud_model(model)
-        || installed
-            .iter()
-            .find(|row| row.name == model)
-            .is_none_or(|row| !row.remote_host.is_empty())
+        || !matches!(
+            installed.iter().find(|row| row.name == model),
+            Some(row) if row.remote_host.is_empty()
+        )
 }
 
 /// Con qué modelo responder. Si hay uno configurado tiene que estar instalado;
@@ -250,6 +261,12 @@ pub fn pick_model(configured: Option<&str>, installed: &[String]) -> Result<Stri
     }
 }
 
+fn remote_not_allowed(model: &str) -> BackendError {
+    BackendError::NotAllowed(format!(
+        "El modelo «{model}» de Ollama corre en la nube o en otro host: la conversación saldría de la máquina. Para usarlo hay que permitirlo con «allow_remote»."
+    ))
+}
+
 fn model_missing(model: &str) -> BackendError {
     BackendError::Unavailable(format!(
         "El modelo «{model}» no está instalado en Ollama. Instalalo con `ollama pull {model}`."
@@ -262,7 +279,10 @@ mod tests {
     const TOPE: usize = 256 * 1024;
 
     use super::*;
-    use crate::test_support::{client, closed_port_url, local_selection, FakeServer, Reply};
+    use crate::test_support::{
+        client, closed_port_url, local_selection, ollama_backend, remote_tags, FakeServer, Reply,
+        REMOTE_HOST,
+    };
     use vasak_assistant_protocol::Role;
 
     const TAGS: &str = r#"{"models":[{"name":"llama3.2:latest"},{"name":"qwen2.5:7b"}]}"#;
@@ -651,41 +671,34 @@ mod tests {
 
     // ── #23: remoto por `remote_host`, por nombre o por no figurar ────────────
 
-    const ALIAS_TAGS: &str =
-        r#"{"models":[{"name":"mio:latest","remote_host":"https://ollama.com:443"}]}"#;
+    fn alias_tags() -> String {
+        remote_tags("mio:latest")
+    }
 
     /// Un Ollama con estas filas de `/api/tags` que contesta el chat.
-    async fn ollama_with_tags(tags: &'static str) -> FakeServer {
+    async fn ollama_with_tags(tags: impl Into<String>) -> FakeServer {
+        let tags = tags.into();
         FakeServer::start(move |pedido| match pedido.path.as_str() {
-            "/api/tags" => Reply::json(tags),
+            "/api/tags" => Reply::json(&tags),
             "/api/chat" => Reply::json(CHAT),
             _ => Reply::status(404),
         })
         .await
     }
 
-    /// Como `cloud_backend`, con un modelo configurado. La selección se acepta
-    /// con `allow_remote` (el arranque no mira la red); el backend recibe el suyo.
+    /// Como `cloud_backend`, con un modelo configurado.
     fn configured_backend(
         server: &FakeServer,
         model: Option<&str>,
         allow_remote: bool,
     ) -> OllamaBackend {
-        let selection = crate::config::select_backend(&crate::config::Settings {
-            backend: Some("ollama".into()),
-            url: Some(server.url("")),
-            model: model.map(str::to_owned),
-            allow_remote: true,
-            share_memory_with_remote: false,
-        })
-        .unwrap_or_else(|rejection| panic!("{}", rejection.reason));
-        OllamaBackend::new(client(), selection, allow_remote)
+        ollama_backend(&server.url(""), model, allow_remote)
     }
 
     #[tokio::test]
     async fn un_alias_sin_sufijo_con_remote_host_sin_allow_remote_no_se_usa_ni_manda_nada() {
         for model in [None, Some("mio"), Some("mio:latest")] {
-            let server = ollama_with_tags(ALIAS_TAGS).await;
+            let server = ollama_with_tags(alias_tags()).await;
             let backend = configured_backend(&server, model, false);
 
             assert!(
@@ -710,7 +723,7 @@ mod tests {
     async fn un_alias_con_remote_host_y_allow_remote_es_remoto_chatea_pero_no_sale_por_chat_local_only(
     ) {
         for model in [None, Some("mio"), Some("mio:latest")] {
-            let server = ollama_with_tags(ALIAS_TAGS).await;
+            let server = ollama_with_tags(alias_tags()).await;
             let backend = configured_backend(&server, model, true);
 
             let active = backend.active_model().await.unwrap();
@@ -824,7 +837,7 @@ mod tests {
             },
             TagsModel {
                 name: "alias:latest".into(),
-                remote_host: "https://ollama.com:443".into(),
+                remote_host: REMOTE_HOST.into(),
             },
         ];
         assert!(!is_remote("local:latest", &installed));
@@ -833,6 +846,7 @@ mod tests {
         assert!(is_remote("Qwen3:Cloud", &[]));
         assert!(is_remote("Qwen3:Cloud", &installed));
     }
+
     // ── La respuesta de /api/chat trae remote_host ────────────────────────────
 
     const REMOTE_REPLY: &str = r#"{"message":{"role":"assistant","content":"texto-canario"},"remote_host":"https://host-canario.ejemplo:443"}"#;
@@ -850,7 +864,7 @@ mod tests {
     async fn chat_local_only_descarta_la_respuesta_que_trae_remote_host_y_no_deja_el_host_en_el_registro(
     ) {
         let server = ollama_replying_from_remote().await;
-        let backend = configured_backend(&server, None, false);
+        let backend = configured_backend(&server, None, true);
         let (log, _guard) = crate::test_support::capture_logs();
 
         let result = backend.chat_local_only(&[user("hola")]).await;
@@ -868,9 +882,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_comun_devuelve_el_texto_aunque_la_respuesta_traiga_remote_host() {
+    async fn chat_comun_con_allow_remote_devuelve_el_texto_aunque_la_respuesta_traiga_remote_host()
+    {
         let server = ollama_replying_from_remote().await;
-        let backend = configured_backend(&server, None, false);
+        let backend = configured_backend(&server, None, true);
 
         let reply = backend.chat(&[user("hola")]).await.unwrap();
 
