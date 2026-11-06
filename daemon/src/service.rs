@@ -4322,3 +4322,167 @@ mod owner_chat_limit_tests {
         ));
     }
 }
+
+/// La época se toma al comienzo del turno (#20): borrar, apagar o encender la
+/// memoria mientras el modelo responde hace que de ese turno no se aprenda nada.
+#[cfg(test)]
+mod turn_epoch_tests {
+    use super::*;
+    use crate::test_support::{FakeBackend, FixedKey, FixedLabel, ScriptedBackend, TempDir};
+
+    const OWNER: &str = ":1.1";
+    const EXTRACTION: &str =
+        r#"{"items":[{"kind":"preference","text":"Prefiere el mate amargo"}],"summary":null}"#;
+
+    struct Rig {
+        _tmp: TempDir,
+        service: Arc<AssistantService>,
+    }
+
+    async fn rig(backend: Arc<dyn ModelBackend>) -> Rig {
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
+        memory.set_enabled(true).await.unwrap();
+        let service = Arc::new(AssistantService {
+            backend,
+            conversations: Arc::default(),
+            remote_allowed: false,
+            secrets: keys,
+            memory,
+            labels: FixedLabel::none(),
+        });
+        Rig { _tmp: tmp, service }
+    }
+
+    async fn quickly<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(5), future)
+            .await
+            .expect("la llamada se colgó")
+    }
+
+    /// Un turno que pasa `worth_learning` y queda bloqueado en el modelo.
+    fn start_turn(
+        service: &Arc<AssistantService>,
+        id: &str,
+    ) -> tokio::task::JoinHandle<Result<String, Error>> {
+        let (service, id) = (service.clone(), id.to_owned());
+        tokio::spawn(async move {
+            service
+                .chat_with(OWNER, &id, "prefiero el mate amargo", true)
+                .await
+        })
+    }
+
+    async fn nothing_learned(rig: &Rig) {
+        rig.service.memory.wait_until_idle().await;
+        let notes = rig.service.memory.recall("mate amargo", true).await;
+        assert!(
+            notes.is_none_or(|block| !block.contains("mate amargo")),
+            "se aprendió algo de un turno de otra época"
+        );
+    }
+
+    #[tokio::test]
+    async fn borrar_la_memoria_mientras_el_modelo_responde_no_aprende_nada_del_turno() {
+        let (fake, gate) = FakeBackend::gated(EXTRACTION);
+        let backend = Arc::new(fake);
+        let rig = rig(backend.clone()).await;
+        let id = rig.service.open(OWNER).unwrap();
+        let turn = start_turn(&rig.service, &id);
+        quickly(backend.entered.notified()).await;
+
+        rig.service.memory.clear().await.unwrap();
+        gate.notify_one();
+        quickly(turn).await.unwrap().unwrap();
+        rig.service.memory.wait_until_idle().await;
+
+        // El chat sale; la extracción no: el backend recibió una sola llamada.
+        assert_eq!(backend.seen.lock().len(), 1);
+        nothing_learned(&rig).await;
+        // La memoria nueva sigue encendida y vacía.
+        assert!(rig.service.memory.status().await.available);
+    }
+
+    #[tokio::test]
+    async fn apagar_y_encender_la_memoria_mientras_el_modelo_responde_tampoco_aprende() {
+        let (fake, gate) = FakeBackend::gated(EXTRACTION);
+        let backend = Arc::new(fake);
+        let rig = rig(backend.clone()).await;
+        let id = rig.service.open(OWNER).unwrap();
+        let turn = start_turn(&rig.service, &id);
+        quickly(backend.entered.notified()).await;
+
+        rig.service.memory.set_enabled(false).await.unwrap();
+        rig.service.memory.set_enabled(true).await.unwrap();
+        gate.notify_one();
+        quickly(turn).await.unwrap().unwrap();
+
+        assert_eq!(backend.seen.lock().len(), 1);
+        nothing_learned(&rig).await;
+    }
+
+    #[tokio::test]
+    async fn solo_apagar_la_memoria_mientras_el_modelo_responde_tampoco_aprende() {
+        let (fake, gate) = FakeBackend::gated(EXTRACTION);
+        let backend = Arc::new(fake);
+        let rig = rig(backend.clone()).await;
+        let id = rig.service.open(OWNER).unwrap();
+        let turn = start_turn(&rig.service, &id);
+        quickly(backend.entered.notified()).await;
+
+        rig.service.memory.set_enabled(false).await.unwrap();
+        gate.notify_one();
+        quickly(turn).await.unwrap().unwrap();
+        rig.service.memory.wait_until_idle().await;
+
+        assert_eq!(backend.seen.lock().len(), 1);
+        rig.service.memory.set_enabled(true).await.unwrap();
+        nothing_learned(&rig).await;
+    }
+
+    #[tokio::test]
+    async fn sin_cambios_en_medio_el_turno_normal_sigue_aprendiendo_de_punta_a_punta() {
+        let backend = ScriptedBackend::new(["Hola.", EXTRACTION]);
+        let rig = rig(backend.clone()).await;
+        let id = rig.service.open(OWNER).unwrap();
+
+        rig.service
+            .chat_with(OWNER, &id, "prefiero el mate amargo", true)
+            .await
+            .unwrap();
+        rig.service.memory.wait_until_idle().await;
+
+        assert_eq!(backend.seen.lock().len(), 2, "el chat y la extracción");
+        let notes = rig.service.memory.recall("zzz", true).await.unwrap();
+        assert!(notes.contains("Prefiere el mate amargo"), "{notes}");
+    }
+
+    #[tokio::test]
+    async fn el_turno_siguiente_ya_con_la_epoca_nueva_aprende_con_normalidad() {
+        let (fake, gate) = FakeBackend::gated(EXTRACTION);
+        let backend = Arc::new(fake);
+        let rig = rig(backend.clone()).await;
+        let id = rig.service.open(OWNER).unwrap();
+        let first = start_turn(&rig.service, &id);
+        quickly(backend.entered.notified()).await;
+        rig.service.memory.clear().await.unwrap();
+        gate.notify_one();
+        quickly(first).await.unwrap().unwrap();
+        assert_eq!(backend.seen.lock().len(), 1);
+
+        // Otro turno de la misma conversación, empezado después del borrado.
+        let second = start_turn(&rig.service, &id);
+        quickly(backend.entered.notified()).await;
+        gate.notify_one();
+        quickly(second).await.unwrap().unwrap();
+        // Ahora sí sale la extracción; hay que soltarla.
+        quickly(backend.entered.notified()).await;
+        gate.notify_one();
+        rig.service.memory.wait_until_idle().await;
+
+        assert_eq!(backend.seen.lock().len(), 3);
+        let notes = rig.service.memory.recall("zzz", true).await.unwrap();
+        assert!(notes.contains("Prefiere el mate amargo"), "{notes}");
+    }
+}

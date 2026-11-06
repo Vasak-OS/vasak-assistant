@@ -3608,3 +3608,123 @@ mod canary_tests {
         assert!(!status.reason.contains(&tmp.path().display().to_string()));
     }
 }
+
+/// `learn_after` con una época que ya pasó (#20).
+#[cfg(test)]
+mod stale_epoch_tests {
+    use super::*;
+    use crate::test_support::{FixedKey, ScriptedBackend, TempDir};
+
+    const EXTRACTION: &str =
+        r#"{"items":[{"kind":"preference","text":"Prefiere el mate amargo"}],"summary":null}"#;
+
+    fn two_turns() -> Vec<Message> {
+        let say = |role, content: &str| Message {
+            role,
+            content: content.into(),
+        };
+        vec![
+            say(Role::User, "hola, buen día"),
+            say(Role::Assistant, "Buen día."),
+            say(Role::User, "prefiero el mate amargo"),
+            say(Role::Assistant, "Anotado."),
+        ]
+    }
+
+    async fn enabled() -> (TempDir, Arc<Memory>) {
+        let tmp = TempDir::new();
+        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), FixedKey::new(None)));
+        memory.set_enabled(true).await.unwrap();
+        (tmp, memory)
+    }
+
+    #[tokio::test]
+    async fn con_una_epoca_vieja_learn_after_no_hace_nada_de_nada() {
+        let (_tmp, memory) = enabled().await;
+        let old = memory.epoch();
+        memory.clear().await.unwrap();
+        assert_ne!(memory.epoch(), old);
+        let backend = ScriptedBackend::new([EXTRACTION]);
+
+        memory.learn_after(backend.clone(), "c1", two_turns(), old);
+        memory.wait_until_idle().await;
+
+        // No extrajo: el modelo no recibió nada.
+        assert!(backend.seen.lock().is_empty());
+        // No marcó nada en vuelo, no tomó el permiso y no abrió ventana.
+        assert!(memory.in_flight.lock().is_none());
+        assert_eq!(memory.learning.available_permits(), 1);
+        assert!(!memory.windows.lock().contains_key("c1"));
+        // Y no dejó recuerdos.
+        assert_eq!(memory.recall("mate", true).await, None);
+    }
+
+    #[tokio::test]
+    async fn la_epoca_vieja_tampoco_deja_pasar_el_resumen_ni_los_turnos_del_resumen() {
+        let (_tmp, memory) = enabled().await;
+        let old = memory.epoch();
+        memory.set_enabled(false).await.unwrap();
+        memory.set_enabled(true).await.unwrap();
+        let backend = ScriptedBackend::new([r#"{"items":[],"summary":"Hablaron del mate"}"#]);
+        // Seis turnos de la persona: toca resumen.
+        let mut conversation = Vec::new();
+        for n in 0..6 {
+            conversation.push(Message {
+                role: Role::User,
+                content: format!("pregunta número {n} sobre el clima"),
+            });
+            conversation.push(Message {
+                role: Role::Assistant,
+                content: "respuesta".into(),
+            });
+        }
+
+        memory.learn_after(backend.clone(), "c1", conversation, old);
+        memory.wait_until_idle().await;
+
+        assert!(backend.seen.lock().is_empty());
+        assert!(memory.windows.lock().is_empty());
+        assert_eq!(memory.recall("clima", true).await, None);
+    }
+
+    #[tokio::test]
+    async fn un_turno_siguiente_con_la_epoca_nueva_abre_la_ventana_desde_ese_turno() {
+        let (_tmp, memory) = enabled().await;
+        let old = memory.epoch();
+        memory.clear().await.unwrap();
+        let backend = ScriptedBackend::new([EXTRACTION]);
+        memory.learn_after(backend.clone(), "c1", two_turns(), old);
+        assert!(memory.windows.lock().is_empty());
+
+        let new = memory.epoch();
+        memory.learn_after(backend.clone(), "c1", two_turns(), new);
+        memory.wait_until_idle().await;
+
+        // La ventana arranca en el turno actual (el índice 2: «prefiero el mate»).
+        assert_eq!(memory.windows.lock().get("c1"), Some(&(new, 2)));
+        assert_eq!(backend.seen.lock().len(), 1);
+        assert!(memory
+            .recall("mate", true)
+            .await
+            .unwrap()
+            .contains("mate amargo"));
+    }
+
+    #[tokio::test]
+    async fn la_epoca_actual_toma_el_permiso_marca_en_vuelo_y_aprende() {
+        let (_tmp, memory) = enabled().await;
+        let backend = ScriptedBackend::new([EXTRACTION]);
+
+        memory.learn_after(backend.clone(), "c1", two_turns(), memory.epoch());
+        // El permiso y la marca se toman antes de que `learn_after` vuelva.
+        assert_eq!(memory.learning.available_permits(), 0);
+        assert_eq!(
+            memory.in_flight.lock().as_ref().map(|(id, _)| id.clone()),
+            Some("c1".to_owned())
+        );
+        memory.wait_until_idle().await;
+
+        assert!(memory.in_flight.lock().is_none());
+        assert!(memory.recall("mate", true).await.is_some());
+    }
+}
