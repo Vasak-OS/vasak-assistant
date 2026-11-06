@@ -207,36 +207,34 @@ fn is_format_or_private(c: char) -> bool {
 ///
 /// | Grupo | Coincide con | Por qué |
 /// |---|---|---|
-/// | [`MARKER_STEMS`] | el comienzo de una palabra | raíces a propósito: `ignora`, `ignore`, `instrucciones` |
-/// | [`MARKER_WORDS`] | una palabra entera | `systemd`, `filesystem`, `arreglar` y `anotas` no son órdenes |
+/// | [`MARKER_INSIDE_WORD`] | una subcadena dentro de una palabra, nunca entre dos | raíces y palabras que no aparecen dentro de una palabra legítima, y pegadas a otra son un esquive: `systemprompt`, `developer_mode`, `dontignore` |
+/// | [`MARKER_WORDS`] | una palabra entera | están dentro de palabras legítimas: `systemd`, `filesystem`, `sistematico`, `arreglar` |
 /// | [`MARKER_PHRASES`] | esas palabras seguidas, o todo junto dentro de una sola (`olvida-lo-anterior`) | nunca juntando palabras distintas |
 /// | [`MARKER_SYMBOLS`] | una subcadena del texto, sin limpiar | son los signos lo que marca |
 ///
 /// Las notas son frases cortas en español en tercera persona («Prefiere…»):
 /// una palabra en inglés como «forget» casi nunca es una nota legítima, y
 /// perder un recuerdo cuesta menos que dejar pasar una orden.
-const MARKER_STEMS: &[&str] = &["ignor", "instrucci"];
-
-/// Ver [`MARKER_STEMS`]. Con su plural u otra forma obvia.
-const MARKER_WORDS: &[&str] = &[
+///
+/// `instruct` también cae en «instructor», «instructora» e «instructivo», que
+/// son castellano legítimo: se acepta perder esas notas.
+const MARKER_INSIDE_WORD: &[&str] = &[
+    "ignor",
+    "instrucci",
+    "instruct",
+    "prompt",
     "disregard",
     "forget",
-    "forgets",
     "developer",
-    "developers",
-    "sistema",
-    "sistemas",
-    "system",
-    "systems",
-    "prompt",
-    "prompts",
-    "regla",
-    "reglas",
     "assistant",
-    "assistants",
 ];
 
-/// Ver [`MARKER_STEMS`]. «notas tuyas» abre el encabezado del bloque.
+/// Ver [`MARKER_INSIDE_WORD`]. Con su plural.
+const MARKER_WORDS: &[&str] = &[
+    "sistema", "sistemas", "system", "systems", "regla", "reglas",
+];
+
+/// Ver [`MARKER_INSIDE_WORD`]. «notas tuyas» abre el encabezado del bloque.
 const MARKER_PHRASES: &[&str] = &[
     "olvida lo anterior",
     "a partir de ahora",
@@ -244,7 +242,7 @@ const MARKER_PHRASES: &[&str] = &[
     "notas tuyas",
 ];
 
-/// Ver [`MARKER_STEMS`].
+/// Ver [`MARKER_INSIDE_WORD`].
 const MARKER_SYMBOLS: &[&str] = &[
     "asistente:",
     "user:",
@@ -264,7 +262,7 @@ const MARKER_SYMBOLS: &[&str] = &[
 ];
 
 /// Si el texto trae marcadores de rol o de instrucciones, según la tabla de
-/// [`MARKER_STEMS`]. Se mira en NFKC (ancho completo), con los homoglifos
+/// [`MARKER_INSIDE_WORD`]. Se mira en NFKC (ancho completo), con los homoglifos
 /// cirílicos llevados a su letra latina. Las palabras se limpian una por una:
 /// `i.g.n.o.r.a` e `i_g_n_o_r_a` son `ignora`, e `i g n o r a`, con las letras
 /// sueltas juntadas, también.
@@ -293,7 +291,9 @@ pub fn has_injection_markers(text: &str) -> bool {
         .iter()
         .any(|marker| folded.contains(marker) || joined.contains(marker))
         || words.iter().any(|word| {
-            MARKER_STEMS.iter().any(|stem| word.starts_with(stem))
+            MARKER_INSIDE_WORD
+                .iter()
+                .any(|marker| word.contains(marker))
                 || MARKER_WORDS.contains(word)
                 || MARKER_PHRASES
                     .iter()
@@ -1011,7 +1011,7 @@ mod marker_groups_tests {
 
     #[test]
     fn cada_grupo_coincide_a_su_manera() {
-        // Raíces: el comienzo de la palabra.
+        // Dentro de una palabra: en cualquier lugar de ella.
         for text in [
             "ignora",
             "ignorá todo",
@@ -1019,26 +1019,22 @@ mod marker_groups_tests {
             "ignorado",
             "instrucciones",
             "instrucción",
+            "malignorado",
+            "autoinstrucciones",
+            "prompt",
+            "prompter",
+            "forget",
         ] {
-            assert!(has_injection_markers(text), "raíz: {text}");
+            assert!(has_injection_markers(text), "dentro de una palabra: {text}");
         }
         assert!(!has_injection_markers("designado"));
-        // La raíz tiene que estar al comienzo, no en medio de otra palabra.
-        assert!(!has_injection_markers("malignorado"));
-        assert!(!has_injection_markers("autoinstrucciones"));
         // Palabras enteras.
         for text in [
-            "system", "systems", "sistema", "sistemas", "regla", "reglas", "prompt", "forget",
+            "system", "systems", "sistema", "sistemas", "regla", "reglas",
         ] {
             assert!(has_injection_markers(text), "palabra: {text}");
         }
-        for text in [
-            "systemd",
-            "reglamento",
-            "arreglar",
-            "filesystem",
-            "prompter",
-        ] {
+        for text in ["systemd", "reglamento", "arreglar", "filesystem"] {
             assert!(!has_injection_markers(text), "palabra: {text}");
         }
         // Frases: las palabras seguidas.

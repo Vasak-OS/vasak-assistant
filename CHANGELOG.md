@@ -25,9 +25,12 @@ escondidas (#18, #19).
   `'‘’‹›„`. Se buscan en NFKC, con los homoglifos cirílicos llevados a su letra
   latina, palabra por palabra sin lo que no es letra o dígito (`i.g.n.o.r.a`) y
   con las letras sueltas juntadas (`i g n o r a`), sin juntar palabras
-  distintas. Las raíces (`ignor`, `instrucci`) coinciden con el comienzo de una
-  palabra; las demás palabras, enteras (`systemd`, `arreglar` y «toma notas» ya
-  no se descartan); las frases, seguidas o todo junto en una palabra
+  distintas. Las raíces y palabras que no aparecen dentro de una palabra
+  legítima (`ignor`, `instrucci`, `instruct`, `prompt`, `disregard`, `forget`,
+  `developer`, `assistant`) se buscan en cualquier lugar de una palabra, así
+  `systemprompt` o `developer_mode` caen; `system`, `sistema` y `regla`, como
+  palabra entera (`systemd`, `filesystem`, `arreglar` y «toma notas» ya no se
+  descartan); las frases, seguidas o todo junto en una palabra
   (`olvida-lo-anterior`); los signos (`<|`, `###`, `user:`), como subcadena. Los
   selectores de variación y los rellenos de Hangul cuentan como caracteres
   prohibidos, y una nota sólo puede tener letras latinas (ASCII, Latin-1 y Latin
