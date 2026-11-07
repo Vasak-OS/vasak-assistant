@@ -4,6 +4,8 @@
 //! `/api/chat` sin streaming (la respuesta entera de una vez). Las defensas
 //! comunes —tiempos, tope, sin redirecciones ni proxy— están en [`crate::http`].
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use vasak_assistant_protocol::{Message, ModelInfo};
@@ -18,6 +20,9 @@ pub struct OllamaBackend {
     /// Si la configuración permite que la conversación salga de la máquina: lo
     /// decide el modelo por omisión, que puede resultar ser uno `cloud`.
     allow_remote: bool,
+    /// Si la última resolución del modelo dio uno que corre afuera: así el
+    /// estado de un modelo rechazado no lo informa local ([`Self::info`]).
+    last_remote: AtomicBool,
 }
 
 impl OllamaBackend {
@@ -26,6 +31,7 @@ impl OllamaBackend {
             client,
             selection,
             allow_remote,
+            last_remote: AtomicBool::new(false),
         }
     }
 
@@ -33,7 +39,9 @@ impl OllamaBackend {
         &self.selection.url
     }
 
-    async fn installed_models(&self) -> Result<Vec<String>, BackendError> {
+    /// Las filas de `/api/tags`: qué modelos hay y cuáles corren en otro host.
+    /// Un error acá no deja mandar nada: sin la lista no se sabe si es local.
+    async fn installed_models(&self) -> Result<Vec<TagsModel>, BackendError> {
         let response = self
             .client
             .get(http::endpoint(self.base(), "api/tags")?)
@@ -56,18 +64,20 @@ impl OllamaBackend {
         parse_tags(&http::read_capped(self.base(), response).await?)
     }
 
-    async fn resolve_model(&self) -> Result<String, BackendError> {
+    /// El modelo con el que responder y si corre fuera de la máquina.
+    async fn resolve_model(&self) -> Result<(String, bool), BackendError> {
         let installed = self.installed_models().await?;
-        let model = pick_model(self.selection.model.as_deref(), &installed)?;
-        // El modelo por omisión puede ser uno `cloud`: sale de la máquina, así
-        // que sin `allow_remote` no se usa. El configurado ya se filtró al
-        // elegir el backend (`select_backend`).
-        if !self.allow_remote && crate::config::is_ollama_cloud_model(&model) {
-            return Err(BackendError::NotAllowed(format!(
-                "El modelo «{model}» de Ollama corre en la nube: la conversación saldría de la máquina. Para usarlo hay que permitirlo con «allow_remote»."
-            )));
+        let names: Vec<String> = installed.iter().map(|row| row.name.clone()).collect();
+        let model = pick_model(self.selection.model.as_deref(), &names)?;
+        let remote = is_remote(&model, &installed);
+        self.last_remote.store(remote, Ordering::Relaxed);
+        // El modelo puede correr afuera aunque el nombre no lo diga (un alias
+        // de `ollama create` con `remote_host`), y el por omisión también:
+        // sin `allow_remote` no se usa. `select_backend` sólo vio el nombre.
+        if !self.allow_remote && remote {
+            return Err(remote_not_allowed(&model));
         }
-        Ok(model)
+        Ok((model, remote))
     }
 
     /// Una sola resolución del modelo para decidir y mandar. Con
@@ -78,8 +88,10 @@ impl OllamaBackend {
         messages: &[Message],
         require_local: bool,
     ) -> Result<String, BackendError> {
-        let model = self.resolve_model().await?;
-        if require_local && !(self.info().local && !crate::config::is_ollama_cloud_model(&model)) {
+        let (model, remote) = self.resolve_model().await?;
+        // La selección y no `info`: ésta decide con la resolución de este
+        // pedido, no con la última de cualquiera.
+        if require_local && !(self.selection.local && !remote) {
             return Err(BackendError::NotLocal);
         }
         let response = self
@@ -112,26 +124,48 @@ impl OllamaBackend {
                 )))
             }
         }
-        parse_chat(&http::read_capped(self.base(), response).await?)
+        let reply = parse_chat(&http::read_capped(self.base(), response).await?)?;
+        // Entre `/api/tags` y `/api/chat` un proceso local puede reapuntar el
+        // nombre a un modelo remoto (`/api/create`): no se evita, se detecta.
+        // Lo mandado ya salió; la respuesta se descarta. Sin `allow_remote`,
+        // `NotAllowed` para que nadie reintente; con él, `RemoteAfterSend` deja
+        // reintentar sin las notas.
+        if !reply.remote_host.is_empty() && (require_local || !self.allow_remote) {
+            tracing::warn!(
+                backend = "ollama",
+                "el modelo cambió a uno remoto durante el pedido"
+            );
+            return Err(if self.allow_remote {
+                BackendError::RemoteAfterSend
+            } else {
+                remote_not_allowed(&model)
+            });
+        }
+        Ok(reply.message.content)
     }
 }
 
 impl ModelBackend for OllamaBackend {
     fn info(&self) -> ModelInfo {
-        self.selection.info()
+        let mut info = self.selection.info();
+        info.local = info.local && !self.last_remote.load(Ordering::Relaxed);
+        info
     }
 
     fn models(&self) -> BoxFuture<'_, Result<Vec<String>, BackendError>> {
-        Box::pin(self.installed_models())
+        Box::pin(async move {
+            let installed = self.installed_models().await?;
+            Ok(installed.into_iter().map(|row| row.name).collect())
+        })
     }
 
     fn active_model(&self) -> BoxFuture<'_, Result<ModelInfo, BackendError>> {
         Box::pin(async move {
-            let name = self.resolve_model().await?;
-            // Un modelo por omisión que resultó `cloud` no es local aunque la
-            // dirección sea el loopback: que el estado lo diga.
+            let (name, remote) = self.resolve_model().await?;
+            // Un modelo que corre afuera no es local aunque la dirección sea el
+            // loopback: que el estado lo diga.
             let mut info = self.info();
-            info.local = info.local && !crate::config::is_ollama_cloud_model(&name);
+            info.local = info.local && !remote;
             info.name = name;
             Ok(info)
         })
@@ -158,50 +192,76 @@ struct ChatRequest<'a> {
     stream: bool,
 }
 
-#[derive(Deserialize)]
-struct ChatResponse {
-    message: ChatResponseMessage,
+/// La respuesta de `/api/chat`. `remote_host` (con `omitempty`) dice si la
+/// respondió un modelo que corre en otro host.
+#[derive(Debug, Deserialize)]
+pub struct ChatResponse {
+    pub message: ChatResponseMessage,
+    #[serde(default)]
+    pub remote_host: String,
 }
 
-#[derive(Deserialize)]
-struct ChatResponseMessage {
-    content: String,
+/// El mensaje de la respuesta de `/api/chat`: sólo el texto.
+#[derive(Debug, Deserialize)]
+pub struct ChatResponseMessage {
+    pub content: String,
 }
 
+/// La respuesta de `/api/tags`: una fila por modelo instalado.
 #[derive(Deserialize)]
 struct TagsResponse {
     models: Vec<TagsModel>,
 }
 
-#[derive(Deserialize)]
-struct TagsModel {
-    name: String,
+/// Una fila de `/api/tags`. Ollama manda `remote_host` (con `omitempty`) en
+/// los modelos que corren en otro host: los `:cloud` y los alias que
+/// `ollama create` deja apuntando a uno.
+#[derive(Debug, Deserialize)]
+pub struct TagsModel {
+    pub name: String,
+    #[serde(default)]
+    pub remote_host: String,
 }
 
-/// La respuesta de `/api/chat`: el texto del modelo.
-pub fn parse_chat(body: &[u8]) -> Result<String, BackendError> {
+/// La respuesta de `/api/chat`: el texto del modelo y de dónde vino.
+pub fn parse_chat(body: &[u8]) -> Result<ChatResponse, BackendError> {
     serde_json::from_slice::<ChatResponse>(body)
-        .map(|response| response.message.content)
         .map_err(|_| BackendError::Failed("respuesta de Ollama ilegible".into()))
 }
 
-/// La respuesta de `/api/tags`: los nombres de los modelos instalados.
-pub fn parse_tags(body: &[u8]) -> Result<Vec<String>, BackendError> {
+/// La respuesta de `/api/tags`: los modelos instalados.
+pub fn parse_tags(body: &[u8]) -> Result<Vec<TagsModel>, BackendError> {
     serde_json::from_slice::<TagsResponse>(body)
-        .map(|tags| tags.models.into_iter().map(|model| model.name).collect())
+        .map(|tags| tags.models)
         .map_err(|_| BackendError::Failed("lista de modelos ilegible".into()))
+}
+
+/// Si `model` corre fuera de la máquina: por el nombre (`:cloud`/`-cloud`, que
+/// el servidor manda a ollama.com aunque no figure en la lista) o porque su
+/// fila trae `remote_host`. Falla cerrado: un modelo sin fila cuenta como remoto.
+///
+/// `model` se compara exacto contra el nombre de la fila, tal cual lo devuelve
+/// [`pick_model`] (que ya resolvió el `:latest`).
+pub fn is_remote(model: &str, installed: &[TagsModel]) -> bool {
+    crate::config::is_ollama_cloud_model(model)
+        || !matches!(
+            installed.iter().find(|row| row.name == model),
+            Some(row) if row.remote_host.is_empty()
+        )
 }
 
 /// Con qué modelo responder. Si hay uno configurado tiene que estar instalado;
 /// Ollama le agrega `:latest` al nombre sin etiqueta, así que `llama3.2`
 /// encuentra a `llama3.2:latest`. Si no hay ninguno configurado, el primero
-/// instalado.
+/// instalado. Un `:cloud`/`-cloud` configurado se usa aunque no figure: el
+/// servidor lo resuelve contra ollama.com sin haber bajado nada.
 pub fn pick_model(configured: Option<&str>, installed: &[String]) -> Result<String, BackendError> {
     match configured {
         Some(wanted) => installed
             .iter()
             .find(|name| *name == wanted || name.strip_suffix(":latest") == Some(wanted))
             .cloned()
+            .or_else(|| crate::config::is_ollama_cloud_model(wanted).then(|| wanted.to_owned()))
             .ok_or_else(|| model_missing(wanted)),
         None => installed.first().cloned().ok_or_else(|| {
             BackendError::Unavailable(
@@ -210,6 +270,12 @@ pub fn pick_model(configured: Option<&str>, installed: &[String]) -> Result<Stri
             )
         }),
     }
+}
+
+fn remote_not_allowed(model: &str) -> BackendError {
+    BackendError::NotAllowed(format!(
+        "El modelo «{model}» de Ollama corre en la nube o en otro host: la conversación saldría de la máquina. Para usarlo hay que permitirlo con «allow_remote»."
+    ))
 }
 
 fn model_missing(model: &str) -> BackendError {
@@ -224,7 +290,10 @@ mod tests {
     const TOPE: usize = 256 * 1024;
 
     use super::*;
-    use crate::test_support::{client, closed_port_url, local_selection, FakeServer, Reply};
+    use crate::test_support::{
+        client, closed_port_url, local_selection, ollama_backend, remote_tags, FakeServer, Reply,
+        REMOTE_HOST,
+    };
     use vasak_assistant_protocol::Role;
 
     const TAGS: &str = r#"{"models":[{"name":"llama3.2:latest"},{"name":"qwen2.5:7b"}]}"#;
@@ -350,10 +419,12 @@ mod tests {
 
     #[test]
     fn parse_tags_lee_los_nombres_y_rechaza_lo_ilegible() {
-        assert_eq!(
-            parse_tags(TAGS.as_bytes()).unwrap(),
-            ["llama3.2:latest", "qwen2.5:7b"]
-        );
+        let names: Vec<_> = parse_tags(TAGS.as_bytes())
+            .unwrap()
+            .into_iter()
+            .map(|row| row.name)
+            .collect();
+        assert_eq!(names, ["llama3.2:latest", "qwen2.5:7b"]);
         assert!(matches!(
             parse_tags(b"no es json"),
             Err(BackendError::Failed(_))
@@ -363,7 +434,10 @@ mod tests {
 
     #[test]
     fn parse_chat_lee_el_texto_y_rechaza_lo_ilegible() {
-        assert_eq!(parse_chat(CHAT.as_bytes()).unwrap(), "Hola, soy Lince.");
+        assert_eq!(
+            parse_chat(CHAT.as_bytes()).unwrap().message.content,
+            "Hola, soy Lince."
+        );
         assert!(matches!(parse_chat(b"{}"), Err(BackendError::Failed(_))));
         assert!(matches!(
             parse_chat(br#"{"message":{"content":null}}"#),
@@ -603,6 +677,299 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, BackendError::NotLocal), "{error:?}");
+        assert_eq!(chats(&server), 0);
+    }
+
+    // ── #23: remoto por `remote_host`, por nombre o por no figurar ────────────
+
+    fn alias_tags() -> String {
+        remote_tags("mio:latest")
+    }
+
+    /// Un Ollama con estas filas de `/api/tags` que contesta el chat.
+    async fn ollama_with_tags(tags: impl Into<String>) -> FakeServer {
+        let tags = tags.into();
+        FakeServer::start(move |pedido| match pedido.path.as_str() {
+            "/api/tags" => Reply::json(&tags),
+            "/api/chat" => Reply::json(CHAT),
+            _ => Reply::status(404),
+        })
+        .await
+    }
+
+    /// Como `cloud_backend`, con un modelo configurado.
+    fn configured_backend(
+        server: &FakeServer,
+        model: Option<&str>,
+        allow_remote: bool,
+    ) -> OllamaBackend {
+        ollama_backend(&server.url(""), model, allow_remote)
+    }
+
+    #[tokio::test]
+    async fn un_alias_sin_sufijo_con_remote_host_sin_allow_remote_no_se_usa_ni_manda_nada() {
+        for model in [None, Some("mio"), Some("mio:latest")] {
+            let server = ollama_with_tags(alias_tags()).await;
+            let backend = configured_backend(&server, model, false);
+
+            assert!(
+                matches!(
+                    backend.active_model().await,
+                    Err(BackendError::NotAllowed(_))
+                ),
+                "{model:?}"
+            );
+            assert!(
+                matches!(
+                    backend.chat(&[user("hola")]).await,
+                    Err(BackendError::NotAllowed(_))
+                ),
+                "{model:?}"
+            );
+            assert_eq!(chats(&server), 0, "{model:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn un_alias_con_remote_host_y_allow_remote_es_remoto_chatea_pero_no_sale_por_chat_local_only(
+    ) {
+        for model in [None, Some("mio"), Some("mio:latest")] {
+            let server = ollama_with_tags(alias_tags()).await;
+            let backend = configured_backend(&server, model, true);
+
+            let active = backend.active_model().await.unwrap();
+            assert_eq!(active.name, "mio:latest", "{model:?}");
+            assert!(!active.local, "{model:?}");
+
+            let error = backend.chat_local_only(&[user("hola")]).await.unwrap_err();
+            assert!(
+                matches!(error, BackendError::NotLocal),
+                "{model:?}: {error:?}"
+            );
+            assert_eq!(chats(&server), 0, "{model:?}");
+
+            backend.chat(&[user("hola")]).await.unwrap();
+            assert_eq!(chats(&server), 1, "{model:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn un_remote_host_vacio_o_ausente_es_un_modelo_local() {
+        for tags in [
+            r#"{"models":[{"name":"mio:latest","remote_host":""}]}"#,
+            r#"{"models":[{"name":"mio:latest"}]}"#,
+        ] {
+            let server = ollama_with_tags(tags).await;
+            let backend = configured_backend(&server, None, false);
+
+            assert!(backend.active_model().await.unwrap().local, "{tags}");
+            backend.chat_local_only(&[user("hola")]).await.unwrap();
+            assert_eq!(chats(&server), 1, "{tags}");
+        }
+    }
+
+    #[tokio::test]
+    async fn un_cloud_configurado_que_no_figura_en_la_lista_es_remoto() {
+        let server = ollama_with_tags(TAGS).await;
+
+        let sin_permiso = configured_backend(&server, Some("qwen3:cloud"), false);
+        assert!(matches!(
+            sin_permiso.active_model().await,
+            Err(BackendError::NotAllowed(_))
+        ));
+        assert!(matches!(
+            sin_permiso.chat(&[user("hola")]).await,
+            Err(BackendError::NotAllowed(_))
+        ));
+
+        let con_permiso = configured_backend(&server, Some("qwen3:cloud"), true);
+        let active = con_permiso.active_model().await.unwrap();
+        assert_eq!(active.name, "qwen3:cloud");
+        assert!(!active.local);
+        assert!(matches!(
+            con_permiso.chat_local_only(&[user("hola")]).await,
+            Err(BackendError::NotLocal)
+        ));
+        assert_eq!(chats(&server), 0);
+    }
+
+    #[tokio::test]
+    async fn un_nombre_que_no_figura_y_no_es_cloud_sigue_siendo_no_disponible() {
+        let server = ollama_with_tags(TAGS).await;
+        let backend = configured_backend(&server, Some("fantasma"), true);
+
+        assert!(matches!(
+            backend.active_model().await,
+            Err(BackendError::Unavailable(_))
+        ));
+        assert_eq!(chats(&server), 0);
+    }
+
+    #[tokio::test]
+    async fn con_la_lista_de_modelos_caida_ilegible_o_con_remote_host_que_no_es_texto_no_sale_nada()
+    {
+        async fn caida(allow_remote: bool) -> (FakeServer, OllamaBackend) {
+            let server = FakeServer::start(|pedido| match pedido.path.as_str() {
+                "/api/tags" => Reply::status(503),
+                _ => Reply::json(CHAT),
+            })
+            .await;
+            let backend = configured_backend(&server, None, allow_remote);
+            (server, backend)
+        }
+
+        let (server, backend) = caida(true).await;
+        assert!(backend.chat(&[user("hola")]).await.is_err());
+        assert!(backend.chat_local_only(&[user("hola")]).await.is_err());
+        assert_eq!(chats(&server), 0);
+
+        for tags in [
+            "no es json",
+            r#"{"models":[{"name":"mio:latest","remote_host":42}]}"#,
+            r#"{"models":[{"name":"mio:latest","remote_host":null}]}"#,
+        ] {
+            let server = ollama_with_tags(tags).await;
+            let backend = configured_backend(&server, None, true);
+            assert!(backend.chat(&[user("hola")]).await.is_err(), "{tags}");
+            assert!(
+                backend.chat_local_only(&[user("hola")]).await.is_err(),
+                "{tags}"
+            );
+            assert_eq!(chats(&server), 0, "{tags}");
+        }
+    }
+
+    #[test]
+    fn is_remote_sin_fila_falla_cerrado_y_el_sufijo_cloud_cuenta_con_mayusculas() {
+        let installed = vec![
+            TagsModel {
+                name: "local:latest".into(),
+                remote_host: String::new(),
+            },
+            TagsModel {
+                name: "alias:latest".into(),
+                remote_host: REMOTE_HOST.into(),
+            },
+        ];
+        assert!(!is_remote("local:latest", &installed));
+        assert!(is_remote("alias:latest", &installed));
+        assert!(is_remote("desconocido:1b", &installed));
+        assert!(is_remote("Qwen3:Cloud", &[]));
+        assert!(is_remote("Qwen3:Cloud", &installed));
+    }
+
+    // ── La respuesta de /api/chat trae remote_host ────────────────────────────
+
+    const REMOTE_REPLY: &str = r#"{"message":{"role":"assistant","content":"texto-canario"},"remote_host":"https://host-canario.ejemplo:443"}"#;
+
+    async fn ollama_replying_from_remote() -> FakeServer {
+        FakeServer::start(|pedido| match pedido.path.as_str() {
+            "/api/tags" => Reply::json(TAGS),
+            "/api/chat" => Reply::json(REMOTE_REPLY),
+            _ => Reply::status(404),
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn chat_local_only_descarta_la_respuesta_que_trae_remote_host_y_no_deja_el_host_en_el_registro(
+    ) {
+        let server = ollama_replying_from_remote().await;
+        let backend = configured_backend(&server, None, true);
+        let (log, _guard) = crate::test_support::capture_logs();
+
+        let result = backend.chat_local_only(&[user("hola")]).await;
+
+        assert!(
+            matches!(result, Err(BackendError::RemoteAfterSend)),
+            "{result:?}"
+        );
+        assert_eq!(chats(&server), 1, "las notas ya habían salido");
+        let text = log.text();
+        assert!(
+            text.contains("el modelo cambió a uno remoto durante el pedido"),
+            "{text}"
+        );
+        assert!(text.contains("WARN"), "{text}");
+        assert!(!text.contains("host-canario"), "{text}");
+        assert!(!text.contains("texto-canario"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn sin_allow_remote_chat_y_chat_local_only_dan_not_allowed_ante_remote_host_y_no_dejan_el_host_en_el_registro(
+    ) {
+        for local_only in [false, true] {
+            let server = ollama_replying_from_remote().await;
+            let backend = configured_backend(&server, None, false);
+            let (log, _guard) = crate::test_support::capture_logs();
+
+            let result = if local_only {
+                backend.chat_local_only(&[user("hola")]).await
+            } else {
+                backend.chat(&[user("hola")]).await
+            };
+
+            assert!(
+                matches!(result, Err(BackendError::NotAllowed(_))),
+                "local_only={local_only}: {result:?}"
+            );
+            assert_eq!(chats(&server), 1, "local_only={local_only}");
+            let text = log.text();
+            assert!(
+                text.contains("el modelo cambió a uno remoto durante el pedido"),
+                "{text}"
+            );
+            assert!(!text.contains("host-canario"), "{text}");
+            assert!(!text.contains("texto-canario"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_comun_con_allow_remote_devuelve_el_texto_aunque_la_respuesta_traiga_remote_host()
+    {
+        let server = ollama_replying_from_remote().await;
+        let backend = configured_backend(&server, None, true);
+
+        let reply = backend.chat(&[user("hola")]).await.unwrap();
+
+        assert_eq!(reply, "texto-canario");
+    }
+
+    #[test]
+    fn parse_chat_lee_remote_host_y_lo_deja_vacio_si_falta() {
+        assert_eq!(
+            parse_chat(REMOTE_REPLY.as_bytes()).unwrap().remote_host,
+            "https://host-canario.ejemplo:443"
+        );
+        assert!(parse_chat(CHAT.as_bytes()).unwrap().remote_host.is_empty());
+    }
+    #[tokio::test]
+    async fn el_estado_de_un_alias_rechazado_dice_que_no_es_local_y_vuelve_a_local_si_deja_de_serlo(
+    ) {
+        let remote = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = remote.clone();
+        let server = FakeServer::start(move |pedido| match pedido.path.as_str() {
+            "/api/tags" if flag.load(std::sync::atomic::Ordering::SeqCst) => {
+                Reply::json(&alias_tags())
+            }
+            "/api/tags" => Reply::json(r#"{"models":[{"name":"mio:latest"}]}"#),
+            "/api/chat" => Reply::json(CHAT),
+            _ => Reply::status(404),
+        })
+        .await;
+        let backend = configured_backend(&server, None, false);
+        assert!(backend.info().local, "antes de preguntar vale la dirección");
+
+        assert!(matches!(
+            backend.active_model().await,
+            Err(BackendError::NotAllowed(_))
+        ));
+        assert!(!backend.info().local, "el alias rechazado no es local");
+        assert_eq!(chats(&server), 0);
+
+        remote.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(backend.active_model().await.unwrap().local);
+        assert!(backend.info().local, "la lista ya no trae remote_host");
         assert_eq!(chats(&server), 0);
     }
 }

@@ -36,6 +36,10 @@ pub enum BackendError {
     /// El rechazo de [`ModelBackend::chat_local_only`]: el modelo que
     /// respondería no es local, y no se mandó nada. El texto es [`NOT_LOCAL`].
     NotLocal,
+    /// Como [`Self::NotLocal`], pero ya se mandó: la respuesta del chat dijo
+    /// que la respondió un modelo remoto (Ollama, `remote_host`) y se
+    /// descartó. El texto es [`REMOTE_AFTER_SEND`].
+    RemoteAfterSend,
     /// El cupo de `models` está lleno. El servicio lo devuelve como `Busy`
     /// ([`crate::service::to_dbus`]); el texto es [`METADATA_BUSY`].
     Busy,
@@ -47,6 +51,7 @@ impl BackendError {
         match self {
             Self::Unavailable(text) | Self::Failed(text) | Self::NotAllowed(text) => text,
             Self::NotLocal => NOT_LOCAL,
+            Self::RemoteAfterSend => REMOTE_AFTER_SEND,
             Self::Busy => METADATA_BUSY,
         }
     }
@@ -91,6 +96,10 @@ pub trait ModelBackend: Send + Sync {
 /// El motivo de [`ModelBackend::chat_local_only`] cuando el modelo no es local.
 pub const NOT_LOCAL: &str =
     "El modelo que respondería no es local: lo que viene de la memoria no se le manda.";
+
+/// El motivo de [`BackendError::RemoteAfterSend`].
+pub const REMOTE_AFTER_SEND: &str =
+    "El modelo que respondió no era local: el pedido ya había salido y la respuesta se descartó.";
 
 /// El motivo de `models` cuando el cupo de modelos está lleno.
 pub const METADATA_BUSY: &str =
@@ -288,6 +297,12 @@ fn log_request<T>(
             ms,
             "el modelo no es local: no se mandó"
         ),
+        Err(BackendError::RemoteAfterSend) => tracing::warn!(
+            backend = provider.as_str(),
+            operation,
+            ms,
+            "el modelo resultó remoto: se mandó y se descartó la respuesta"
+        ),
         Err(BackendError::Unavailable(text) | BackendError::NotAllowed(text)) => tracing::warn!(
             backend = provider.as_str(),
             operation,
@@ -324,6 +339,7 @@ mod tests {
             (BackendError::Failed("b".into()), "b"),
             (BackendError::NotAllowed("c".into()), "c"),
             (BackendError::NotLocal, NOT_LOCAL),
+            (BackendError::RemoteAfterSend, REMOTE_AFTER_SEND),
             (BackendError::Busy, METADATA_BUSY),
         ] {
             assert_eq!(error.text(), text, "{error:?}");
@@ -696,6 +712,30 @@ mod log_tests {
         );
         assert!(l.contains("DEBUG"), "{l}");
         assert!(!log.text().contains(" WARN "), "{}", log.text());
+    }
+
+    #[tokio::test]
+    async fn un_remote_after_send_deja_una_advertencia_sin_contenido_ni_host() {
+        let inner = ScriptedBackend::new(["respuesta-canario-qzx"]);
+        *inner.reject_local_only.lock() = Some(BackendError::RemoteAfterSend);
+        let backend = Limited::new(inner);
+        let (log, _guard) = capture_logs();
+
+        let error = backend
+            .chat_local_only(&user("mensaje-canario-qzx"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, BackendError::RemoteAfterSend));
+        let l = line(
+            &log,
+            &[
+                "el modelo resultó remoto: se mandó y se descartó la respuesta",
+                "operation=\"chat_local_only\"",
+            ],
+        );
+        assert!(l.contains("WARN"), "{l}");
+        assert!(!log.text().contains("canario"), "{}", log.text());
     }
 
     #[tokio::test]

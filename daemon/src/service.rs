@@ -514,7 +514,7 @@ impl AssistantService {
                     // se reintenta sin notas (la persona igual tiene respuesta,
                     // y la conversación ya podía ir a ese modelo) y ese turno
                     // no se aprende.
-                    Err(BackendError::NotLocal) => {
+                    Err(BackendError::NotLocal | BackendError::RemoteAfterSend) => {
                         use_memory = false;
                         self.backend.chat(&context).await
                     }
@@ -691,7 +691,9 @@ pub fn capabilities(remote_allowed: bool, memory: &MemoryStatus) -> Vec<Capabili
 pub fn to_dbus(error: BackendError) -> Error {
     match error {
         BackendError::Busy => Error::Busy(error.text().to_owned()),
-        BackendError::NotLocal => Error::Unavailable(error.text().to_owned()),
+        BackendError::NotLocal | BackendError::RemoteAfterSend => {
+            Error::Unavailable(error.text().to_owned())
+        }
         BackendError::Unavailable(text) | BackendError::NotAllowed(text) => {
             Error::Unavailable(text)
         }
@@ -2627,6 +2629,154 @@ mod effective_model_tests {
     }
 
     #[tokio::test]
+    async fn si_la_respuesta_de_ollama_llega_con_remote_host_sin_allow_remote_da_error_no_se_reintenta_ni_se_aprende(
+    ) {
+        use crate::test_support::{ollama_backend, FakeServer, Reply, REMOTE_HOST};
+
+        let chat = serde_json::json!({
+            "message": {"role": "assistant", "content": "Hola."},
+            "remote_host": REMOTE_HOST,
+        })
+        .to_string();
+        let server = FakeServer::start(move |pedido| match pedido.path.as_str() {
+            "/api/tags" => Reply::json(r#"{"models":[{"name":"llama3.2:latest"}]}"#),
+            "/api/chat" => Reply::json(&chat),
+            _ => Reply::status(404),
+        })
+        .await;
+        let ollama = ollama_backend(&server.url(""), None, false);
+        let rig = rig(Arc::new(Limited::new(Arc::new(ollama))), false).await;
+        let id = rig.service.open(OWNER).unwrap();
+
+        let result = rig
+            .service
+            .chat_as(OWNER, &id, "prefiero el mate amargo, ¿qué tal?")
+            .await;
+        rig.service.memory.wait_until_idle().await;
+
+        assert!(result.is_err(), "{result:?}");
+        let bodies: Vec<String> = server
+            .captured()
+            .iter()
+            .filter(|r| r.path == "/api/chat")
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        // Sólo el que llevaba las notas (descartado): sin reintento ni extracción.
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        assert!(
+            bodies[0].contains("Prefiere respuestas cortas"),
+            "{}",
+            bodies[0]
+        );
+        assert!(!remembers(&rig, "mate amargo").await);
+        // Un turno que falla no deja nada en el historial: ni la respuesta
+        // descartada ni la pregunta (`finish_turn` sólo guarda con respuesta).
+        let history = rig.service.history_of(OWNER, &id).unwrap();
+        assert!(history.is_empty(), "{history:?}");
+    }
+
+    #[tokio::test]
+    async fn un_remote_after_send_se_reintenta_sin_notas_y_no_se_aprende() {
+        let backend = ScriptedBackend::new(["Hola.", EXTRACTION]);
+        *backend.reject_local_only.lock() = Some(BackendError::RemoteAfterSend);
+        let rig = rig(backend.clone(), false).await;
+
+        chat(&rig, "prefiero el mate amargo, ¿qué tal?").await;
+
+        let seen = backend.seen.lock().clone();
+        assert_eq!(seen.len(), 1, "sólo el reintento: {seen:?}");
+        assert!(seen[0].iter().all(|m| m.role != Role::System));
+        assert!(!remembers(&rig, "mate amargo").await);
+    }
+
+    #[tokio::test]
+    async fn con_allow_remote_una_respuesta_con_remote_host_se_reintenta_sin_notas_y_no_se_aprende()
+    {
+        use crate::test_support::{ollama_backend, FakeServer, Reply, REMOTE_HOST};
+
+        // Cada pedido recibe un texto distinto: el primero, con `remote_host`,
+        // se descarta; el segundo es el que la persona tiene que ver.
+        let discarded = serde_json::json!({
+            "message": {"role": "assistant", "content": "Descartada."},
+            "remote_host": REMOTE_HOST,
+        })
+        .to_string();
+        let accepted = r#"{"message":{"role":"assistant","content":"Segunda."}}"#;
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let server = FakeServer::start(move |pedido| match pedido.path.as_str() {
+            "/api/tags" => Reply::json(r#"{"models":[{"name":"llama3.2:latest"}]}"#),
+            "/api/chat" if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 => {
+                Reply::json(&discarded)
+            }
+            "/api/chat" => Reply::json(accepted),
+            _ => Reply::status(404),
+        })
+        .await;
+        let ollama = ollama_backend(&server.url(""), None, true);
+        let rig = rig(Arc::new(Limited::new(Arc::new(ollama))), false).await;
+        let id = rig.service.open(OWNER).unwrap();
+
+        let reply = rig
+            .service
+            .chat_as(OWNER, &id, "prefiero el mate amargo, ¿qué tal?")
+            .await
+            .unwrap();
+        rig.service.memory.wait_until_idle().await;
+
+        assert_eq!(reply, "Segunda.");
+        let bodies: Vec<String> = server
+            .captured()
+            .iter()
+            .filter(|r| r.path == "/api/chat")
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        // Uno con las notas (descartado) y uno sin ellas; ninguno de extracción.
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+        assert!(
+            bodies[0].contains("Prefiere respuestas cortas"),
+            "{}",
+            bodies[0]
+        );
+        assert!(
+            !bodies[1].contains("Prefiere respuestas cortas"),
+            "{}",
+            bodies[1]
+        );
+        assert!(!bodies[1].contains("\"system\""), "{}", bodies[1]);
+        assert!(!remembers(&rig, "mate amargo").await);
+        // El historial guarda la respuesta aceptada, no la descartada.
+        let history = rig.service.history_of(OWNER, &id).unwrap();
+        assert_eq!(history.len(), 2, "{history:?}");
+        assert_eq!(history[1].role, Role::Assistant);
+        assert_eq!(history[1].content, "Segunda.");
+        assert!(history.iter().all(|m| !m.content.contains("Descartada.")));
+    }
+
+    #[tokio::test]
+    async fn un_alias_con_remote_host_y_allow_remote_sin_compartir_no_ve_la_memoria() {
+        use crate::test_support::{ollama_backend, remote_tags, FakeServer, Reply};
+
+        let tags = remote_tags("mio:latest");
+        let server = FakeServer::start(move |pedido| match pedido.path.as_str() {
+            "/api/tags" => Reply::json(&tags),
+            "/api/chat" => Reply::json(r#"{"message":{"role":"assistant","content":"Hola."}}"#),
+            _ => Reply::status(404),
+        })
+        .await;
+        let ollama = Arc::new(Limited::new(Arc::new(ollama_backend(
+            &server.url(""),
+            None,
+            true,
+        ))));
+        let rig = rig(ollama.clone(), false).await;
+
+        assert!(!rig.service.memory.allowed_for(&*ollama).await);
+        let status = rig.service.memory_status_now().await;
+        assert!(!status.available && status.enabled, "{status:?}");
+        assert_eq!(status.reason, REASON_REMOTE);
+    }
+
+    #[tokio::test]
     async fn compartiendo_con_remotos_un_modelo_remoto_que_responde_sigue_disponible() {
         let rig = rig(ScriptedBackend::cloud_by_default([]), true).await;
 
@@ -4305,6 +4455,10 @@ mod owner_chat_limit_tests {
         assert!(matches!(
             to_dbus(BackendError::NotAllowed("en la nube".into())),
             Error::Unavailable(text) if text == "en la nube"
+        ));
+        assert!(matches!(
+            to_dbus(BackendError::RemoteAfterSend),
+            Error::Unavailable(text) if text == crate::backend::REMOTE_AFTER_SEND
         ));
         // El texto del cupo lleno en un `Unavailable` no es el cupo lleno.
         assert!(matches!(
