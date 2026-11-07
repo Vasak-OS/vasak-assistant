@@ -948,3 +948,136 @@ mod owner_limit_tests {
         assert!(conversations.in_flight.is_empty());
     }
 }
+
+/// El cupo compartido de los confinados (#32).
+#[cfg(test)]
+mod confined_quota_tests {
+    use super::*;
+
+    const A: &str = ":1.1";
+    const B: &str = ":1.2";
+    const C: &str = ":1.3";
+
+    // El cupo de los confinados deja lugar al resto, y el de chats no puede
+    // llenar el del servicio (`backend::MAX_IN_FLIGHT`).
+    const _: () = {
+        assert!(MAX_CONFINED_CONVERSATIONS < MAX_CONVERSATIONS);
+        assert!(MAX_CONFINED_CHATS_IN_FLIGHT < crate::backend::MAX_IN_FLIGHT);
+        assert!(MAX_CONFINED_CONVERSATIONS > 0 && MAX_CONFINED_CHATS_IN_FLIGHT > 0);
+    };
+
+    #[test]
+    fn entre_dos_duenios_confinados_la_conversacion_de_mas_da_limit_exceeded_y_un_duenio_sin_confinar_sigue_abriendo(
+    ) {
+        let mut conversations = Conversations::default();
+        for _ in 0..MAX_CONFINED_CONVERSATIONS / 2 {
+            conversations.create(A, true).unwrap();
+            conversations.create(B, true).unwrap();
+        }
+
+        // Ni un dueño nuevo confinado ni uno que ya tenía entran.
+        for owner in [A, B, C] {
+            assert!(
+                matches!(
+                    conversations.create(owner, true),
+                    Err(Error::LimitExceeded(_))
+                ),
+                "{owner}"
+            );
+        }
+        // Sin confinar sigue abriendo, y lo suyo no gasta el cupo compartido.
+        for _ in 0..MAX_CONVERSATIONS_PER_OWNER {
+            conversations.create(C, false).unwrap();
+        }
+        assert_eq!(
+            conversations.open.values().filter(|c| c.confined).count(),
+            MAX_CONFINED_CONVERSATIONS
+        );
+    }
+
+    #[test]
+    fn cerrar_una_conversacion_confinada_devuelve_su_lugar_al_cupo_compartido() {
+        let mut conversations = Conversations::default();
+        let ids: Vec<String> = (0..MAX_CONFINED_CONVERSATIONS)
+            .map(|_| conversations.create(A, true).unwrap())
+            .collect();
+        assert!(conversations.create(B, true).is_err());
+
+        conversations.delete(A, &ids[0]).unwrap();
+
+        assert!(conversations.create(B, true).is_ok());
+    }
+
+    #[test]
+    fn con_un_chat_confinado_en_vuelo_el_de_otro_confinado_da_busy_y_el_sin_confinar_chatea() {
+        let mut conversations = Conversations::default();
+        let a = conversations.create(A, true).unwrap();
+        let b = conversations.create(B, true).unwrap();
+        let c = conversations.create(C, false).unwrap();
+        conversations.begin_turn(A, &a, "uno").unwrap();
+
+        let busy = conversations.begin_turn(B, &b, "dos");
+
+        assert_eq!(MAX_CONFINED_CHATS_IN_FLIGHT, 1);
+        assert!(matches!(busy, Err(Error::Busy(_))), "{busy:?}");
+        // El rechazado no ocupó nada: ni la conversación ni su mensaje.
+        assert!(!conversations.open[&b].busy);
+        assert!(conversations.history(B, &b).unwrap().is_empty());
+        // Sin confinar chatea al mismo tiempo, y no gasta el cupo compartido.
+        conversations.begin_turn(C, &c, "tres").unwrap();
+
+        // Al terminar el turno, el lugar vuelve.
+        conversations.finish_turn(&a, "uno", Some("ok"));
+        conversations.begin_turn(B, &b, "dos").unwrap();
+    }
+
+    #[test]
+    fn un_chat_sin_confinar_en_vuelo_no_ocupa_el_lugar_de_los_confinados() {
+        let mut conversations = Conversations::default();
+        let c = conversations.create(C, false).unwrap();
+        let a = conversations.create(A, true).unwrap();
+        conversations.begin_turn(C, &c, "uno").unwrap();
+
+        assert!(conversations.begin_turn(A, &a, "dos").is_ok());
+    }
+
+    #[test]
+    fn al_irse_un_confinado_se_libera_solo_lo_suyo_y_lo_del_otro_sigue_ocupando() {
+        let mut conversations = Conversations::default();
+        let a = conversations.create(A, true).unwrap();
+        let b = conversations.create(B, true).unwrap();
+        conversations.begin_turn(A, &a, "uno").unwrap();
+
+        // Se va B: el lugar en vuelo de A sigue ocupado y su conversación abierta.
+        assert_eq!(conversations.release_owner(B), 1);
+        assert!(conversations.history(B, &b).is_err());
+        let b2 = conversations.create(B, true).unwrap();
+        assert!(matches!(
+            conversations.begin_turn(B, &b2, "dos"),
+            Err(Error::Busy(_))
+        ));
+        assert!(conversations.history(A, &a).is_ok());
+
+        // Se va A: ahora sí queda libre el lugar.
+        assert_eq!(conversations.release_owner(A), 1);
+        conversations.begin_turn(B, &b2, "dos").unwrap();
+    }
+
+    #[test]
+    fn borrar_una_conversacion_confinada_con_su_chat_en_vuelo_no_libera_el_lugar_hasta_terminar_el_turno(
+    ) {
+        let mut conversations = Conversations::default();
+        let a = conversations.create(A, true).unwrap();
+        let b = conversations.create(B, true).unwrap();
+        conversations.begin_turn(A, &a, "uno").unwrap();
+        conversations.delete(A, &a).unwrap();
+
+        assert!(matches!(
+            conversations.begin_turn(B, &b, "dos"),
+            Err(Error::Busy(_))
+        ));
+
+        conversations.finish_turn(&a, "uno", Some("ok"));
+        conversations.begin_turn(B, &b, "dos").unwrap();
+    }
+}

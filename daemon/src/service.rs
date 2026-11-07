@@ -3588,6 +3588,90 @@ mod log_tests {
             .to_owned()
     }
 
+    /// Cuántas etiquetas cuentan como confinadas, por el bus.
+    fn caller_labels() -> Vec<(&'static str, Arc<FixedLabel>, bool)> {
+        vec![
+            ("confinada", FixedLabel::of(CONFINED), true),
+            ("el bus no contesta", FixedLabel::failing(), true),
+            ("sin etiqueta", FixedLabel::none(), false),
+            ("unconfined", FixedLabel::of(b"unconfined\0"), false),
+        ]
+    }
+
+    #[tokio::test]
+    async fn por_el_bus_solo_una_etiqueta_confinada_o_que_no_se_pudo_leer_cuenta_en_el_cupo_de_conversaciones(
+    ) {
+        use vasak_assistant_protocol::MAX_CONFINED_CONVERSATIONS;
+        for (name, label, confined) in caller_labels() {
+            let rig = rig_with(label, FakeBackend::replying("hola"), Some(SENDER)).await;
+            for _ in 0..MAX_CONFINED_CONVERSATIONS {
+                rig.proxy.new_conversation().await.unwrap();
+            }
+            let (log, _guard) = capture_logs();
+
+            let extra = rig.proxy.new_conversation().await;
+
+            if confined {
+                assert!(
+                    matches!(extra, Err(Error::LimitExceeded(_))),
+                    "{name}: {extra:?}"
+                );
+                let l = line(&log, &["la llamada se rechazó", "NewConversation"]);
+                assert!(l.contains("error=\"LimitExceeded\""), "{name}: {l}");
+            } else {
+                assert!(extra.is_ok(), "{name}: {extra:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn por_el_bus_un_chat_confinado_en_vuelo_hace_que_el_siguiente_de_un_confinado_de_busy_sin_contenido_en_el_registro(
+    ) {
+        for (name, label, confined) in caller_labels() {
+            let (fake, gate) = FakeBackend::gated("hola");
+            let rig = rig_with(label, fake, Some(SENDER)).await;
+            let first = rig.proxy.new_conversation().await.unwrap();
+            let second = rig.proxy.new_conversation().await.unwrap();
+            let pending = {
+                let proxy = rig.proxy.clone();
+                tokio::spawn(async move { proxy.chat(&first, "primero").await })
+            };
+            rig.backend.entered.notified().await;
+            let (log, _guard) = capture_logs();
+
+            let result = if confined {
+                // Falla en vez de colgarse si el segundo chat entra al modelo.
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    rig.proxy.chat(&second, "contenido-canario-qzx"),
+                )
+                .await
+                .expect("el chat confinado de más tenía que rechazarse, no esperar al modelo")
+            } else {
+                // Sin confinar entra al mismo tiempo (el tope por dueño es 2).
+                let proxy = rig.proxy.clone();
+                let second_chat =
+                    tokio::spawn(async move { proxy.chat(&second, "contenido-canario-qzx").await });
+                rig.backend.entered.notified().await;
+                // Los dos están esperando al modelo: se sueltan los dos.
+                gate.notify_one();
+                gate.notify_one();
+                second_chat.await.unwrap()
+            };
+
+            if confined {
+                assert!(matches!(result, Err(Error::Busy(_))), "{name}: {result:?}");
+                let l = line(&log, &["la llamada se rechazó", "method=\"Chat\""]);
+                assert!(l.contains("error=\"Busy\""), "{name}: {l}");
+            } else {
+                assert_eq!(result.unwrap(), "hola", "{name}");
+            }
+            assert!(!log.text().contains("canario"), "{name}: {}", log.text());
+            gate.notify_one();
+            pending.await.unwrap().unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn un_limit_exceeded_deja_su_linea_con_el_metodo_el_remitente_y_el_error() {
         let rig = rig().await;
