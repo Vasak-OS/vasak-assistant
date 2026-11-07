@@ -134,6 +134,19 @@ Cerrarlo es trabajo del perfil, en Vasak-OS/vasak-desktop-settings#13. Hasta
 que ese issue esté cerrado, la memoria no se publica en una ISO ni se promueve:
 viene apagada y queda para quien la encienda sabiendo este límite.
 
+**El cupo de los confinados.** Los topes por conexión (8 conversaciones y 2
+`Chat` esperando respuesta) se cuentan por nombre único del bus, y un proceso
+que abre varias conexiones los esquivaría. Por eso todos los llamadores
+confinados comparten además un solo cupo, abran las conexiones que abran: entre
+todos, `MAX_CONFINED_CONVERSATIONS` (4) conversaciones abiertas, pasado lo cual
+`NewConversation` da `LimitExceeded`, y `MAX_CONFINED_CHATS_IN_FLIGHT` (1)
+`Chat` esperando al modelo, pasado lo cual da `Busy`. Así siempre quedan
+lugares para la persona. Los dos valores están en el contrato y son ajustables.
+Si el bus no contesta la etiqueta, la conexión cuenta como confinada. Cuando una
+conexión confinada se va, se liberan sus lugares y los de las demás quedan. Un
+proceso sin confinar queda fuera de alcance: puede abrir conexiones y esquivar
+los topes por conexión, pero igual puede leer o matar al servicio.
+
 | Método | Qué hace |
 |---|---|
 | `SetProviderKey(s url, s key) → ()` | Guarda la clave de esa dirección en la colección por omisión del llavero, reemplazando la anterior. La dirección se normaliza como la de `vasak.conf` (con `/` final); un host remoto tiene que ser `https`. La clave se recorta y va de 1 a 4096 bytes sin caracteres de control. `InvalidArgs` si algo no vale; `Unavailable` si el llavero está bloqueado (no abre ningún diálogo) o no responde. La clave nunca vuelve en un error ni va al registro. |

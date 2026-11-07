@@ -68,6 +68,23 @@ pub const MAX_CONVERSATIONS_PER_OWNER: usize = 8;
 /// y los demás no esperan hasta el plazo de D-Bus.
 pub const MAX_CHATS_IN_FLIGHT_PER_OWNER: usize = 2;
 
+/// Cuántas conversaciones pueden tener abiertas, entre todos, los llamadores
+/// confinados por AppArmor (#32). Es un cupo compartido y no por conexión: los
+/// topes por dueño se cuentan por nombre único del bus, y un proceso que abre
+/// varias conexiones los esquivaría. Chico a propósito, para que siempre queden
+/// lugares de [`MAX_CONVERSATIONS`] para la persona. Es ajustable, siempre
+/// bastante por debajo de ese total. Pasado, `NewConversation` da
+/// `LimitExceeded`.
+pub const MAX_CONFINED_CONVERSATIONS: usize = 4;
+
+/// Cuántos `Chat` pueden tener esperando respuesta, entre todos, los
+/// llamadores confinados (#32). Compartido por la misma razón que
+/// [`MAX_CONFINED_CONVERSATIONS`]: las aplicaciones confinadas ocupan a lo sumo
+/// un lugar del cupo de pedidos al modelo del servicio (4), abran las
+/// conexiones que abran, y el resto queda para la persona. Es ajustable,
+/// siempre por debajo de ese cupo. Pasado, `Chat` da `Busy`.
+pub const MAX_CONFINED_CHATS_IN_FLIGHT: usize = 1;
+
 /// Cuántos mensajes guarda una conversación. Pasado eso se olvidan los más
 /// viejos; el último intercambio se conserva siempre.
 pub const MAX_HISTORY_MESSAGES: usize = 100;
@@ -211,10 +228,12 @@ pub enum Error {
     InvalidArgs(String),
     /// No hay ninguna conversación con ese id.
     NotFound(String),
-    /// Se llegó a [`MAX_CONVERSATIONS`] o a [`MAX_CONVERSATIONS_PER_OWNER`].
+    /// Se llegó a [`MAX_CONVERSATIONS`], a [`MAX_CONVERSATIONS_PER_OWNER`] o,
+    /// para un llamador confinado, a [`MAX_CONFINED_CONVERSATIONS`].
     LimitExceeded(String),
     /// La conversación ya está esperando una respuesta, o quien llama ya tiene
-    /// [`MAX_CHATS_IN_FLIGHT_PER_OWNER`] chats esperando la suya. Es
+    /// [`MAX_CHATS_IN_FLIGHT_PER_OWNER`] chats esperando la suya, o los
+    /// confinados ya tienen [`MAX_CONFINED_CHATS_IN_FLIGHT`] entre todos. Es
     /// pasajero: se puede volver a intentar cuando llegue una respuesta.
     Busy(String),
     /// Quien llama no puede hacer eso: una aplicación confinada (AppArmor) no

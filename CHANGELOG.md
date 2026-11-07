@@ -2,6 +2,24 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-assistant 0.3.12
+
+Las aplicaciones confinadas comparten un solo cupo, y abrir muchas conexiones
+ya no esquiva los topes (#32).
+
+- **`protocol`** — `MAX_CONFINED_CONVERSATIONS` (4) y
+  `MAX_CONFINED_CHATS_IN_FLIGHT` (1): el cupo compartido de todos los
+  llamadores confinados por AppArmor, documentados como ajustables.
+- **`daemon`** — los topes por dueño se cuentan por nombre único del bus, y un
+  proceso con dos conexiones ya ocupaba los 4 lugares del cupo de pedidos al
+  modelo; con cuatro, las 32 conversaciones. Ahora `NewConversation` lee la
+  etiqueta una vez y la conversación guarda si es de un confinado: los
+  confinados, entre todos, tienen a lo sumo 4 conversaciones abiertas
+  (`LimitExceeded`) y 1 `Chat` esperando al modelo (`Busy`), además de los
+  topes por dueño, que siguen. Sin respuesta del bus, cuenta como confinado.
+  Al irse una conexión confinada se liberan sólo sus lugares. Un proceso sin
+  confinar queda fuera de alcance.
+
 ## vasak-assistant 0.3.10
 
 Lo de un turno no se aprende en una memoria que se borró mientras se respondía

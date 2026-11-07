@@ -17,6 +17,9 @@
 //! aprende de lo que dice. `MemoryStatus` y `Capabilities` siguen abiertos.
 //! Sin etiqueta (no hay AppArmor) se deja pasar; una vacía, no. No se mira
 //! `/proc/<pid>/exe`: la unidad corre con un namespace de usuario y da EACCES.
+//!
+//! Además, todos los confinados comparten un solo cupo de conversaciones y de
+//! chats en vuelo (`MAX_CONFINED_*`, #32), abran las conexiones que abran.
 
 use std::sync::Arc;
 
@@ -335,7 +338,11 @@ impl AssistantService {
         let Some(sender) = header.sender() else {
             return Err(no_sender());
         };
-        let id = self.open(sender.as_str())?;
+        // Una sola consulta de la etiqueta: la conversación guarda si es de un
+        // confinado, y `Chat` la cuenta en el cupo compartido sin preguntar otra
+        // vez (#32).
+        let confined = self.confined(connection, header).await;
+        let id = self.open(sender.as_str(), confined)?;
         // Punto a punto no hay demonio del bus a quien preguntar (el par no
         // contestaría y la llamada quedaría colgada), y el único par es el
         // que está llamando.
@@ -439,8 +446,8 @@ impl AssistantService {
         }
     }
 
-    pub fn open(&self, owner: &str) -> Result<String, Error> {
-        self.conversations.lock().create(owner)
+    pub fn open(&self, owner: &str, confined: bool) -> Result<String, Error> {
+        self.conversations.lock().create(owner, confined)
     }
 
     pub fn list(&self, owner: &str) -> Vec<String> {
@@ -801,8 +808,8 @@ mod tests {
     #[tokio::test]
     async fn el_estado_con_modelo_listo_lo_informa_y_cuenta_las_conversaciones() {
         let service = service(FakeBackend::replying("hola"), false);
-        service.open(OWNER).unwrap();
-        service.open(OWNER).unwrap();
+        service.open(OWNER, false).unwrap();
+        service.open(OWNER, false).unwrap();
 
         let status = service.status_for(OWNER).await;
 
@@ -865,7 +872,7 @@ mod tests {
             memory: memory_off(),
             labels: std::sync::Arc::new(crate::service::BusLabels),
         };
-        let id = service.open(OWNER).unwrap();
+        let id = service.open(OWNER, false).unwrap();
 
         assert_eq!(
             service.chat_as(OWNER, &id, "uno").await.unwrap(),
@@ -907,7 +914,7 @@ mod tests {
             memory: memory_off(),
             labels: std::sync::Arc::new(crate::service::BusLabels),
         };
-        let id = service.open(OWNER).unwrap();
+        let id = service.open(OWNER, false).unwrap();
         service.chat_as(OWNER, &id, "primero").await.unwrap_err();
         assert!(service.history_of(OWNER, &id).unwrap().is_empty());
 
@@ -924,7 +931,7 @@ mod tests {
         let (backend, gate) = FakeBackend::gated("respuesta");
         let entered = backend.entered.clone();
         let service = Arc::new(service(backend, false));
-        let id = service.open(OWNER).unwrap();
+        let id = service.open(OWNER, false).unwrap();
 
         let primero = tokio::spawn({
             let (service, id) = (service.clone(), id.clone());
@@ -949,7 +956,7 @@ mod tests {
         let (backend, gate) = FakeBackend::gated("respuesta");
         let entered = backend.entered.clone();
         let service = service(backend, false);
-        let id = service.open(OWNER).unwrap();
+        let id = service.open(OWNER, false).unwrap();
 
         // El pedido queda esperando al modelo y se abandona (el cliente se fue).
         tokio::select! {
@@ -977,7 +984,7 @@ mod tests {
             memory: memory_off(),
             labels: std::sync::Arc::new(crate::service::BusLabels),
         };
-        let id = service.open(OWNER).unwrap();
+        let id = service.open(OWNER, false).unwrap();
         assert!(matches!(
             service.chat_as(OWNER, &id, "  ").await,
             Err(Error::InvalidArgs(_))
@@ -993,10 +1000,13 @@ mod tests {
     async fn abrir_listar_y_cerrar_conversaciones_respeta_el_tope() {
         let service = service(FakeBackend::replying("x"), false);
         let ids: Vec<String> = (0..MAX_CONVERSATIONS_PER_OWNER)
-            .map(|_| service.open(OWNER).unwrap())
+            .map(|_| service.open(OWNER, false).unwrap())
             .collect();
         assert_eq!(service.list(OWNER).len(), MAX_CONVERSATIONS_PER_OWNER);
-        assert!(matches!(service.open(OWNER), Err(Error::LimitExceeded(_))));
+        assert!(matches!(
+            service.open(OWNER, false),
+            Err(Error::LimitExceeded(_))
+        ));
         service.delete_as(OWNER, &ids[0]).unwrap();
         assert_eq!(service.list(OWNER).len(), MAX_CONVERSATIONS_PER_OWNER - 1);
         assert!(matches!(
@@ -1151,7 +1161,7 @@ mod tests {
             memory: memory_off(),
             labels: std::sync::Arc::new(crate::service::BusLabels),
         };
-        let id = service.open(":1.1").unwrap();
+        let id = service.open(":1.1", false).unwrap();
         service.chat_as(":1.1", &id, "secreto").await.unwrap();
 
         assert!(service.list(":1.2").is_empty());
@@ -1180,10 +1190,13 @@ mod tests {
     async fn pasarse_del_tope_por_dueno_no_bloquea_a_otro_dueno() {
         let service = service(FakeBackend::replying("x"), false);
         for _ in 0..MAX_CONVERSATIONS_PER_OWNER {
-            service.open(":1.1").unwrap();
+            service.open(":1.1", false).unwrap();
         }
-        assert!(matches!(service.open(":1.1"), Err(Error::LimitExceeded(_))));
-        assert!(service.open(":1.2").is_ok());
+        assert!(matches!(
+            service.open(":1.1", false),
+            Err(Error::LimitExceeded(_))
+        ));
+        assert!(service.open(":1.2", false).is_ok());
         assert_eq!(service.list(":1.1").len(), MAX_CONVERSATIONS_PER_OWNER);
     }
 
@@ -1272,7 +1285,7 @@ mod tests {
         conversations: &Mutex<Conversations>,
         still_connected: zbus::Result<bool>,
     ) -> (String, Result<String, Error>) {
-        let id = conversations.lock().create(":1.7").unwrap();
+        let id = conversations.lock().create(":1.7", false).unwrap();
         let result = settle_new_conversation(conversations, ":1.7", id.clone(), still_connected);
         (id, result)
     }
@@ -1288,8 +1301,8 @@ mod tests {
     #[test]
     fn si_el_dueno_ya_se_fue_se_liberan_sus_conversaciones_y_se_contesta_not_found() {
         let conversations = Mutex::new(Conversations::default());
-        let ajena = conversations.lock().create(":1.8").unwrap();
-        conversations.lock().create(":1.7").unwrap();
+        let ajena = conversations.lock().create(":1.8", false).unwrap();
+        conversations.lock().create(":1.7", false).unwrap();
 
         let (_, result) = settle(&conversations, Ok(false));
 
@@ -1305,12 +1318,12 @@ mod tests {
         let conversations = Mutex::new(Conversations::default());
         for i in 0..MAX_CONVERSATIONS * 3 {
             let owner = format!(":1.{}", 100 + i);
-            let id = conversations.lock().create(&owner).unwrap();
+            let id = conversations.lock().create(&owner, false).unwrap();
             let result = settle_new_conversation(&conversations, &owner, id, Ok(false));
             assert!(matches!(result, Err(Error::NotFound(_))));
         }
         assert_eq!(conversations.lock().len(), 0);
-        assert!(conversations.lock().create(":1.1").is_ok());
+        assert!(conversations.lock().create(":1.1", false).is_ok());
     }
 
     #[test]
@@ -1578,7 +1591,7 @@ mod memory_tests {
         }
 
         async fn say(&self, content: &str) -> (String, String) {
-            let id = self.service.open(OWNER).unwrap();
+            let id = self.service.open(OWNER, false).unwrap();
             let reply = self.service.chat_as(OWNER, &id, content).await.unwrap();
             (id, reply)
         }
@@ -1717,7 +1730,7 @@ mod memory_tests {
             memory: Arc::new(remote),
             labels: std::sync::Arc::new(crate::service::BusLabels),
         };
-        let id = service.open(OWNER).unwrap();
+        let id = service.open(OWNER, false).unwrap();
 
         service
             .chat_as(OWNER, &id, "prefiero el mate amargo")
@@ -1814,7 +1827,7 @@ mod memory_tests {
     async fn el_resumen_de_la_conversacion_se_pide_cada_seis_turnos_y_vuelve_en_la_siguiente() {
         const SUMMARY: &str = r#"{"items":[],"summary":"Hablaron de plantas y de mate"}"#;
         let world = World::new(["r", "r", "r", "r", "r", "r", SUMMARY, "Hola."]).await;
-        let id = world.service.open(OWNER).unwrap();
+        let id = world.service.open(OWNER, false).unwrap();
         for n in 0..6 {
             world
                 .service
@@ -2371,7 +2384,7 @@ mod effective_model_tests {
     }
 
     async fn chat(rig: &Rig, text: &str) {
-        let id = rig.service.open(OWNER).unwrap();
+        let id = rig.service.open(OWNER, false).unwrap();
         rig.service.chat_as(OWNER, &id, text).await.unwrap();
         // Una extracción que no tendría que ocurrir ya estaría tomando el permiso.
         rig.service.memory.wait_until_idle().await;
@@ -2475,7 +2488,7 @@ mod effective_model_tests {
         // La puerta del modelo vale para cualquier llamador, no sólo para los confinados.
         let backend = ScriptedBackend::cloud_by_default(["Hola."]);
         let rig = rig(backend.clone(), false).await;
-        let id = rig.service.open(OWNER).unwrap();
+        let id = rig.service.open(OWNER, false).unwrap();
 
         rig.service
             .chat_with(OWNER, &id, "hola", true)
@@ -2499,7 +2512,7 @@ mod effective_model_tests {
     ) {
         let backend = FlippingBackend::new(["Hola.", EXTRACTION]);
         let rig = rig(backend.clone(), false).await;
-        let id = rig.service.open(OWNER).unwrap();
+        let id = rig.service.open(OWNER, false).unwrap();
 
         let reply = rig
             .service
@@ -2653,7 +2666,7 @@ mod effective_model_tests {
         .await;
         let ollama = ollama_backend(&server.url(""), None, false);
         let rig = rig(Arc::new(Limited::new(Arc::new(ollama))), false).await;
-        let id = rig.service.open(OWNER).unwrap();
+        let id = rig.service.open(OWNER, false).unwrap();
 
         let result = rig
             .service
@@ -2721,7 +2734,7 @@ mod effective_model_tests {
         .await;
         let ollama = ollama_backend(&server.url(""), None, true);
         let rig = rig(Arc::new(Limited::new(Arc::new(ollama))), false).await;
-        let id = rig.service.open(OWNER).unwrap();
+        let id = rig.service.open(OWNER, false).unwrap();
 
         let reply = rig
             .service
@@ -2836,7 +2849,7 @@ mod effective_model_tests {
         *inner.reject_local_only.lock() =
             Some(BackendError::Unavailable(crate::backend::NOT_LOCAL.into()));
         let rig = rig(inner.clone(), false).await;
-        let id = rig.service.open(OWNER).unwrap();
+        let id = rig.service.open(OWNER, false).unwrap();
 
         let result = rig
             .service
@@ -3235,8 +3248,8 @@ mod delete_conversation_tests {
     /// Dos conversaciones del mismo dueño, cada una con su resumen.
     async fn two_with_summaries(rig: &Rig) -> (String, String) {
         let (a, b) = (
-            rig.service.open(OWNER).unwrap(),
-            rig.service.open(OWNER).unwrap(),
+            rig.service.open(OWNER, false).unwrap(),
+            rig.service.open(OWNER, false).unwrap(),
         );
         rig.service
             .memory
@@ -3378,8 +3391,8 @@ mod delete_conversation_tests {
     async fn dos_resumenes_iguales_de_conversaciones_distintas_borrar_una_deja_el_de_la_otra() {
         let rig = rig().await;
         let (a, b) = (
-            rig.service.open(OWNER).unwrap(),
-            rig.service.open(OWNER).unwrap(),
+            rig.service.open(OWNER, false).unwrap(),
+            rig.service.open(OWNER, false).unwrap(),
         );
         for id in [&a, &b] {
             rig.service
@@ -3413,7 +3426,7 @@ mod delete_conversation_tests {
     async fn borrar_la_conversacion_mientras_su_extraccion_esta_en_vuelo_no_guarda_nada() {
         let (rig, backend, gate) = gated_rig().await;
         let service = Arc::new(rig.service);
-        let id = service.open(OWNER).unwrap();
+        let id = service.open(OWNER, false).unwrap();
 
         let chat = {
             let (service, id) = (service.clone(), id.clone());
@@ -3441,7 +3454,7 @@ mod delete_conversation_tests {
     async fn borrar_la_conversacion_mientras_el_chat_espera_la_respuesta_no_aprende_nada() {
         let (rig, backend, gate) = gated_rig().await;
         let service = Arc::new(rig.service);
-        let id = service.open(OWNER).unwrap();
+        let id = service.open(OWNER, false).unwrap();
 
         let chat = {
             let (service, id) = (service.clone(), id.clone());
@@ -3475,7 +3488,7 @@ mod delete_conversation_tests {
     async fn sin_borrar_nada_la_misma_secuencia_si_aprende() {
         let (rig, backend, gate) = gated_rig().await;
         let service = Arc::new(rig.service);
-        let id = service.open(OWNER).unwrap();
+        let id = service.open(OWNER, false).unwrap();
 
         let chat = {
             let (service, id) = (service.clone(), id.clone());
@@ -3967,7 +3980,7 @@ mod privacy_tests {
         };
         let (log, _guard) = capture_logs();
 
-        let id = service.open(OWNER).unwrap();
+        let id = service.open(OWNER, false).unwrap();
         service
             .chat_as(OWNER, &id, "prefiero mensajecanarioqzx")
             .await
@@ -4033,7 +4046,7 @@ mod privacy_tests {
         };
         let (log, _guard) = capture_logs();
 
-        let id = service.open(OWNER).unwrap();
+        let id = service.open(OWNER, false).unwrap();
         service
             .chat_as(OWNER, &id, "prefiero mensajecanarioqzx")
             .await
@@ -4064,7 +4077,7 @@ mod privacy_tests {
         let (log, _guard) = capture_logs();
 
         // Un mensaje demasiado largo, vacío, un id que no es un uuid y una dirección inválida.
-        let id = service.open(OWNER).unwrap();
+        let id = service.open(OWNER, false).unwrap();
         let _ = service
             .chat_as(
                 OWNER,
@@ -4129,7 +4142,7 @@ mod owner_chat_limit_tests {
         let (fake, gate) = FakeBackend::gated("hola");
         let backend = Arc::new(fake);
         let service = service(Arc::new(Limited::new(backend.clone())));
-        let ids: Vec<_> = (0..3).map(|_| service.open(A).unwrap()).collect();
+        let ids: Vec<_> = (0..3).map(|_| service.open(A, false).unwrap()).collect();
         let first = start_chat(&service, A, &ids[0]);
         quickly(backend.entered.notified()).await;
         let second = start_chat(&service, A, &ids[1]);
@@ -4145,7 +4158,7 @@ mod owner_chat_limit_tests {
             "el tercero no salió al modelo"
         );
         // Dos lugares globales siguen libres: otros dos chats de otro dueño entran.
-        let others: Vec<_> = (0..2).map(|_| service.open(B).unwrap()).collect();
+        let others: Vec<_> = (0..2).map(|_| service.open(B, false).unwrap()).collect();
         let b1 = start_chat(&service, B, &others[0]);
         quickly(backend.entered.notified()).await;
         let b2 = start_chat(&service, B, &others[1]);
@@ -4166,7 +4179,7 @@ mod owner_chat_limit_tests {
         let (fake, gate) = FakeBackend::gated("hola");
         let backend = Arc::new(fake);
         let service = service(Arc::new(Limited::new(backend.clone())));
-        let a: Vec<_> = (0..3).map(|_| service.open(A).unwrap()).collect();
+        let a: Vec<_> = (0..3).map(|_| service.open(A, false).unwrap()).collect();
         let a1 = start_chat(&service, A, &a[0]);
         quickly(backend.entered.notified()).await;
         let a2 = start_chat(&service, A, &a[1]);
@@ -4175,7 +4188,7 @@ mod owner_chat_limit_tests {
             quickly(service.chat_as(A, &a[2], "tres")).await,
             Err(Error::Busy(_))
         ));
-        let b = service.open(B).unwrap();
+        let b = service.open(B, false).unwrap();
 
         let other = start_chat(&service, B, &b);
         quickly(backend.entered.notified()).await;
@@ -4196,7 +4209,7 @@ mod owner_chat_limit_tests {
         let (fake, gate) = FakeBackend::gated("hola");
         let backend = Arc::new(fake);
         let service = service(Arc::new(Limited::new(backend.clone())));
-        let ids: Vec<_> = (0..3).map(|_| service.open(A).unwrap()).collect();
+        let ids: Vec<_> = (0..3).map(|_| service.open(A, false).unwrap()).collect();
         let first = start_chat(&service, A, &ids[0]);
         quickly(backend.entered.notified()).await;
         let second = start_chat(&service, A, &ids[1]);
@@ -4222,7 +4235,7 @@ mod owner_chat_limit_tests {
         ] {
             let fake = FakeBackend::failing(error);
             let service = service(Arc::new(Limited::new(Arc::new(fake))));
-            let ids: Vec<_> = (0..4).map(|_| service.open(A).unwrap()).collect();
+            let ids: Vec<_> = (0..4).map(|_| service.open(A, false).unwrap()).collect();
 
             // Más chats seguidos que el tope: cada error libera el lugar.
             for id in &ids {
@@ -4246,7 +4259,7 @@ mod owner_chat_limit_tests {
         let (fake, gate) = FakeBackend::gated("hola");
         let backend = Arc::new(fake);
         let service = service(Arc::new(Limited::new(backend.clone())));
-        let ids: Vec<_> = (0..3).map(|_| service.open(A).unwrap()).collect();
+        let ids: Vec<_> = (0..3).map(|_| service.open(A, false).unwrap()).collect();
         let first = start_chat(&service, A, &ids[0]);
         quickly(backend.entered.notified()).await;
         let second = start_chat(&service, A, &ids[1]);
@@ -4284,7 +4297,7 @@ mod owner_chat_limit_tests {
             memory: memory.clone(),
             labels: FixedLabel::none(),
         });
-        let ids: Vec<_> = (0..3).map(|_| service.open(A).unwrap()).collect();
+        let ids: Vec<_> = (0..3).map(|_| service.open(A, false).unwrap()).collect();
         let first = {
             let (service, id) = (service.clone(), ids[0].clone());
             tokio::spawn(async move { service.chat_as(A, &id, "prefiero el mate amargo").await })
@@ -4300,7 +4313,7 @@ mod owner_chat_limit_tests {
         quickly(backend.entered.notified()).await;
         let third = start_chat(&service, A, &ids[2]);
         quickly(backend.entered.notified()).await;
-        let busy = quickly(service.chat_as(A, &service.open(A).unwrap(), "otro")).await;
+        let busy = quickly(service.chat_as(A, &service.open(A, false).unwrap(), "otro")).await;
         assert!(matches!(busy, Err(Error::Busy(_))), "{busy:?}");
 
         for _ in 0..3 {
@@ -4379,7 +4392,7 @@ mod owner_chat_limit_tests {
         let (fake, gate) = FakeBackend::gated("hola");
         let backend = Arc::new(fake);
         let service = service(Arc::new(Limited::new(backend.clone())));
-        let ids: Vec<_> = (0..4).map(|_| service.open(A).unwrap()).collect();
+        let ids: Vec<_> = (0..4).map(|_| service.open(A, false).unwrap()).collect();
         let first = start_chat(&service, A, &ids[0]);
         quickly(backend.entered.notified()).await;
         let second = start_chat(&service, A, &ids[1]);
@@ -4410,7 +4423,7 @@ mod owner_chat_limit_tests {
         let (fake, gate) = FakeBackend::gated("hola");
         let backend = Arc::new(fake);
         let service = service(Arc::new(Limited::new(backend.clone())));
-        let old: Vec<_> = (0..2).map(|_| service.open(A).unwrap()).collect();
+        let old: Vec<_> = (0..2).map(|_| service.open(A, false).unwrap()).collect();
         let first = start_chat(&service, A, &old[0]);
         quickly(backend.entered.notified()).await;
         let second = start_chat(&service, A, &old[1]);
@@ -4419,7 +4432,7 @@ mod owner_chat_limit_tests {
         let released = service.conversations.lock().release_owner(A);
         assert_eq!(released, 2);
         // Un dueño con el mismo nombre arranca limpio: sus dos chats entran.
-        let fresh: Vec<_> = (0..3).map(|_| service.open(A).unwrap()).collect();
+        let fresh: Vec<_> = (0..3).map(|_| service.open(A, false).unwrap()).collect();
         let f1 = start_chat(&service, A, &fresh[0]);
         quickly(backend.entered.notified()).await;
         let f2 = start_chat(&service, A, &fresh[1]);
@@ -4555,7 +4568,7 @@ mod turn_epoch_tests {
         let (fake, gate) = FakeBackend::gated(EXTRACTION);
         let backend = Arc::new(fake);
         let rig = rig(backend.clone()).await;
-        let id = rig.service.open(OWNER).unwrap();
+        let id = rig.service.open(OWNER, false).unwrap();
         let turn = start_turn(&rig.service, &id);
         quickly(backend.entered.notified()).await;
         Blocked {
@@ -4684,7 +4697,7 @@ mod turn_epoch_tests {
             blocked_once: Default::default(),
         });
         let rig = rig(backend.clone()).await;
-        let id = rig.service.open(OWNER).unwrap();
+        let id = rig.service.open(OWNER, false).unwrap();
         let turn = start_turn(&rig.service, &id);
         // El turno ya tomó la época y espera dentro de `allowed_for`.
         quickly(backend.entered.notified()).await;
@@ -4706,7 +4719,7 @@ mod turn_epoch_tests {
     async fn sin_cambios_en_medio_el_turno_normal_sigue_aprendiendo_de_punta_a_punta() {
         let backend = ScriptedBackend::new(["Hola.", EXTRACTION]);
         let rig = rig(backend.clone()).await;
-        let id = rig.service.open(OWNER).unwrap();
+        let id = rig.service.open(OWNER, false).unwrap();
 
         rig.service
             .chat_with(OWNER, &id, "prefiero el mate amargo", true)
