@@ -4016,6 +4016,103 @@ mod pending_deletes_tests {
             ["Resumen de A", "Resumen de B"]
         );
     }
+
+    fn summarized(memory: &Memory) -> Vec<String> {
+        let mut ids: Vec<String> = memory.summarized.lock().iter().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn borrar_256_conversaciones_sin_resumen_no_saca_de_la_lista_a_un_pendiente_real() {
+        let (_tmp, _keys, memory) = with_two_summaries().await;
+        memory.set_enabled(false).await.unwrap();
+        memory.forget_conversation(A).await;
+        assert_eq!(pending(&memory), [A]);
+
+        // El ataque: llenar la lista con conversaciones que nunca tuvieron resumen.
+        for n in 0..=MAX_PENDING_DELETES {
+            memory
+                .forget_conversation(&format!("{n:08x}-0000-4000-8000-000000000000"))
+                .await;
+        }
+
+        assert_eq!(pending(&memory), [A], "sólo el que tiene resumen se anota");
+        memory.set_enabled(true).await.unwrap();
+        assert_eq!(summaries(&memory).await, ["Resumen de B"]);
+        assert!(pending(&memory).is_empty());
+    }
+
+    #[tokio::test]
+    async fn una_conversacion_sin_resumen_no_se_anota_ni_con_la_memoria_apagada_ni_con_el_llavero_bloqueado(
+    ) {
+        let (_tmp, keys, memory) = with_two_summaries().await;
+        memory.set_enabled(false).await.unwrap();
+        memory.forget_conversation("sin-resumen").await;
+        assert!(pending(&memory).is_empty());
+        memory.set_enabled(true).await.unwrap();
+        memory.close().await;
+        *keys.locked.lock() = true;
+        memory.forget_conversation("sin-resumen-2").await;
+        assert!(pending(&memory).is_empty());
+    }
+
+    #[tokio::test]
+    async fn store_con_resumen_marca_el_id_y_sin_resumen_no() {
+        let tmp = TempDir::new();
+        let memory = Memory::new(Some(tmp.memory_dir()), FixedKey::new(None));
+        memory.set_enabled(true).await.unwrap();
+
+        memory
+            .store(
+                Extraction {
+                    items: Vec::new(),
+                    summary: None,
+                },
+                "sin",
+            )
+            .await
+            .unwrap();
+        assert!(summarized(&memory).is_empty());
+        memory.store(summary("Resumen"), "con").await.unwrap();
+
+        assert_eq!(summarized(&memory), ["con"]);
+    }
+
+    #[tokio::test]
+    async fn al_aplicarse_el_borrado_el_id_sale_de_summarized_y_el_de_otra_conversacion_se_queda() {
+        let (_tmp, keys, memory) = with_two_summaries().await;
+        assert_eq!(summarized(&memory), [A, B]);
+
+        // Borrado inmediato: A sale.
+        memory.forget_conversation(A).await;
+        assert_eq!(summarized(&memory), [B]);
+
+        // Borrado diferido: B sale cuando se aplica, no antes.
+        memory.close().await;
+        *keys.locked.lock() = true;
+        memory.forget_conversation(B).await;
+        assert_eq!(summarized(&memory), [B], "pendiente, todavía no se borró");
+        assert_eq!(pending(&memory), [B]);
+        *keys.locked.lock() = false;
+        memory.status().await;
+        assert!(summarized(&memory).is_empty());
+        assert!(pending(&memory).is_empty());
+    }
+
+    #[tokio::test]
+    async fn borrar_la_memoria_y_crear_una_nueva_vacian_summarized() {
+        let (_tmp, _keys, memory) = with_two_summaries().await;
+        assert_eq!(summarized(&memory).len(), 2);
+        memory.clear().await.unwrap();
+        assert!(summarized(&memory).is_empty());
+
+        let tmp = TempDir::new();
+        let fresh = Memory::new(Some(tmp.memory_dir()), FixedKey::new(None));
+        fresh.summarized.lock().insert("x".to_owned());
+        fresh.set_enabled(true).await.unwrap();
+        assert!(summarized(&fresh).is_empty());
+    }
 }
 
 /// `learn_after` con una época que ya pasó (#20).
