@@ -336,14 +336,20 @@ impl Memory {
     /// plano. No espera ni falla: lo que salga mal queda en el registro.
     ///
     /// `conversation` son los mensajes del turno (historial, mensaje y
-    /// respuesta), sin el bloque de la memoria.
+    /// respuesta), sin el bloque de la memoria. `epoch` es la época del
+    /// comienzo del turno ([`Self::epoch`], tomada antes de `recall`): si desde
+    /// entonces se encendió, se apagó o se borró la memoria, no se aprende nada
+    /// del turno, ni recuerdos ni resumen, ni se toca su ventana.
     pub fn learn_after(
         self: &Arc<Self>,
         backend: Arc<dyn ModelBackend>,
         conversation_id: &str,
         conversation: Vec<Message>,
+        epoch: u64,
     ) {
-        let epoch = self.epoch.load(Ordering::SeqCst);
+        if self.epoch.load(Ordering::SeqCst) != epoch {
+            return;
+        }
         let Some(current) = conversation.iter().rposition(|m| m.role == Role::User) else {
             return;
         };
@@ -628,9 +634,8 @@ impl Memory {
         }
     }
 
-    /// La época actual (sube con cada encender, apagar y borrar). Sólo la
-    /// usan las pruebas de `store_at`.
-    #[cfg(test)]
+    /// La época actual (sube con cada encender, apagar y borrar). El servicio
+    /// la toma al comienzo de cada turno para [`Self::learn_after`].
     pub fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::SeqCst)
     }
@@ -1819,16 +1824,19 @@ mod tests {
 
         // Con el permiso tomado por otra extracción, el turno se saltea.
         let held = fixture.memory.learning.try_acquire().unwrap();
-        fixture
-            .memory
-            .learn_after(backend.clone(), "c1", conversation.clone());
+        fixture.memory.learn_after(
+            backend.clone(),
+            "c1",
+            conversation.clone(),
+            fixture.memory.epoch(),
+        );
         // Con el permiso tomado no se lanza nada: no hay nada que esperar.
         assert!(backend.seen.lock().is_empty());
         drop(held);
 
         fixture
             .memory
-            .learn_after(backend.clone(), "c1", conversation);
+            .learn_after(backend.clone(), "c1", conversation, fixture.memory.epoch());
         backend.wait_for_calls(1).await;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while fixture.memory.recall("mate", false).await.is_none() {
@@ -2118,7 +2126,7 @@ mod guard_tests {
         let (backend, gate) = crate::test_support::FakeBackend::gated(EXTRACTION);
         let backend = Arc::new(backend);
 
-        memory.learn_after(backend.clone(), "c1", turn());
+        memory.learn_after(backend.clone(), "c1", turn(), memory.epoch());
         backend.entered.notified().await;
         memory.clear().await.unwrap();
         gate.notify_one();
@@ -2135,7 +2143,7 @@ mod guard_tests {
         let (backend, gate) = crate::test_support::FakeBackend::gated(EXTRACTION);
         let backend = Arc::new(backend);
 
-        memory.learn_after(backend.clone(), "c1", turn());
+        memory.learn_after(backend.clone(), "c1", turn(), memory.epoch());
         backend.entered.notified().await;
         memory.set_enabled(false).await.unwrap();
         memory.set_enabled(true).await.unwrap();
@@ -2151,7 +2159,7 @@ mod guard_tests {
         let (backend, gate) = crate::test_support::FakeBackend::gated(EXTRACTION);
         let backend = Arc::new(backend);
 
-        memory.learn_after(backend.clone(), "c1", turn());
+        memory.learn_after(backend.clone(), "c1", turn(), memory.epoch());
         backend.entered.notified().await;
         gate.notify_one();
         until_idle(&memory).await;
@@ -2181,7 +2189,7 @@ mod guard_tests {
 
         // Es la primera vez que la memoria ve esta conversación: la ventana
         // arranca en el turno actual.
-        memory.learn_after(backend.clone(), "c1", conversation);
+        memory.learn_after(backend.clone(), "c1", conversation, memory.epoch());
         backend.wait_for_calls(1).await;
 
         let request = backend.seen.lock()[0][1].content.clone();
@@ -2226,7 +2234,7 @@ mod review_tests {
     use super::*;
     use crate::test_support::{FakeBackend, FixedKey, TempDir};
 
-    async fn enabled() -> (TempDir, Arc<Memory>) {
+    pub(super) async fn enabled() -> (TempDir, Arc<Memory>) {
         let tmp = TempDir::new();
         let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), FixedKey::new(None)));
         memory.set_enabled(true).await.unwrap();
@@ -2264,7 +2272,7 @@ mod review_tests {
         ];
         let epoch = memory.epoch();
 
-        memory.learn_after(backend.clone(), "c1", conversation);
+        memory.learn_after(backend.clone(), "c1", conversation, epoch);
         backend.entered.notified().await;
         memory.set_enabled(true).await.unwrap();
         memory.set_enabled(true).await.unwrap();
@@ -2494,7 +2502,7 @@ mod forget_tests {
         let (backend, gate) = FakeBackend::gated(EXTRACTION);
         let backend = Arc::new(backend);
 
-        memory.learn_after(backend.clone(), "a", turn());
+        memory.learn_after(backend.clone(), "a", turn(), memory.epoch());
         backend.entered.notified().await;
         memory.forget_conversation("a").await;
         gate.notify_one();
@@ -2514,13 +2522,13 @@ mod forget_tests {
         let backend = ScriptedBackend::new([EXTRACTION]);
         memory.forget_conversation("a").await;
 
-        memory.learn_after(backend.clone(), "a", turn());
+        memory.learn_after(backend.clone(), "a", turn(), memory.epoch());
         memory.wait_until_idle().await;
 
         assert!(backend.seen.lock().is_empty());
         assert_eq!(memory.recall("mate", true).await, None);
         // Otra conversación sí aprende.
-        memory.learn_after(backend.clone(), "b", turn());
+        memory.learn_after(backend.clone(), "b", turn(), memory.epoch());
         backend.wait_for_calls(1).await;
     }
 
@@ -2613,7 +2621,7 @@ mod forget_tests {
         let (backend, gate) = FakeBackend::gated(EXTRACTION);
         let backend = Arc::new(backend);
 
-        memory.learn_after(backend.clone(), "a", turn());
+        memory.learn_after(backend.clone(), "a", turn(), memory.epoch());
         backend.entered.notified().await;
         memory.forget_conversation("a").await;
         // Más que el tope de `forgotten`: «a» ya no está en esa lista.
@@ -2633,7 +2641,7 @@ mod forget_tests {
         let (backend, gate) = FakeBackend::gated(EXTRACTION);
         let backend = Arc::new(backend);
 
-        memory.learn_after(backend.clone(), "a", turn());
+        memory.learn_after(backend.clone(), "a", turn(), memory.epoch());
         backend.entered.notified().await;
         memory.forget_conversation("b").await;
         gate.notify_one();
@@ -2651,14 +2659,14 @@ mod forget_tests {
         let (_tmp, memory) = enabled().await;
         let backend = ScriptedBackend::new([EXTRACTION]);
 
-        memory.learn_after(backend.clone(), "a", turn());
+        memory.learn_after(backend.clone(), "a", turn(), memory.epoch());
         backend.wait_for_calls(1).await;
         until_idle(&memory).await;
 
         assert!(memory.in_flight.lock().is_none());
         // Y una extracción que ni empezó (otra en curso) no deja marca de más.
         let held = memory.learning.clone().try_acquire_owned().unwrap();
-        memory.learn_after(backend.clone(), "b", turn());
+        memory.learn_after(backend.clone(), "b", turn(), memory.epoch());
         assert!(memory.in_flight.lock().is_none());
         drop(held);
     }
@@ -2668,7 +2676,7 @@ mod forget_tests {
         let (_tmp, memory) = enabled().await;
         let backend = ScriptedBackend::new(["no es json"]);
 
-        memory.learn_after(backend.clone(), "a", turn());
+        memory.learn_after(backend.clone(), "a", turn(), memory.epoch());
         backend.wait_for_calls(1).await;
         until_idle(&memory).await;
 
@@ -2775,6 +2783,7 @@ mod log_tests {
             backend.clone(),
             "123e4567-e89b-12d3-a456-426614174000",
             turn(),
+            memory.epoch(),
         );
         memory.wait_until_idle().await;
 
@@ -2796,7 +2805,7 @@ mod log_tests {
         ]);
         let (log, _guard) = capture_logs();
 
-        memory.learn_after(saved.clone(), "c1", turn());
+        memory.learn_after(saved.clone(), "c1", turn(), memory.epoch());
         memory.wait_until_idle().await;
         let l = line(&log, &["se guardaron recuerdos"]);
         assert!(
@@ -2805,7 +2814,7 @@ mod log_tests {
         );
 
         let empty = ScriptedBackend::new([r#"{"items":[],"summary":null}"#]);
-        memory.learn_after(empty.clone(), "c2", turn());
+        memory.learn_after(empty.clone(), "c2", turn(), memory.epoch());
         memory.wait_until_idle().await;
         let l = line(&log, &["la extracción no trajo nada que recordar"]);
         assert!(l.contains("DEBUG"), "{l}");
@@ -2825,7 +2834,7 @@ mod log_tests {
             .store_at(preference("Prefiere el mate"), "c1", memory.epoch())
             .await
             .unwrap_err();
-        memory.learn_after(backend, "c1", turn());
+        memory.learn_after(backend, "c1", turn(), memory.epoch());
         memory.wait_until_idle().await;
 
         assert!(!log.text().contains(" WARN "), "{}", log.text());
@@ -3204,7 +3213,7 @@ mod log_tests {
         ]);
         let (log, _guard) = capture_logs();
 
-        memory.learn_after(backend.clone(), "c1", turn());
+        memory.learn_after(backend.clone(), "c1", turn(), memory.epoch());
         memory.wait_until_idle().await;
 
         let text = log.text();
@@ -3221,7 +3230,7 @@ mod log_tests {
         let again = ScriptedBackend::new([
             r#"{"items":[{"kind":"preference","text":"Prefiere otracosa"}],"summary":null}"#,
         ]);
-        memory.learn_after(again, "c2", turn());
+        memory.learn_after(again, "c2", turn(), memory.epoch());
         memory.wait_until_idle().await;
         assert!(
             log.text().contains("se guardaron recuerdos"),
@@ -3969,5 +3978,119 @@ mod pending_deletes_tests {
             summaries(&restarted).await,
             ["Resumen de A", "Resumen de B"]
         );
+    }
+}
+
+/// `learn_after` con una época que ya pasó (#20).
+#[cfg(test)]
+mod stale_epoch_tests {
+    use super::review_tests::enabled;
+    use super::*;
+    use crate::test_support::ScriptedBackend;
+
+    const EXTRACTION: &str =
+        r#"{"items":[{"kind":"preference","text":"Prefiere el mate amargo"}],"summary":null}"#;
+
+    fn two_turns() -> Vec<Message> {
+        let say = |role, content: &str| Message {
+            role,
+            content: content.into(),
+        };
+        vec![
+            say(Role::User, "hola, buen día"),
+            say(Role::Assistant, "Buen día."),
+            say(Role::User, "prefiero el mate amargo"),
+            say(Role::Assistant, "Anotado."),
+        ]
+    }
+
+    #[tokio::test]
+    async fn con_una_epoca_vieja_learn_after_no_hace_nada_de_nada() {
+        let (_tmp, memory) = enabled().await;
+        let old = memory.epoch();
+        memory.clear().await.unwrap();
+        assert_ne!(memory.epoch(), old);
+        let backend = ScriptedBackend::new([EXTRACTION]);
+
+        memory.learn_after(backend.clone(), "c1", two_turns(), old);
+        memory.wait_until_idle().await;
+
+        // No extrajo: el modelo no recibió nada.
+        assert!(backend.seen.lock().is_empty());
+        // No marcó nada en vuelo, no tomó el permiso y no abrió ventana.
+        assert!(memory.in_flight.lock().is_none());
+        assert_eq!(memory.learning.available_permits(), 1);
+        assert!(!memory.windows.lock().contains_key("c1"));
+        // Y no dejó recuerdos.
+        assert_eq!(memory.recall("mate", true).await, None);
+    }
+
+    #[tokio::test]
+    async fn la_epoca_vieja_tampoco_deja_pasar_el_resumen_ni_los_turnos_del_resumen() {
+        let (_tmp, memory) = enabled().await;
+        let old = memory.epoch();
+        memory.set_enabled(false).await.unwrap();
+        memory.set_enabled(true).await.unwrap();
+        let backend = ScriptedBackend::new([r#"{"items":[],"summary":"Hablaron del mate"}"#]);
+        // Seis turnos de la persona: toca resumen.
+        let mut conversation = Vec::new();
+        for n in 0..6 {
+            conversation.push(Message {
+                role: Role::User,
+                content: format!("pregunta número {n} sobre el clima"),
+            });
+            conversation.push(Message {
+                role: Role::Assistant,
+                content: "respuesta".into(),
+            });
+        }
+
+        memory.learn_after(backend.clone(), "c1", conversation, old);
+        memory.wait_until_idle().await;
+
+        assert!(backend.seen.lock().is_empty());
+        assert!(memory.windows.lock().is_empty());
+        assert_eq!(memory.recall("clima", true).await, None);
+    }
+
+    #[tokio::test]
+    async fn un_turno_siguiente_con_la_epoca_nueva_abre_la_ventana_desde_ese_turno() {
+        let (_tmp, memory) = enabled().await;
+        let old = memory.epoch();
+        memory.clear().await.unwrap();
+        let backend = ScriptedBackend::new([EXTRACTION]);
+        memory.learn_after(backend.clone(), "c1", two_turns(), old);
+        assert!(memory.windows.lock().is_empty());
+
+        let new = memory.epoch();
+        memory.learn_after(backend.clone(), "c1", two_turns(), new);
+        memory.wait_until_idle().await;
+
+        // La ventana arranca en el turno actual (el índice 2: «prefiero el mate»).
+        assert_eq!(memory.windows.lock().get("c1"), Some(&(new, 2)));
+        assert_eq!(backend.seen.lock().len(), 1);
+        assert!(memory
+            .recall("mate", true)
+            .await
+            .unwrap()
+            .contains("mate amargo"));
+    }
+
+    #[tokio::test]
+    async fn la_epoca_actual_toma_el_permiso_marca_en_vuelo_y_aprende() {
+        let (_tmp, memory) = enabled().await;
+        let backend = ScriptedBackend::new([EXTRACTION]);
+
+        memory.learn_after(backend.clone(), "c1", two_turns(), memory.epoch());
+        // El permiso y la marca se toman antes de que `learn_after` vuelva.
+        assert_eq!(memory.learning.available_permits(), 0);
+        assert_eq!(
+            memory.in_flight.lock().as_ref().map(|(id, _)| id.clone()),
+            Some("c1".to_owned())
+        );
+        memory.wait_until_idle().await;
+
+        assert!(memory.in_flight.lock().is_none());
+        assert!(memory.recall("mate", true).await.is_some());
     }
 }
