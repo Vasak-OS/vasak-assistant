@@ -239,7 +239,13 @@ pub fn startup_summary(
         "arrancando vasak-assistant {}: backend {} ({}), allow_remote={}, share_memory_with_remote={}, memoria {}",
         env!("CARGO_PKG_VERSION"),
         backend.provider,
-        if backend.local { "local" } else { "remoto" },
+        // Con Ollama, un alias puede correr afuera: al arrancar sólo se sabe la
+        // dirección, el modelo se confirma en cada pedido.
+        match (backend.local, backend.provider.as_str()) {
+            (false, _) => "remoto",
+            (true, vasak_assistant_protocol::PROVIDER_OLLAMA) => "local según la dirección",
+            (true, _) => "local",
+        },
         settings.allow_remote,
         settings.share_memory_with_remote,
         if memory_enabled { "encendida" } else { "apagada" },
@@ -445,7 +451,7 @@ mod startup_tests {
                 local.clone(),
                 false,
                 vec![
-                    "ollama (local)",
+                    "ollama (local según la dirección)",
                     "allow_remote=false",
                     "share_memory_with_remote=false",
                     "memoria apagada",
@@ -467,7 +473,7 @@ mod startup_tests {
                 local,
                 true,
                 vec![
-                    "(local)",
+                    "(local según la dirección)",
                     "allow_remote=true",
                     "share_memory_with_remote=false",
                     "memoria encendida",
@@ -486,6 +492,19 @@ mod startup_tests {
                 assert!(line.contains(piece), "{piece}: {line}");
             }
         }
+    }
+
+    #[test]
+    fn solo_con_ollama_el_arranque_dice_local_segun_la_direccion() {
+        let openai = vasak_assistant_protocol::ModelInfo {
+            provider: "openai".into(),
+            ..model_info("gpt")
+        };
+        let line = startup_summary(&settings(false, false), &openai, false);
+        assert!(line.contains("openai (local)"), "{line}");
+        assert!(!line.contains("según la dirección"), "{line}");
+        let line = startup_summary(&settings(false, false), &model_info("llama"), false);
+        assert!(line.contains("ollama (local según la dirección)"), "{line}");
     }
 
     #[test]

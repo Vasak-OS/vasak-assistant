@@ -254,6 +254,33 @@ pub fn local_selection(backend: &str, url: &str, model: Option<&str>) -> Selecti
     .unwrap_or_else(|rejection| panic!("la selección local se acepta: {}", rejection.reason))
 }
 
+/// Un `remote_host` de Ollama como el que trae un modelo que corre afuera.
+pub const REMOTE_HOST: &str = "https://ollama.com:443";
+
+/// Un `/api/tags` con un solo modelo, `name`, que corre en [`REMOTE_HOST`].
+pub fn remote_tags(name: &str) -> String {
+    serde_json::json!({"models": [{"name": name, "remote_host": REMOTE_HOST}]}).to_string()
+}
+
+/// Un backend de Ollama en `url`. La selección se acepta con `allow_remote`
+/// (el arranque no mira la red, así que con un nombre sin sufijo da lo mismo);
+/// el backend recibe el `allow_remote` pedido, que es el que decide.
+pub fn ollama_backend(
+    url: &str,
+    model: Option<&str>,
+    allow_remote: bool,
+) -> crate::ollama::OllamaBackend {
+    let selection = select_backend(&Settings {
+        backend: Some("ollama".into()),
+        url: Some(url.into()),
+        model: model.map(str::to_owned),
+        allow_remote: true,
+        share_memory_with_remote: false,
+    })
+    .unwrap_or_else(|rejection| panic!("{}", rejection.reason));
+    crate::ollama::OllamaBackend::new(client(), selection, allow_remote)
+}
+
 // ── Llavero de mentira ────────────────────────────────────────────────────────
 
 /// Una clave fija; guarda las direcciones por las que le preguntaron y lo que

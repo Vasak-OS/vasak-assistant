@@ -62,9 +62,20 @@ arrancar: después de cambiarla, `systemctl --user restart vasak-assistant`.
 **Local o remoto.** Lo decide la dirección, no una declaración: un host
 `localhost` o una IP de loopback es **local**; cualquier otro es **remoto**. Un
 remoto sólo se usa con `allow_remote: true`, sólo por `https` y con el modelo
-elegido; si no, queda no disponible con el motivo. `Status` informa en
-`model.local` y `model.host` si la conversación sale de la máquina y hacia
-dónde.
+elegido; si no, queda no disponible con el motivo. En `Status`,
+`model.local` dice si la conversación sale de la máquina (también con el
+modelo rechazado: un alias remoto sin `allow_remote` figura no local), y
+`model.host` identifica el backend configurado, no necesariamente el host
+donde corre el modelo.
+
+Con Ollama, además, un modelo puede correr fuera de la máquina aunque se le
+hable al Ollama local, y cuenta como **remoto**: si su fila de `/api/tags` trae
+`remote_host` (los `:cloud` y los alias que `ollama create` deja apuntando a
+uno, con un nombre cualquiera) o si el nombre termina en `:cloud` o `-cloud`,
+figure o no en la lista. Se decide en cada pedido con esa lista: si Ollama no
+la da, no se manda nada, y un modelo que no figura en ella sólo se usa si es
+`:cloud`/`-cloud`, como remoto. Al arrancar, con la configuración sola, sólo
+se ve el nombre.
 
 **La clave del proveedor nunca va en la configuración.** Se lee de
 `vasak-keyring` (el Secret Service de la sesión), del ítem con los atributos
@@ -199,8 +210,23 @@ systemd, `$STATE_DIRECTORY`). No va en el almacén de cuentas.
   `assistant` de `vasak.conf`; si no, `MemoryStatus` dice «La memoria no se
   comparte con un proveedor remoto». Se decide en cada pedido con el modelo que
   de verdad va a responder: sin modelo configurado, Ollama toma el primero
-  instalado, y si es uno `:cloud` cuenta como remoto aunque se le hable al
-  Ollama local.
+  instalado, y si corre afuera (`remote_host` en `/api/tags`, o `:cloud`/`-cloud`)
+  cuenta como remoto aunque se le hable al Ollama local.
+
+  **Límite:** entre la lista de modelos y el chat, un proceso local puede
+  reapuntar el nombre a un modelo remoto (`/api/create`), y eso no se puede
+  evitar desde el cliente: se detecta y se descarta, no se evita; el pedido ya
+  salió. Se detecta por el `remote_host` de la respuesta del chat: lo mandado
+  (con las notas, si las llevaba) ya salió, pero la respuesta se descarta, ese
+  turno no se aprende y queda el aviso «el modelo cambió a uno remoto durante
+  el pedido» en el registro (sin el host ni el contenido). Sin
+  `allow_remote` el pedido da error y no se reintenta: la persona no recibe
+  nada del remoto, y el turno no queda en el historial (como con cualquier
+  otro error, no se guarda ni el mensaje de la persona ni la respuesta). Lo
+  mismo si el reintento falla. Con `allow_remote` y sin
+  `share_memory_with_remote`, un pedido con notas se repite sin ellas; si ese
+  reintento sale bien, o si el pedido no llevaba notas, se devuelve la
+  respuesta y el intercambio se guarda, porque el remoto está permitido.
 
 | Método | Qué hace |
 |---|---|

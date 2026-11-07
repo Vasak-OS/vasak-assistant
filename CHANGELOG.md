@@ -16,6 +16,35 @@ Lo de un turno no se aprende en una memoria que se borró mientras se respondía
   guardarse en la memoria nueva. `store_at` sigue comparando contra la misma
   época del comienzo del turno.
 
+## vasak-assistant 0.3.9
+
+Un modelo de Ollama que corre afuera se reconoce por `remote_host`, no sólo
+por el nombre (#23).
+
+- **`daemon`** — un alias de `ollama create` (`FROM gpt-oss:120b-cloud`, o con
+  `remote_host`) corre en la nube con un nombre sin sufijo, y se trataba como
+  local: la conversación y la memoria salían de la máquina sin `allow_remote`
+  ni `share_memory_with_remote`. Ahora el modelo efectivo es remoto si su fila
+  de `/api/tags` trae `remote_host`, o si el nombre termina en `:cloud` o
+  `-cloud`. Vale para el chat, `chat_local_only`, la puerta de la memoria y
+  `model.local` de `Status`.
+- **`daemon`** — falla cerrado: sin `/api/tags` no se manda nada, y un modelo
+  que no figura en la lista cuenta como remoto. Un `:cloud`/`-cloud`
+  configurado se usa aunque no figure (el servidor lo resuelve contra
+  ollama.com sin haberlo bajado), como remoto.
+- **`daemon`** — si la respuesta de un chat trae `remote_host` (el nombre se
+  reapuntó a un remoto durante el pedido), sin `allow_remote` se descarta, da
+  error y no se reintenta. Con `allow_remote` y sin
+  `share_memory_with_remote`, la de un chat con notas de la memoria se descarta
+  y se repite sin ellas; con los dos permisos, el chat con notas acepta la
+  respuesta remota. Lo descartado no se aprende y queda un aviso en el
+  registro. `BackendError` suma `RemoteAfterSend` para ese descarte: a
+  diferencia de `NotLocal`, el pedido ya había salido.
+- **`daemon`** — con un modelo remoto rechazado por falta de `allow_remote`,
+  `Status` informa `model.local = false` en vez de `true`.
+- **`daemon`** — la línea de arranque dice «local según la dirección» con
+  Ollama: un alias se confirma en cada pedido.
+
 ## vasak-assistant 0.3.8
 
 La memoria, más dura frente a una base cambiada y a las notas con órdenes
