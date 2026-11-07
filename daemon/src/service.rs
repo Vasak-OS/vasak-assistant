@@ -485,6 +485,10 @@ impl AssistantService {
             reply: None,
         };
         let first_turn = context.iter().filter(|m| m.role == Role::User).count() == 1;
+        // La época del comienzo del turno, antes de leer la memoria: si un
+        // `ClearMemory` (o encender, apagar) llega mientras el modelo responde,
+        // de este turno no se aprende nada en la memoria nueva (#20).
+        let epoch = self.memory.epoch();
         // La puerta del remoto con el modelo que va a responder este pedido:
         // remoto y sin `share_memory_with_remote`, ni notas ni aprendizaje.
         // Filtro previo: no se lee la memoria si el modelo de ahora no la
@@ -537,7 +541,7 @@ impl AssistantService {
             let conversations = self.conversations.lock();
             if conversations.contains(owner, conversation_id) {
                 self.memory
-                    .learn_after(self.backend.clone(), conversation_id, context);
+                    .learn_after(self.backend.clone(), conversation_id, context, epoch);
             }
         }
         Ok(reply)
@@ -2550,9 +2554,12 @@ mod effective_model_tests {
 
         // La puerta (`allowed_for`, primera resolución) ve un modelo local y la
         // extracción (`chat_local_only`, segunda) lo ve en la nube.
-        rig.service
-            .memory
-            .learn_after(backend.clone(), "c1", conversation);
+        rig.service.memory.learn_after(
+            backend.clone(),
+            "c1",
+            conversation,
+            rig.service.memory.epoch(),
+        );
         rig.service.memory.wait_until_idle().await;
 
         assert!(backend.inner.seen.lock().is_empty(), "nada salió a la nube");
@@ -4467,5 +4474,275 @@ mod owner_chat_limit_tests {
             )),
             Error::Unavailable(_)
         ));
+    }
+}
+
+/// La época se toma al comienzo del turno (#20): borrar, apagar o encender la
+/// memoria mientras el modelo responde hace que de ese turno no se aprenda nada.
+#[cfg(test)]
+mod turn_epoch_tests {
+    use super::*;
+    use crate::test_support::{FakeBackend, FixedKey, FixedLabel, ScriptedBackend, TempDir};
+
+    const OWNER: &str = ":1.1";
+    const EXTRACTION: &str =
+        r#"{"items":[{"kind":"preference","text":"Prefiere el mate amargo"}],"summary":null}"#;
+
+    /// Un servicio con la memoria encendida, y su carpeta.
+    struct Rig {
+        _tmp: TempDir,
+        service: Arc<AssistantService>,
+    }
+
+    /// Un servicio con la memoria encendida sobre `backend`.
+    async fn rig(backend: Arc<dyn ModelBackend>) -> Rig {
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
+        memory.set_enabled(true).await.unwrap();
+        let service = Arc::new(AssistantService {
+            backend,
+            conversations: Arc::default(),
+            remote_allowed: false,
+            secrets: keys,
+            memory,
+            labels: FixedLabel::none(),
+        });
+        Rig { _tmp: tmp, service }
+    }
+
+    /// Falla a los 5 s en vez de colgar la prueba.
+    async fn quickly<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(5), future)
+            .await
+            .expect("la llamada se colgó")
+    }
+
+    /// Un turno que pasa `worth_learning` y queda bloqueado en el modelo.
+    fn start_turn(
+        service: &Arc<AssistantService>,
+        id: &str,
+    ) -> tokio::task::JoinHandle<Result<String, Error>> {
+        let (service, id) = (service.clone(), id.to_owned());
+        tokio::spawn(async move {
+            service
+                .chat_with(OWNER, &id, "prefiero el mate amargo", true)
+                .await
+        })
+    }
+
+    /// Comprueba que de ese turno no quedó nada en la memoria.
+    async fn nothing_learned(rig: &Rig) {
+        rig.service.memory.wait_until_idle().await;
+        let notes = rig.service.memory.recall("mate amargo", true).await;
+        assert!(
+            notes.is_none_or(|block| !block.contains("mate amargo")),
+            "se aprendió algo de un turno de otra época"
+        );
+    }
+
+    /// Un turno bloqueado en el modelo, con todo para soltarlo.
+    struct Blocked {
+        rig: Rig,
+        backend: Arc<FakeBackend>,
+        gate: Arc<tokio::sync::Notify>,
+        id: String,
+        turn: tokio::task::JoinHandle<Result<String, Error>>,
+    }
+
+    /// Deja un turno bloqueado en el modelo (ya entró, todavía no respondió).
+    async fn blocked_turn() -> Blocked {
+        let (fake, gate) = FakeBackend::gated(EXTRACTION);
+        let backend = Arc::new(fake);
+        let rig = rig(backend.clone()).await;
+        let id = rig.service.open(OWNER).unwrap();
+        let turn = start_turn(&rig.service, &id);
+        quickly(backend.entered.notified()).await;
+        Blocked {
+            rig,
+            backend,
+            gate,
+            id,
+            turn,
+        }
+    }
+
+    impl Blocked {
+        /// Suelta el turno bloqueado y espera a que termine, con la extracción.
+        async fn release(self) -> Rig {
+            self.gate.notify_one();
+            quickly(self.turn).await.unwrap().unwrap();
+            self.rig.service.memory.wait_until_idle().await;
+            self.rig
+        }
+
+        /// Lo suelta y verifica que el turno no aprendió nada: el chat salió, la
+        /// extracción no, y la memoria no tiene lo dicho.
+        async fn finish_and_check(self) -> Rig {
+            let backend = self.backend.clone();
+            let rig = self.release().await;
+            assert_eq!(
+                backend.seen.lock().len(),
+                1,
+                "la extracción no tenía que salir"
+            );
+            nothing_learned(&rig).await;
+            rig
+        }
+    }
+
+    #[tokio::test]
+    async fn borrar_la_memoria_mientras_el_modelo_responde_no_aprende_nada_del_turno() {
+        let blocked = blocked_turn().await;
+        let memory = blocked.rig.service.memory.clone();
+
+        memory.clear().await.unwrap();
+        let _rig = blocked.finish_and_check().await;
+
+        // La memoria nueva sigue encendida y vacía.
+        assert!(memory.status().await.available);
+    }
+
+    #[tokio::test]
+    async fn apagar_y_encender_la_memoria_mientras_el_modelo_responde_tampoco_aprende() {
+        let blocked = blocked_turn().await;
+        let memory = blocked.rig.service.memory.clone();
+
+        memory.set_enabled(false).await.unwrap();
+        memory.set_enabled(true).await.unwrap();
+
+        let _rig = blocked.finish_and_check().await;
+    }
+
+    #[tokio::test]
+    async fn solo_apagar_la_memoria_mientras_el_modelo_responde_tampoco_aprende() {
+        let blocked = blocked_turn().await;
+        let memory = blocked.rig.service.memory.clone();
+
+        memory.set_enabled(false).await.unwrap();
+        let rig = blocked.finish_and_check().await;
+
+        // Vuelve a encenderse y sigue sin haber nada de ese turno.
+        memory.set_enabled(true).await.unwrap();
+        nothing_learned(&rig).await;
+    }
+
+    /// Un backend cuyo `active_model` —lo que consulta `allowed_for`— se queda
+    /// esperando hasta que se lo suelta; el resto va al `ScriptedBackend`.
+    struct BlockedGate {
+        inner: Arc<ScriptedBackend>,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        /// Sólo la primera consulta espera: las siguientes pasan.
+        blocked_once: std::sync::atomic::AtomicBool,
+    }
+
+    impl ModelBackend for BlockedGate {
+        fn info(&self) -> vasak_assistant_protocol::ModelInfo {
+            self.inner.info()
+        }
+        fn models(&self) -> BoxFuture<'_, Result<Vec<String>, BackendError>> {
+            self.inner.models()
+        }
+        fn active_model(
+            &self,
+        ) -> BoxFuture<'_, Result<vasak_assistant_protocol::ModelInfo, BackendError>> {
+            Box::pin(async move {
+                if !self
+                    .blocked_once
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                self.inner.active_model().await
+            })
+        }
+        fn chat<'a>(
+            &'a self,
+            messages: &'a [Message],
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            self.inner.chat(messages)
+        }
+        fn chat_local_only<'a>(
+            &'a self,
+            messages: &'a [Message],
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            self.inner.chat_local_only(messages)
+        }
+    }
+
+    /// La época se toma antes de `allowed_for`: un borrado que llega mientras
+    /// la puerta espera al modelo también deja el turno sin aprender (#20).
+    #[tokio::test]
+    async fn borrar_la_memoria_mientras_la_puerta_espera_al_modelo_no_aprende_nada_del_turno() {
+        let inner = ScriptedBackend::new(["Hola.", EXTRACTION]);
+        let backend = Arc::new(BlockedGate {
+            inner: inner.clone(),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            blocked_once: Default::default(),
+        });
+        let rig = rig(backend.clone()).await;
+        let id = rig.service.open(OWNER).unwrap();
+        let turn = start_turn(&rig.service, &id);
+        // El turno ya tomó la época y espera dentro de `allowed_for`.
+        quickly(backend.entered.notified()).await;
+
+        rig.service.memory.clear().await.unwrap();
+        backend.release.notify_one();
+        quickly(turn).await.unwrap().unwrap();
+        rig.service.memory.wait_until_idle().await;
+
+        assert_eq!(
+            inner.seen.lock().len(),
+            1,
+            "el chat salió y la extracción no"
+        );
+        nothing_learned(&rig).await;
+    }
+
+    #[tokio::test]
+    async fn sin_cambios_en_medio_el_turno_normal_sigue_aprendiendo_de_punta_a_punta() {
+        let backend = ScriptedBackend::new(["Hola.", EXTRACTION]);
+        let rig = rig(backend.clone()).await;
+        let id = rig.service.open(OWNER).unwrap();
+
+        rig.service
+            .chat_with(OWNER, &id, "prefiero el mate amargo", true)
+            .await
+            .unwrap();
+        rig.service.memory.wait_until_idle().await;
+
+        assert_eq!(backend.seen.lock().len(), 2, "el chat y la extracción");
+        let notes = rig.service.memory.recall("zzz", true).await.unwrap();
+        assert!(notes.contains("Prefiere el mate amargo"), "{notes}");
+    }
+
+    #[tokio::test]
+    async fn el_turno_siguiente_ya_con_la_epoca_nueva_aprende_con_normalidad() {
+        let blocked = blocked_turn().await;
+        let (backend, gate, id) = (
+            blocked.backend.clone(),
+            blocked.gate.clone(),
+            blocked.id.clone(),
+        );
+        blocked.rig.service.memory.clear().await.unwrap();
+        let rig = blocked.release().await;
+        assert_eq!(backend.seen.lock().len(), 1);
+
+        // Otro turno de la misma conversación, empezado después del borrado.
+        let second = start_turn(&rig.service, &id);
+        quickly(backend.entered.notified()).await;
+        gate.notify_one();
+        quickly(second).await.unwrap().unwrap();
+        // Ahora sí sale la extracción; hay que soltarla.
+        quickly(backend.entered.notified()).await;
+        gate.notify_one();
+        rig.service.memory.wait_until_idle().await;
+
+        assert_eq!(backend.seen.lock().len(), 3);
+        let notes = rig.service.memory.recall("zzz", true).await.unwrap();
+        assert!(notes.contains("Prefiere el mate amargo"), "{notes}");
     }
 }
