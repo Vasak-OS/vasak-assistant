@@ -3287,7 +3287,7 @@ mod delete_conversation_tests {
     }
 
     #[tokio::test]
-    async fn con_la_memoria_apagada_borrar_la_conversacion_no_toca_la_base_y_el_resumen_queda() {
+    async fn con_la_memoria_apagada_borrar_no_toca_la_base_y_el_resumen_se_va_al_encender() {
         let rig = rig().await;
         let (a, _b) = two_with_summaries(&rig).await;
         rig.service.memory.set_enabled(false).await.unwrap();
@@ -3296,12 +3296,9 @@ mod delete_conversation_tests {
 
         // La conversación se cerró; la memoria apagada no se leyó ni se escribió.
         assert!(rig.service.history_of(OWNER, &a).is_err());
-        rig.service.memory.set_enabled(true).await.unwrap();
-        assert_eq!(
-            summaries(&rig.service.memory).await,
-            ["Resumen de A", "Resumen de B"]
-        );
         assert!(rig.tmp.memory_dir().exists());
+        rig.service.memory.set_enabled(true).await.unwrap();
+        assert_eq!(summaries(&rig.service.memory).await, ["Resumen de B"]);
     }
 
     #[tokio::test]

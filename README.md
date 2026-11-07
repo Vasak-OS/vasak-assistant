@@ -192,11 +192,13 @@ systemd, `$STATE_DIRECTORY`). No va en el almacén de cuentas.
   aprendió de ella antes (preferencias, estilo, temas) queda: no está atado a
   una conversación. El borrado es lógico: la base sigue cifrada con la llave
   vigente, y borrar del todo es `ClearMemory`, que destruye la llave.
-  - Con la memoria apagada no se toca la base, así que el resumen de una
-    conversación borrada mientras estaba apagada queda.
-  - Si la memoria está encendida pero no se puede abrir (llavero bloqueado o
-    llave que falta), tampoco se borra y no se reintenta después: para eso,
-    `ClearMemory` (#28).
+  - Con la memoria apagada no se toca la base, y si está encendida pero no se
+    puede abrir (llavero bloqueado o llave que falta) no se puede borrar: en
+    los dos casos el servicio anota el id de la conversación (sólo el id, en
+    RAM) y borra el resumen la próxima vez que abre la memoria. Si el servicio
+    se reinicia antes, la lista se pierde y el resumen queda: para eso,
+    `ClearMemory` (#28). La lista guarda hasta 256 ids; pasado eso se olvida el
+    más viejo y su resumen queda.
   - Los resúmenes de conversaciones de antes de reiniciar el servicio (las
     conversaciones no sobreviven al reinicio, así que ya no se pueden borrar
     una por una) no se borran a pedido: se van con `ClearMemory`, o solos

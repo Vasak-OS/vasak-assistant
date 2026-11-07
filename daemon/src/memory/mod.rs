@@ -163,7 +163,16 @@ pub struct Memory {
     /// [`Self::store_at`], bajo el candado. Hace de época por conversación:
     /// los ids son uuid y no vuelven, así que basta con recordar que se borró.
     forgotten: parking_lot::Mutex<std::collections::VecDeque<String>>,
+    /// Los ids de conversaciones borradas cuyos resúmenes no se pudieron
+    /// borrar en el momento (memoria apagada, sin abrir o un fallo al
+    /// escribir): se borran al abrir la base ([`Self::ensure_open`]). Sólo en
+    /// RAM, sólo el id, y se toca con el candado de la base tomado.
+    pending_deletes: parking_lot::Mutex<std::collections::VecDeque<String>>,
 }
+
+/// Cuántos borrados de resúmenes se guardan para después. Lleno, se olvida el
+/// más viejo (su resumen queda, como antes de #28) con un aviso.
+const MAX_PENDING_DELETES: usize = vasak_assistant_protocol::MAX_CONVERSATIONS * 8;
 
 /// Cuántas conversaciones borradas se recuerdan en `forgotten`. Vaciarlo no
 /// deja pasar nada: la extracción en vuelo se cancela por `in_flight`, y el
@@ -210,6 +219,7 @@ impl Memory {
             pruned_over_limit: Arc::default(),
             last_open_problem: parking_lot::Mutex::default(),
             forgotten: parking_lot::Mutex::default(),
+            pending_deletes: parking_lot::Mutex::default(),
         }
     }
 
@@ -486,11 +496,10 @@ impl Memory {
     /// memoria no se puede usar, sólo queda la cancelación.
     ///
     /// Con la memoria apagada no se toca la base (apagar no lee ni escribe,
-    /// decisión 10), y el resumen de una conversación borrada mientras estaba
-    /// apagada queda: no se anota en ningún lado para borrarlo al encender,
-    /// porque eso sería escribir con la memoria apagada. La salida para eso es
-    /// `ClearMemory`. Lo mismo si la memoria no se pudo abrir (llavero
-    /// bloqueado, llave que falta): no se reintenta después.
+    /// decisión 10): el id queda en `pending_deletes`, en RAM, y el resumen se
+    /// borra la próxima vez que se abra la base. Lo mismo si no se pudo abrir
+    /// (llavero bloqueado, llave que falta) o falló el borrado. Si el servicio
+    /// se reinicia antes, la lista se pierde y el resumen queda (#28).
     pub async fn forget_conversation(&self, conversation_id: &str) {
         if let Some((id, cancelled)) = &*self.in_flight.lock() {
             if id == conversation_id {
@@ -510,15 +519,23 @@ impl Memory {
         };
         let mut db = self.db.lock().await;
         if !is_file(&flag(dir)).await {
+            self.defer_delete(conversation_id);
             return;
         }
         // Borrar no le manda nada a ningún modelo: la puerta del remoto no
         // aplica, sólo que esté encendida y abierta.
         if let Err(reason) = self.ensure_open(dir, &mut db).await {
-            tracing::warn!("no se borraron los resúmenes de la conversación: {reason}");
+            tracing::warn!(
+                conversation = %short_id(conversation_id),
+                "los resúmenes de la conversación se borrarán al abrir la memoria: {reason}"
+            );
+            self.defer_delete(conversation_id);
             return;
         }
-        let Some(db) = db.clone() else { return };
+        let Some(db) = db.clone() else {
+            self.defer_delete(conversation_id);
+            return;
+        };
         let id = conversation_id.to_owned();
         let short = short_id(conversation_id);
         match blocking(move || schema::delete_summaries(&db, &id).map_err(db_error)).await {
@@ -528,9 +545,72 @@ impl Memory {
                 "se borraron los resúmenes de la conversación"
             ),
             Err(error) => {
-                tracing::warn!("no se borraron los resúmenes de la conversación: {error}")
+                tracing::warn!(
+                    conversation = %short,
+                    "no se borraron los resúmenes de la conversación, se reintenta: {error}"
+                );
+                self.defer_delete(conversation_id);
             }
         }
+    }
+
+    /// Anota el id en `pending_deletes`, sin repetirlo. Con el candado de la
+    /// base tomado.
+    fn defer_delete(&self, conversation_id: &str) {
+        let mut pending = self.pending_deletes.lock();
+        if pending.iter().any(|id| id == conversation_id) {
+            return;
+        }
+        if pending.len() >= MAX_PENDING_DELETES {
+            if let Some(dropped) = pending.pop_front() {
+                tracing::warn!(
+                    conversation = %short_id(&dropped),
+                    "demasiados borrados pendientes: el resumen de esta conversación queda"
+                );
+            }
+        }
+        pending.push_back(conversation_id.to_owned());
+    }
+
+    /// Borra los resúmenes de `pending_deletes` en la base recién abierta. Lo
+    /// que falla vuelve a la lista. Con el candado de la base tomado.
+    async fn apply_pending_deletes(&self, db: &Arc<GrafeoDB>) {
+        let pending: Vec<String> = self.pending_deletes.lock().drain(..).collect();
+        if pending.is_empty() {
+            return;
+        }
+        let db = db.clone();
+        let total = pending.len();
+        // Si la tarea entera falla (un pánico), vuelven todos.
+        let all = pending.clone();
+        let failed = blocking(move || {
+            Ok(pending
+                .into_iter()
+                .filter(|id| match schema::delete_summaries(&db, id) {
+                    Ok(_) => false,
+                    Err(error) => {
+                        tracing::debug!(conversation = %short_id(id), "{error}");
+                        true
+                    }
+                })
+                .collect::<Vec<_>>())
+        })
+        .await
+        .unwrap_or(all);
+        if failed.is_empty() {
+            tracing::debug!(total, "se borraron los resúmenes pendientes");
+            return;
+        }
+        tracing::warn!(
+            failed = failed.len(),
+            total,
+            "no se borraron algunos resúmenes pendientes, se reintenta"
+        );
+        let mut list = self.pending_deletes.lock();
+        for id in failed.into_iter().rev() {
+            list.push_front(id);
+        }
+        list.truncate(MAX_PENDING_DELETES);
     }
 
     /// Espera a que no haya una extracción en curso: `learn_after` toma el
@@ -645,6 +725,8 @@ impl Memory {
             .map_err(|error| {
                 Error::Unavailable(format!("No se pudo borrar la memoria: {error}"))
             })?;
+        // Los resúmenes pendientes se fueron con los archivos.
+        self.pending_deletes.lock().clear();
         let recreated = is_file(&flag(dir)).await;
         if recreated {
             self.create(dir, &mut db).await?;
@@ -663,17 +745,22 @@ impl Memory {
         // Una línea la primera vez y cada vez que cambia el motivo: el estado y
         // cada `recall` vuelven a intentarlo, y no hace falta repetirla. El
         // motivo es un texto fijo, sin la llave.
-        let mut last = self.last_open_problem.lock();
-        match result {
-            Err(reason) if *last != Some(reason) => {
-                tracing::warn!("la memoria no se puede abrir: {reason}");
-                *last = Some(reason);
+        {
+            let mut last = self.last_open_problem.lock();
+            match result {
+                Err(reason) if *last != Some(reason) => {
+                    tracing::warn!("la memoria no se puede abrir: {reason}");
+                    *last = Some(reason);
+                }
+                Ok(()) if last.is_some() => {
+                    tracing::info!("la memoria se abrió");
+                    *last = None;
+                }
+                _ => {}
             }
-            Ok(()) if last.is_some() => {
-                tracing::info!("la memoria se abrió");
-                *last = None;
-            }
-            _ => {}
+        }
+        if let Some(opened) = db.as_ref().filter(|_| result.is_ok()) {
+            self.apply_pending_deletes(opened).await;
         }
         result
     }
@@ -742,6 +829,8 @@ impl Memory {
         let created = blocking(move || create_files(&dir, &stored)).await;
         match created {
             Ok(opened) => {
+                // Una base nueva no tiene resúmenes de nadie.
+                self.pending_deletes.lock().clear();
                 *db = Some(Arc::new(opened));
                 Ok(())
             }
@@ -2436,7 +2525,7 @@ mod forget_tests {
     }
 
     #[tokio::test]
-    async fn con_la_memoria_apagada_no_se_toca_la_base_y_el_resumen_queda() {
+    async fn con_la_memoria_apagada_no_se_toca_la_base_y_el_resumen_se_borra_al_encender() {
         let (tmp, memory) = enabled().await;
         memory.store(summary("Resumen de A"), "a").await.unwrap();
         memory.set_enabled(false).await.unwrap();
@@ -2462,7 +2551,7 @@ mod forget_tests {
 
         assert_eq!(files(&tmp.memory_dir()), before);
         memory.set_enabled(true).await.unwrap();
-        assert_eq!(summaries(&memory).await, ["Resumen de A"]);
+        assert!(summaries(&memory).await.is_empty());
     }
 
     #[tokio::test]
@@ -2803,7 +2892,7 @@ mod log_tests {
 
         broken.forget_conversation("c1").await;
 
-        let l = line(&log, &["no se borraron los resúmenes de la conversación"]);
+        let l = line(&log, &["se borrarán al abrir la memoria"]);
         assert!(l.contains("WARN"), "{l}");
     }
 

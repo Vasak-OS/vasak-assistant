@@ -2,6 +2,19 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-assistant 0.3.11
+
+Borrar una conversación con la memoria apagada o sin abrir ya no deja su
+resumen para siempre (#28).
+
+- **`daemon`** — si `DeleteConversation` no puede borrar el resumen en el
+  momento (memoria apagada, llavero bloqueado, llave que falta o un fallo al
+  escribir), anota el id de la conversación en una lista en RAM y lo borra la
+  próxima vez que se abre la memoria. Con la memoria apagada no se escribe
+  nada (decisión 10). Lo que falle al aplicarse queda en la lista; `ClearMemory`
+  la vacía. Tope: 256 ids; lleno, se olvida el más viejo con un aviso. Si el
+  servicio se reinicia, la lista se pierde.
+
 ## vasak-assistant 0.3.9
 
 Un modelo de Ollama que corre afuera se reconoce por `remote_host`, no sólo
