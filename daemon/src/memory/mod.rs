@@ -49,6 +49,13 @@
 //!   abre la base, la memoria queda no disponible con el motivo, y la salida es
 //!   borrarla. La base se abre la primera vez que alguien la necesita, así un
 //!   llavero que se desbloquea después alcanza.
+//! - **Borrar una conversación** con la memoria apagada o sin abrir deja su
+//!   id pendiente en RAM (`pending_deletes`), y su resumen se borra la próxima
+//!   vez que se usa la base abierta.
+//!
+//! Orden de los candados: primero la base (`db`), después `pending_deletes` y
+//! por último `summarized`; esos dos nunca se sostienen a través de un
+//! `await`.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -176,6 +183,10 @@ pub struct Memory {
     // extracción a la vez, con ida y vuelta al modelo) y lo pierde al borrarse.
     // Ponerle tope si el demonio corre semanas con miles de conversaciones.
     summarized: parking_lot::Mutex<HashSet<String>>,
+    /// Si ya se avisó (WARN) que hay borrados pendientes que fallan: se
+    /// reintentan en cada uso de la base, y los demás fallos van a DEBUG
+    /// hasta que la lista se vacíe.
+    pending_warned: AtomicBool,
 }
 
 /// Cuántos borrados de resúmenes se guardan para después. Lleno, se olvida el
@@ -229,6 +240,7 @@ impl Memory {
             forgotten: parking_lot::Mutex::default(),
             pending_deletes: parking_lot::Mutex::default(),
             summarized: parking_lot::Mutex::default(),
+            pending_warned: AtomicBool::new(false),
         }
     }
 
@@ -590,6 +602,7 @@ impl Memory {
         }
         if pending.len() >= MAX_PENDING_DELETES {
             if let Some(dropped) = pending.pop_front() {
+                self.summarized.lock().remove(&dropped);
                 tracing::warn!(
                     conversation = %short_id(&dropped),
                     "demasiados borrados pendientes: el resumen de esta conversación queda"
@@ -599,8 +612,9 @@ impl Memory {
         pending.push_back(conversation_id.to_owned());
     }
 
-    /// Borra los resúmenes de `pending_deletes` en la base recién abierta. Lo
-    /// que falla vuelve a la lista. Con el candado de la base tomado.
+    /// Borra los resúmenes de `pending_deletes` en la base abierta. Lo que
+    /// falla vuelve a la lista y se reintenta en el próximo uso de la base.
+    /// Con el candado de la base tomado.
     async fn apply_pending_deletes(&self, db: &Arc<GrafeoDB>) {
         let pending: Vec<String> = self.pending_deletes.lock().drain(..).collect();
         if pending.is_empty() {
@@ -632,19 +646,30 @@ impl Memory {
             }
         }
         if failed.is_empty() {
+            self.pending_warned.store(false, Ordering::SeqCst);
             tracing::debug!(total, "se borraron los resúmenes pendientes");
             return;
         }
-        tracing::warn!(
-            failed = failed.len(),
-            total,
-            "no se borraron algunos resúmenes pendientes, se reintenta"
-        );
+        let failed_count = failed.len();
+        if self.pending_warned.swap(true, Ordering::SeqCst) {
+            tracing::debug!(
+                failed = failed_count,
+                total,
+                "siguen sin borrarse algunos resúmenes pendientes"
+            );
+        } else {
+            tracing::warn!(
+                failed = failed_count,
+                total,
+                "no se borraron algunos resúmenes pendientes, se reintenta"
+            );
+        }
+        // Sin tope que mirar: `failed` sale de lo que se sacó de la lista, y
+        // con el candado de la base nadie más la llenó mientras tanto.
         let mut list = self.pending_deletes.lock();
         for id in failed.into_iter().rev() {
             list.push_front(id);
         }
-        list.truncate(MAX_PENDING_DELETES);
     }
 
     /// Espera a que no haya una extracción en curso: `learn_after` toma el
@@ -1881,7 +1906,7 @@ mod tests {
 mod guard_tests {
     use super::learn::Item;
     use super::*;
-    use crate::test_support::{FixedKey, TempDir};
+    use crate::test_support::{files_under, FixedKey, TempDir};
 
     fn header(magic: &[u8; 4], version: u32, flags: u32) -> Vec<u8> {
         let mut bytes = magic.to_vec();
@@ -1908,21 +1933,6 @@ mod guard_tests {
         ] {
             assert!(!is_encrypted_header(&bytes), "{name}");
         }
-    }
-
-    /// Cada archivo bajo `path`, con su ruta y su contenido, en orden.
-    fn files_under(path: &Path) -> Vec<(PathBuf, Vec<u8>)> {
-        let mut found = Vec::new();
-        for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                found.extend(files_under(&path));
-            } else {
-                found.push((path.clone(), std::fs::read(&path).unwrap()));
-            }
-        }
-        found.sort();
-        found
     }
 
     async fn enabled() -> (TempDir, Arc<FixedKey>, Arc<Memory>) {
@@ -2437,20 +2447,15 @@ mod review_tests {
 mod forget_tests {
     use super::learn::Item;
     use super::*;
-    use crate::test_support::{FakeBackend, FixedKey, ScriptedBackend, TempDir};
+    use crate::test_support::{
+        files_under, summaries, summary, FakeBackend, FixedKey, ScriptedBackend, TempDir,
+    };
 
     async fn enabled() -> (TempDir, Arc<Memory>) {
         let tmp = TempDir::new();
         let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), FixedKey::new(None)));
         memory.set_enabled(true).await.unwrap();
         (tmp, memory)
-    }
-
-    fn summary(text: &str) -> Extraction {
-        Extraction {
-            items: Vec::new(),
-            summary: Some(text.into()),
-        }
     }
 
     fn preference(text: &str) -> Extraction {
@@ -2463,20 +2468,6 @@ mod forget_tests {
             }],
             summary: None,
         }
-    }
-
-    async fn summaries(memory: &Memory) -> Vec<String> {
-        let db = memory.database().await.unwrap();
-        let mut all = blocking(move || {
-            Ok(schema::entries(&db, MemoryKind::ConversationSummary)
-                .into_iter()
-                .map(|e| e.text)
-                .collect::<Vec<_>>())
-        })
-        .await
-        .unwrap();
-        all.sort();
-        all
     }
 
     fn turn() -> Vec<Message> {
@@ -2567,27 +2558,11 @@ mod forget_tests {
         let (tmp, memory) = enabled().await;
         memory.store(summary("Resumen de A"), "a").await.unwrap();
         memory.set_enabled(false).await.unwrap();
-        let files = |dir: &Path| -> Vec<(PathBuf, Vec<u8>)> {
-            fn walk(path: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
-                for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
-                    let p = entry.path();
-                    if p.is_dir() {
-                        walk(&p, out);
-                    } else {
-                        out.push((p.clone(), std::fs::read(&p).unwrap()));
-                    }
-                }
-            }
-            let mut out = Vec::new();
-            walk(dir, &mut out);
-            out.sort();
-            out
-        };
-        let before = files(&tmp.memory_dir());
+        let before = files_under(&tmp.memory_dir());
 
         memory.forget_conversation("a").await;
 
-        assert_eq!(files(&tmp.memory_dir()), before);
+        assert_eq!(files_under(&tmp.memory_dir()), before);
         memory.set_enabled(true).await.unwrap();
         assert!(summaries(&memory).await.is_empty());
     }
@@ -3732,31 +3707,10 @@ mod canary_tests {
 #[cfg(test)]
 mod pending_deletes_tests {
     use super::*;
-    use crate::test_support::{capture_logs, FixedKey, LogCapture, TempDir};
+    use crate::test_support::{capture_logs, files_under, summaries, summary, FixedKey, TempDir};
 
     const A: &str = "123e4567-e89b-12d3-a456-426614174000";
     const B: &str = "223e4567-e89b-12d3-a456-426614174000";
-
-    fn summary(text: &str) -> Extraction {
-        Extraction {
-            items: Vec::new(),
-            summary: Some(text.into()),
-        }
-    }
-
-    async fn summaries(memory: &Memory) -> Vec<String> {
-        let db = memory.database().await.unwrap();
-        let mut all = blocking(move || {
-            Ok(schema::entries(&db, MemoryKind::ConversationSummary)
-                .into_iter()
-                .map(|e| e.text)
-                .collect::<Vec<_>>())
-        })
-        .await
-        .unwrap();
-        all.sort();
-        all
-    }
 
     /// Una memoria encendida con un resumen de cada conversación (A y B).
     async fn with_two_summaries() -> (TempDir, Arc<FixedKey>, Arc<Memory>) {
@@ -3773,38 +3727,15 @@ mod pending_deletes_tests {
         memory.pending_deletes.lock().iter().cloned().collect()
     }
 
-    fn files(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
-        let mut out = Vec::new();
-        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                out.extend(files(&path));
-            } else {
-                out.push((path.clone(), std::fs::read(&path).unwrap()));
-            }
-        }
-        out.sort();
-        out
-    }
-
-    fn text(log: &LogCapture) -> String {
-        log.text()
-    }
-
-    #[test]
-    fn el_tope_son_256_ids() {
-        assert_eq!(MAX_PENDING_DELETES, 256);
-    }
-
     #[tokio::test]
     async fn con_la_memoria_apagada_borrar_no_escribe_en_disco_y_al_encender_se_borra() {
         let (tmp, _keys, memory) = with_two_summaries().await;
         memory.set_enabled(false).await.unwrap();
-        let before = files(&tmp.memory_dir());
+        let before = files_under(&tmp.memory_dir());
 
         memory.forget_conversation(A).await;
 
-        assert_eq!(files(&tmp.memory_dir()), before, "nada escrito");
+        assert_eq!(files_under(&tmp.memory_dir()), before, "nada escrito");
         assert_eq!(pending(&memory), [A]);
         memory.set_enabled(true).await.unwrap();
         assert_eq!(summaries(&memory).await, ["Resumen de B"]);
@@ -3943,10 +3874,11 @@ mod pending_deletes_tests {
         assert_eq!(kept.first(), Some(&ids[1]));
         assert_eq!(kept.last(), ids.last());
         assert!(!kept.contains(&ids[0]));
-        let l = text(&log)
+        let l = log
+            .text()
             .lines()
             .find(|l| l.contains("demasiados borrados pendientes"))
-            .unwrap_or_else(|| panic!("falta el aviso:\n{}", text(&log)))
+            .unwrap_or_else(|| panic!("falta el aviso:\n{}", log.text()))
             .to_owned();
         assert!(
             l.contains("WARN") && l.contains("conversation=00000000"),
@@ -3983,7 +3915,7 @@ mod pending_deletes_tests {
         *keys.locked.lock() = false;
         memory.status().await;
 
-        let all = text(&log);
+        let all = log.text();
         let deferred = all
             .lines()
             .find(|l| l.contains("se borrarán al abrir la memoria"))

@@ -11,8 +11,9 @@ resumen para siempre (#28).
   momento (memoria apagada, llavero bloqueado, llave que falta o un fallo al
   escribir), anota el id de la conversación en una lista en RAM y lo borra la
   próxima vez que se abre la memoria. Con la memoria apagada no se escribe
-  nada (decisión 10). Lo que falle al aplicarse queda en la lista; `ClearMemory`
-  la vacía. Tope: 256 ids; lleno, se olvida el más viejo con un aviso. Si el
+  nada (decisión 10). Lo que falle al aplicarse queda en la lista y se
+  reintenta en cada uso de la memoria abierta (estado, notas, aprendizaje),
+  con un solo aviso hasta que la lista se vacíe; `ClearMemory` la vacía. Tope: 256 ids; lleno, se olvida el más viejo con un aviso. Si el
   servicio se reinicia, la lista se pierde.
 - **`daemon`** — sólo se anota una conversación con un resumen guardado en esta
   ejecución: un cliente que no usa la memoria ya no puede vaciar la lista

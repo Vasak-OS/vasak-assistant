@@ -197,7 +197,7 @@ systemd, `$STATE_DIRECTORY`). No va en el almacén de cuentas.
     los dos casos el servicio anota el id de la conversación (sólo el id, en
     RAM) y borra el resumen la próxima vez que abre la memoria. Si el servicio
     se reinicia antes, la lista se pierde y el resumen queda: para eso,
-    `ClearMemory` (#28). La lista guarda hasta 256 ids; pasado eso se olvida el
+    `ClearMemory`. La lista guarda hasta 256 ids; pasado eso se olvida el
     más viejo y su resumen queda.
   - Sólo entra a la lista una conversación con un resumen guardado en esta
     ejecución del servicio, así un cliente no la llena borrando conversaciones
