@@ -3688,3 +3688,286 @@ mod canary_tests {
         assert!(!status.reason.contains(&tmp.path().display().to_string()));
     }
 }
+
+/// Los borrados de resúmenes que esperan a que se abra la memoria (#28).
+#[cfg(test)]
+mod pending_deletes_tests {
+    use super::*;
+    use crate::test_support::{capture_logs, FixedKey, LogCapture, TempDir};
+
+    const A: &str = "123e4567-e89b-12d3-a456-426614174000";
+    const B: &str = "223e4567-e89b-12d3-a456-426614174000";
+
+    fn summary(text: &str) -> Extraction {
+        Extraction {
+            items: Vec::new(),
+            summary: Some(text.into()),
+        }
+    }
+
+    async fn summaries(memory: &Memory) -> Vec<String> {
+        let db = memory.database().await.unwrap();
+        let mut all = blocking(move || {
+            Ok(schema::entries(&db, MemoryKind::ConversationSummary)
+                .into_iter()
+                .map(|e| e.text)
+                .collect::<Vec<_>>())
+        })
+        .await
+        .unwrap();
+        all.sort();
+        all
+    }
+
+    /// Una memoria encendida con un resumen de cada conversación (A y B).
+    async fn with_two_summaries() -> (TempDir, Arc<FixedKey>, Arc<Memory>) {
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
+        memory.set_enabled(true).await.unwrap();
+        memory.store(summary("Resumen de A"), A).await.unwrap();
+        memory.store(summary("Resumen de B"), B).await.unwrap();
+        (tmp, keys, memory)
+    }
+
+    fn pending(memory: &Memory) -> Vec<String> {
+        memory.pending_deletes.lock().iter().cloned().collect()
+    }
+
+    fn files(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(files(&path));
+            } else {
+                out.push((path.clone(), std::fs::read(&path).unwrap()));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn text(log: &LogCapture) -> String {
+        log.text()
+    }
+
+    #[test]
+    fn el_tope_son_256_ids() {
+        assert_eq!(MAX_PENDING_DELETES, 256);
+    }
+
+    #[tokio::test]
+    async fn con_la_memoria_apagada_borrar_no_escribe_en_disco_y_al_encender_se_borra() {
+        let (tmp, _keys, memory) = with_two_summaries().await;
+        memory.set_enabled(false).await.unwrap();
+        let before = files(&tmp.memory_dir());
+
+        memory.forget_conversation(A).await;
+
+        assert_eq!(files(&tmp.memory_dir()), before, "nada escrito");
+        assert_eq!(pending(&memory), [A]);
+        memory.set_enabled(true).await.unwrap();
+        assert_eq!(summaries(&memory).await, ["Resumen de B"]);
+        assert!(pending(&memory).is_empty());
+    }
+
+    #[tokio::test]
+    async fn con_el_llavero_bloqueado_el_id_queda_y_el_siguiente_uso_borra_el_resumen() {
+        for next_use in ["status", "recall", "database"] {
+            let (_tmp, keys, memory) = with_two_summaries().await;
+            memory.close().await;
+            *keys.locked.lock() = true;
+
+            memory.forget_conversation(A).await;
+
+            assert_eq!(pending(&memory), [A], "{next_use}");
+            *keys.locked.lock() = false;
+            match next_use {
+                "status" => assert!(memory.status().await.available),
+                "recall" => {
+                    memory.recall("hola", true).await;
+                }
+                _ => {
+                    memory.database().await.unwrap();
+                }
+            }
+            assert!(pending(&memory).is_empty(), "{next_use}");
+            assert_eq!(summaries(&memory).await, ["Resumen de B"], "{next_use}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sin_llave_el_id_queda_y_con_la_llave_de_vuelta_se_borra() {
+        let (_tmp, keys, memory) = with_two_summaries().await;
+        memory.close().await;
+        let key = keys.memory_key.lock().take();
+
+        memory.forget_conversation(A).await;
+        memory.forget_conversation(B).await;
+
+        assert_eq!(pending(&memory), [A, B]);
+        *keys.memory_key.lock() = key;
+        assert!(memory.status().await.available);
+        assert!(pending(&memory).is_empty());
+        assert!(summaries(&memory).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn con_la_memoria_encendida_y_abierta_el_borrado_sigue_siendo_inmediato() {
+        let (_tmp, _keys, memory) = with_two_summaries().await;
+
+        memory.forget_conversation(A).await;
+
+        assert!(pending(&memory).is_empty());
+        assert_eq!(summaries(&memory).await, ["Resumen de B"]);
+    }
+
+    #[tokio::test]
+    async fn los_pendientes_se_aplican_en_orden_y_con_la_lista_vacia_no_se_hace_nada() {
+        let (_tmp, _keys, memory) = with_two_summaries().await;
+        let db = memory.database().await.unwrap();
+        // Sin pendientes, aplicar no toca nada.
+        memory.apply_pending_deletes(&db).await;
+        assert_eq!(summaries(&memory).await, ["Resumen de A", "Resumen de B"]);
+
+        memory
+            .pending_deletes
+            .lock()
+            .extend([A.to_owned(), B.to_owned()]);
+        memory.apply_pending_deletes(&db).await;
+
+        assert!(pending(&memory).is_empty());
+        assert!(summaries(&memory).await.is_empty());
+        // Un id que no existe se da por borrado: no queda en la lista.
+        memory
+            .pending_deletes
+            .lock()
+            .push_back("no-existe".to_owned());
+        memory.apply_pending_deletes(&db).await;
+        assert!(pending(&memory).is_empty());
+    }
+
+    #[tokio::test]
+    async fn borrar_la_memoria_con_exito_vacia_la_lista_y_con_el_llavero_bloqueado_la_conserva() {
+        let (tmp, keys, memory) = with_two_summaries().await;
+        memory.set_enabled(false).await.unwrap();
+        memory.forget_conversation(A).await;
+        memory.forget_conversation(B).await;
+        assert_eq!(pending(&memory).len(), 2);
+
+        // Bloqueado: falla y no se toca nada, tampoco la lista.
+        *keys.locked.lock() = true;
+        assert!(memory.clear().await.is_err());
+        assert_eq!(pending(&memory), [A, B]);
+        assert!(tmp.memory_dir().exists());
+
+        // Desbloqueado: se borra todo, y la lista se vacía.
+        *keys.locked.lock() = false;
+        memory.clear().await.unwrap();
+        assert!(pending(&memory).is_empty());
+        assert!(!tmp.memory_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn encender_cuando_no_habia_memoria_tambien_vacia_la_lista() {
+        let tmp = TempDir::new();
+        let memory = Memory::new(Some(tmp.memory_dir()), FixedKey::new(None));
+        memory.forget_conversation(A).await;
+        assert_eq!(pending(&memory), [A]);
+
+        memory.set_enabled(true).await.unwrap();
+
+        // Una base nueva no tiene resúmenes de nadie.
+        assert!(pending(&memory).is_empty());
+        assert!(summaries(&memory).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn con_la_lista_llena_el_id_257_descarta_el_mas_viejo_con_su_aviso() {
+        let tmp = TempDir::new();
+        let memory = Memory::new(Some(tmp.memory_dir()), FixedKey::new(None));
+        let ids: Vec<String> = (0..=MAX_PENDING_DELETES)
+            .map(|n| format!("{n:08x}-e89b-12d3-a456-426614174000"))
+            .collect();
+        let (log, _guard) = capture_logs();
+
+        for id in &ids {
+            memory.forget_conversation(id).await;
+        }
+
+        let kept = pending(&memory);
+        assert_eq!(kept.len(), MAX_PENDING_DELETES);
+        assert_eq!(kept.first(), Some(&ids[1]));
+        assert_eq!(kept.last(), ids.last());
+        assert!(!kept.contains(&ids[0]));
+        let l = text(&log)
+            .lines()
+            .find(|l| l.contains("demasiados borrados pendientes"))
+            .unwrap_or_else(|| panic!("falta el aviso:\n{}", text(&log)))
+            .to_owned();
+        assert!(
+            l.contains("WARN") && l.contains("conversation=00000000"),
+            "{l}"
+        );
+        assert!(!l.contains(&ids[0]), "{l}");
+    }
+
+    #[tokio::test]
+    async fn el_mismo_id_anotado_dos_veces_no_se_repite() {
+        let tmp = TempDir::new();
+        let memory = Memory::new(Some(tmp.memory_dir()), FixedKey::new(None));
+
+        memory.forget_conversation(A).await;
+        memory.forget_conversation(A).await;
+        memory.forget_conversation(B).await;
+        memory.forget_conversation(A).await;
+
+        assert_eq!(pending(&memory), [A, B]);
+    }
+
+    #[tokio::test]
+    async fn el_registro_lleva_el_id_corto_y_cantidades_pero_nunca_el_id_entero_ni_el_resumen() {
+        let (_tmp, keys, memory) = with_two_summaries().await;
+        memory.close().await;
+        *keys.locked.lock() = true;
+        let (log, _guard) = capture_logs();
+
+        memory.forget_conversation(A).await;
+        *keys.locked.lock() = false;
+        memory.status().await;
+
+        let all = text(&log);
+        let deferred = all
+            .lines()
+            .find(|l| l.contains("se borrarán al abrir la memoria"))
+            .unwrap_or_else(|| panic!("falta la línea:\n{all}"));
+        assert!(deferred.contains("conversation=123e4567"), "{deferred}");
+        assert!(
+            all.contains("se borraron los resúmenes pendientes"),
+            "{all}"
+        );
+        assert!(all.contains("total=1"), "{all}");
+        assert!(!all.contains(A), "el id entero:\n{all}");
+        assert!(
+            !all.contains("Resumen de A") && !all.contains("Resumen de B"),
+            "{all}"
+        );
+    }
+
+    #[tokio::test]
+    async fn los_pendientes_se_pierden_si_el_servicio_se_reinicia_y_el_resumen_queda() {
+        let (tmp, keys, memory) = with_two_summaries().await;
+        memory.set_enabled(false).await.unwrap();
+        memory.forget_conversation(A).await;
+        drop(memory);
+
+        // Es un límite conocido: la lista es sólo RAM.
+        let restarted = Memory::new(Some(tmp.memory_dir()), keys);
+        restarted.set_enabled(true).await.unwrap();
+        assert_eq!(
+            summaries(&restarted).await,
+            ["Resumen de A", "Resumen de B"]
+        );
+    }
+}
