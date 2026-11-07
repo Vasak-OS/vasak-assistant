@@ -4627,6 +4627,81 @@ mod turn_epoch_tests {
         nothing_learned(&rig).await;
     }
 
+    /// Un backend cuyo `active_model` —lo que consulta `allowed_for`— se queda
+    /// esperando hasta que se lo suelta; el resto va al `ScriptedBackend`.
+    struct BlockedGate {
+        inner: Arc<ScriptedBackend>,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        /// Sólo la primera consulta espera: las siguientes pasan.
+        blocked_once: std::sync::atomic::AtomicBool,
+    }
+
+    impl ModelBackend for BlockedGate {
+        fn info(&self) -> vasak_assistant_protocol::ModelInfo {
+            self.inner.info()
+        }
+        fn models(&self) -> BoxFuture<'_, Result<Vec<String>, BackendError>> {
+            self.inner.models()
+        }
+        fn active_model(
+            &self,
+        ) -> BoxFuture<'_, Result<vasak_assistant_protocol::ModelInfo, BackendError>> {
+            Box::pin(async move {
+                if !self
+                    .blocked_once
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                self.inner.active_model().await
+            })
+        }
+        fn chat<'a>(
+            &'a self,
+            messages: &'a [Message],
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            self.inner.chat(messages)
+        }
+        fn chat_local_only<'a>(
+            &'a self,
+            messages: &'a [Message],
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            self.inner.chat_local_only(messages)
+        }
+    }
+
+    /// La época se toma antes de `allowed_for`: un borrado que llega mientras
+    /// la puerta espera al modelo también deja el turno sin aprender (#20).
+    #[tokio::test]
+    async fn borrar_la_memoria_mientras_la_puerta_espera_al_modelo_no_aprende_nada_del_turno() {
+        let inner = ScriptedBackend::new(["Hola.", EXTRACTION]);
+        let backend = Arc::new(BlockedGate {
+            inner: inner.clone(),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            blocked_once: Default::default(),
+        });
+        let rig = rig(backend.clone()).await;
+        let id = rig.service.open(OWNER).unwrap();
+        let turn = start_turn(&rig.service, &id);
+        // El turno ya tomó la época y espera dentro de `allowed_for`.
+        quickly(backend.entered.notified()).await;
+
+        rig.service.memory.clear().await.unwrap();
+        backend.release.notify_one();
+        quickly(turn).await.unwrap().unwrap();
+        rig.service.memory.wait_until_idle().await;
+
+        assert_eq!(
+            inner.seen.lock().len(),
+            1,
+            "el chat salió y la extracción no"
+        );
+        nothing_learned(&rig).await;
+    }
+
     #[tokio::test]
     async fn sin_cambios_en_medio_el_turno_normal_sigue_aprendiendo_de_punta_a_punta() {
         let backend = ScriptedBackend::new(["Hola.", EXTRACTION]);
