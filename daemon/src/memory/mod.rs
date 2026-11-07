@@ -4051,6 +4051,135 @@ mod pending_deletes_tests {
         fresh.set_enabled(true).await.unwrap();
         assert!(summarized(&fresh).is_empty());
     }
+
+    // ── El fallo parcial de los pendientes (gancho: ids `falla-…` y `panico-…`) ──
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    #[tokio::test]
+    async fn los_ids_que_fallan_vuelven_a_la_lista_en_orden_y_los_demas_se_borran() {
+        let (_tmp, _keys, memory) = with_two_summaries().await;
+        let db = memory.database().await.unwrap();
+        let list = ids(&["falla-1", A, "falla-2", B, "falla-3"]);
+        memory.pending_deletes.lock().extend(list.clone());
+        memory.summarized.lock().extend(list);
+
+        memory.apply_pending_deletes(&db).await;
+
+        assert_eq!(pending(&memory), ["falla-1", "falla-2", "falla-3"]);
+        // Los que no fallaron se borraron de verdad.
+        assert!(summaries(&memory).await.is_empty());
+        // Los que fallaron siguen en `summarized`, los demás salieron.
+        assert_eq!(summarized(&memory), ["falla-1", "falla-2", "falla-3"]);
+    }
+
+    #[tokio::test]
+    async fn el_primer_fallo_deja_warn_y_los_siguientes_debug_hasta_que_la_lista_se_vacia() {
+        let (_tmp, _keys, memory) = with_two_summaries().await;
+        let db = memory.database().await.unwrap();
+        let (log, _guard) = capture_logs();
+        memory
+            .pending_deletes
+            .lock()
+            .push_back("falla-1".to_owned());
+
+        memory.apply_pending_deletes(&db).await;
+        memory.apply_pending_deletes(&db).await;
+        memory.apply_pending_deletes(&db).await;
+
+        let all = log.text();
+        let warns = all
+            .lines()
+            .filter(|l| l.contains(" WARN ") && l.contains("no se borraron algunos"))
+            .count();
+        let debugs = all
+            .lines()
+            .filter(|l| l.contains(" DEBUG ") && l.contains("siguen sin borrarse"))
+            .count();
+        assert_eq!((warns, debugs), (1, 2), "{all}");
+        assert!(memory.pending_warned.load(Ordering::SeqCst));
+
+        // Se vacía la lista: vuelve a avisar si falla de nuevo más adelante.
+        memory.pending_deletes.lock().clear();
+        memory.pending_deletes.lock().push_back(A.to_owned());
+        memory.apply_pending_deletes(&db).await;
+        assert!(!memory.pending_warned.load(Ordering::SeqCst));
+        assert!(log.text().contains("se borraron los resúmenes pendientes"));
+        memory
+            .pending_deletes
+            .lock()
+            .push_back("falla-2".to_owned());
+        memory.apply_pending_deletes(&db).await;
+        let warns = log
+            .text()
+            .lines()
+            .filter(|l| l.contains(" WARN ") && l.contains("no se borraron algunos"))
+            .count();
+        assert_eq!(warns, 2, "{}", log.text());
+    }
+
+    #[tokio::test]
+    async fn el_registro_de_un_fallo_de_borrado_lleva_el_id_corto_y_el_codigo_pero_no_el_texto() {
+        let (_tmp, _keys, memory) = with_two_summaries().await;
+        let db = memory.database().await.unwrap();
+        let (log, _guard) = capture_logs();
+        memory
+            .pending_deletes
+            .lock()
+            .push_back("falla-1234567890".to_owned());
+
+        memory.apply_pending_deletes(&db).await;
+
+        let all = log.text();
+        assert!(all.contains("conversation=falla-12"), "{all}");
+        assert!(all.contains("GRAFEO-"), "{all}");
+        assert!(!all.contains("canarioqzx"), "{all}");
+        assert!(!all.contains("falla-1234567890"), "{all}");
+    }
+
+    #[tokio::test]
+    async fn si_la_tarea_entera_entra_en_panico_vuelven_todos_y_summarized_no_cambia() {
+        let (_tmp, _keys, memory) = with_two_summaries().await;
+        let db = memory.database().await.unwrap();
+        let (log, _guard) = capture_logs();
+        let list = ids(&[A, "panico-1", B]);
+        memory.pending_deletes.lock().extend(list.clone());
+        memory.summarized.lock().extend(list.clone());
+
+        memory.apply_pending_deletes(&db).await;
+
+        assert_eq!(pending(&memory), list);
+        assert!(summarized(&memory).contains(&A.to_owned()));
+        assert!(summarized(&memory).contains(&"panico-1".to_owned()));
+        // El mensaje del pánico no llega al registro.
+        assert!(!log.text().contains("canarioqzx"), "{}", log.text());
+        // Se reintenta: sacado el que entra en pánico, se borran los demás.
+        memory.pending_deletes.lock().retain(|id| id != "panico-1");
+        memory.apply_pending_deletes(&db).await;
+        assert!(pending(&memory).is_empty());
+    }
+
+    #[tokio::test]
+    async fn el_id_descartado_por_el_tope_sale_de_summarized() {
+        let tmp = TempDir::new();
+        let memory = Memory::new(Some(tmp.memory_dir()), FixedKey::new(None));
+        let all: Vec<String> = (0..=MAX_PENDING_DELETES)
+            .map(|n| format!("{n:08x}-e89b-12d3-a456-426614174000"))
+            .collect();
+        memory.summarized.lock().extend(all.iter().cloned());
+
+        for id in &all {
+            memory.forget_conversation(id).await;
+        }
+
+        assert_eq!(pending(&memory).len(), MAX_PENDING_DELETES);
+        let kept = summarized(&memory);
+        assert!(!kept.contains(&all[0]), "el descartado sale de summarized");
+        assert_eq!(kept.len(), MAX_PENDING_DELETES);
+        assert!(kept.contains(&all[1]) && kept.contains(all.last().unwrap()));
+    }
 }
 
 /// `learn_after` con una época que ya pasó (#20).

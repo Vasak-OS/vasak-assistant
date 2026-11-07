@@ -372,6 +372,19 @@ fn delete(db: &GrafeoDB, node: NodeId) -> grafeo::Result<()> {
 /// `conversation`) y después corre `gc` y `wal_checkpoint`, como la poda.
 /// Devuelve cuántos borró.
 pub fn delete_summaries(db: &GrafeoDB, conversation: &str) -> grafeo::Result<usize> {
+    // Gancho de prueba: un id que empieza con `falla-` falla y uno que empieza
+    // con `panico-` entra en pánico, para probar los borrados pendientes.
+    #[cfg(test)]
+    {
+        if conversation.starts_with("panico-") {
+            panic!("mensajecanarioqzx del borrado");
+        }
+        if conversation.starts_with("falla-") {
+            return Err(grafeo::Error::Internal(
+                "textocanarioqzx del borrado".into(),
+            ));
+        }
+    }
     let summaries: Vec<NodeId> = db
         .find_nodes_by_property("conversation", &Value::from(conversation))
         .into_iter()
