@@ -4502,7 +4502,7 @@ mod owner_chat_limit_tests {
     }
 
     #[tokio::test]
-    async fn al_irse_el_duenio_con_chats_colgados_sus_lugares_se_liberan_y_los_pedidos_viejos_no_rompen(
+    async fn al_irse_el_duenio_con_chats_colgados_sus_lugares_siguen_ocupados_hasta_que_terminan_los_pedidos_viejos(
     ) {
         let (fake, gate) = FakeBackend::gated("hola");
         let backend = Arc::new(fake);
@@ -4515,21 +4515,28 @@ mod owner_chat_limit_tests {
 
         let released = service.conversations.lock().release_owner(A);
         assert_eq!(released, 2);
-        // Un dueño con el mismo nombre arranca limpio: sus dos chats entran.
-        let fresh: Vec<_> = (0..3).map(|_| service.open(A, false).unwrap()).collect();
+        // Los pedidos viejos siguen en el backend: un dueño con el mismo nombre
+        // no gana lugares, y no llega al modelo.
+        let fresh: Vec<_> = (0..2).map(|_| service.open(A, false).unwrap()).collect();
+        let blocked = quickly(service.chat_as(A, &fresh[0], "nuevo")).await;
+        assert!(matches!(blocked, Err(Error::Busy(_))), "{blocked:?}");
+        assert_eq!(backend.seen.lock().len(), 2);
+
+        // Los pedidos de la conexión que se fue terminan sin romper nada...
+        gate.notify_one();
+        gate.notify_one();
+        for task in [first, second] {
+            let _ = quickly(task).await.unwrap();
+        }
+        // ...y recién entonces se devuelven los lugares.
         let f1 = start_chat(&service, A, &fresh[0]);
         quickly(backend.entered.notified()).await;
         let f2 = start_chat(&service, A, &fresh[1]);
         quickly(backend.entered.notified()).await;
-        let third = quickly(service.chat_as(A, &fresh[2], "tres")).await;
-        assert!(matches!(third, Err(Error::Busy(_))), "{third:?}");
-
-        for _ in 0..4 {
-            gate.notify_one();
-        }
-        // Los pedidos de la conexión que se fue terminan sin romper nada.
-        for task in [first, second, f1, f2] {
-            let _ = quickly(task).await.unwrap();
+        gate.notify_one();
+        gate.notify_one();
+        for task in [f1, f2] {
+            assert_eq!(quickly(task).await.unwrap().unwrap(), "hola");
         }
     }
 

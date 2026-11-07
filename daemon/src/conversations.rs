@@ -820,16 +820,25 @@ mod owner_limit_tests {
     }
 
     #[test]
-    fn irse_el_duenio_devuelve_el_lugar() {
+    fn irse_el_duenio_libera_sus_conversaciones_pero_sus_chats_en_vuelo_siguen_ocupando_hasta_terminar(
+    ) {
         let mut conversations = Conversations::default();
         let ids = open(&mut conversations, A, 2);
         conversations.begin_turn(A, &ids[0], "uno").unwrap();
         conversations.begin_turn(A, &ids[1], "dos").unwrap();
 
-        conversations.release_owner(A);
+        assert_eq!(conversations.release_owner(A), 2);
 
+        // Las conversaciones se fueron, pero los pedidos siguen en el backend.
         assert_eq!(busy_count(&conversations, A), 0);
+        assert_eq!(conversations.count_for(A), 0);
         let fresh = conversations.create(A, false).unwrap();
+        assert!(matches!(
+            conversations.begin_turn(A, &fresh, "nuevo"),
+            Err(Error::Busy(_))
+        ));
+        // Al terminar el pedido (su `Drop` llama a `finish_turn`) el lugar vuelve.
+        conversations.finish_turn(&ids[0], "uno", None);
         conversations.begin_turn(A, &fresh, "nuevo").unwrap();
     }
 
@@ -892,7 +901,8 @@ mod owner_limit_tests {
     }
 
     #[test]
-    fn al_irse_el_duenio_con_dos_chats_colgados_se_liberan_sus_lugares_y_no_se_hereda_nada() {
+    fn al_irse_el_duenio_con_dos_chats_colgados_sus_lugares_siguen_hasta_que_terminan_y_no_se_hereda_nada(
+    ) {
         let mut conversations = Conversations::default();
         let old = open(&mut conversations, A, 2);
         let other = open(&mut conversations, B, 1);
@@ -901,28 +911,26 @@ mod owner_limit_tests {
         conversations.begin_turn(B, &other[0], "uno").unwrap();
         assert_eq!(conversations.in_flight.len(), 3);
 
-        // La conexión se va con sus dos chats colgados: sólo el otro dueño queda anotado.
+        // La conexión se va con sus dos chats colgados: siguen anotados.
         conversations.release_owner(A);
 
-        assert_eq!(conversations.in_flight.len(), 1);
-        assert!(conversations.in_flight.values().all(|chat| chat.owner == B));
-        // Otra conexión con el mismo nombre (aunque no debería repetirse) empieza de cero.
-        let fresh = open(&mut conversations, A, 3);
-        conversations.begin_turn(A, &fresh[0], "uno").unwrap();
-        conversations.begin_turn(A, &fresh[1], "dos").unwrap();
-        assert!(matches!(
-            conversations.begin_turn(A, &fresh[2], "tres"),
-            Err(Error::Busy(_))
-        ));
-        // Los pedidos viejos terminan después (su `Drop` llama a `finish_turn`):
-        // no liberan los lugares nuevos ni rompen nada.
-        conversations.finish_turn(&old[0], "uno", None);
-        conversations.finish_turn(&old[1], "dos", Some("tarde"));
         assert_eq!(conversations.in_flight.len(), 3);
+        // Otra conexión con el mismo nombre (aunque no debería repetirse) no
+        // gana lugares: los de los pedidos viejos siguen ocupados.
+        let fresh = open(&mut conversations, A, 2);
         assert!(matches!(
-            conversations.begin_turn(A, &fresh[2], "tres"),
+            conversations.begin_turn(A, &fresh[0], "uno"),
             Err(Error::Busy(_))
         ));
+        // Cada pedido viejo que termina devuelve exactamente un lugar.
+        conversations.finish_turn(&old[0], "uno", None);
+        conversations.begin_turn(A, &fresh[0], "uno").unwrap();
+        assert!(matches!(
+            conversations.begin_turn(A, &fresh[1], "dos"),
+            Err(Error::Busy(_))
+        ));
+        conversations.finish_turn(&old[1], "dos", Some("tarde"));
+        conversations.begin_turn(A, &fresh[1], "dos").unwrap();
         // Y el otro dueño sigue con lo suyo.
         conversations.finish_turn(&other[0], "uno", None);
         assert_eq!(conversations.in_flight.len(), 2);
@@ -1043,13 +1051,14 @@ mod confined_quota_tests {
     }
 
     #[test]
-    fn al_irse_un_confinado_se_libera_solo_lo_suyo_y_lo_del_otro_sigue_ocupando() {
+    fn al_irse_un_confinado_se_liberan_solo_sus_conversaciones_y_el_lugar_en_vuelo_lo_devuelve_el_fin_del_turno(
+    ) {
         let mut conversations = Conversations::default();
         let a = conversations.create(A, true).unwrap();
         let b = conversations.create(B, true).unwrap();
         conversations.begin_turn(A, &a, "uno").unwrap();
 
-        // Se va B: el lugar en vuelo de A sigue ocupado y su conversación abierta.
+        // Se va B: lo de A sigue, conversación y lugar en vuelo.
         assert_eq!(conversations.release_owner(B), 1);
         assert!(conversations.history(B, &b).is_err());
         let b2 = conversations.create(B, true).unwrap();
@@ -1059,9 +1068,35 @@ mod confined_quota_tests {
         ));
         assert!(conversations.history(A, &a).is_ok());
 
-        // Se va A: ahora sí queda libre el lugar.
+        // Se va A: su conversación se libera, pero el pedido sigue en el
+        // backend y el lugar no vuelve hasta que termina.
         assert_eq!(conversations.release_owner(A), 1);
+        assert!(matches!(
+            conversations.begin_turn(B, &b2, "dos"),
+            Err(Error::Busy(_))
+        ));
+        conversations.finish_turn(&a, "uno", None);
         conversations.begin_turn(B, &b2, "dos").unwrap();
+    }
+
+    // El ataque que cerró security (#32): un confinado se desconectaba a mitad
+    // de un chat para que su lugar del cupo compartido se devolviera mientras
+    // el pedido seguía corriendo.
+    #[test]
+    fn un_confinado_que_se_desconecta_a_mitad_de_un_chat_no_libera_el_cupo_compartido() {
+        let mut conversations = Conversations::default();
+        let a = conversations.create(A, true).unwrap();
+        let b = conversations.create(B, true).unwrap();
+        conversations.begin_turn(A, &a, "colgado").unwrap();
+
+        conversations.release_owner(A);
+
+        // Otra conexión confinada no entra mientras el pedido de A siga corriendo.
+        let busy = conversations.begin_turn(B, &b, "dos");
+        assert!(matches!(busy, Err(Error::Busy(_))), "{busy:?}");
+        // Al terminar el primer pedido (`finish_turn`), el segundo entra.
+        conversations.finish_turn(&a, "colgado", None);
+        conversations.begin_turn(B, &b, "dos").unwrap();
     }
 
     #[test]
