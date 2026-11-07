@@ -143,7 +143,9 @@ todos, `MAX_CONFINED_CONVERSATIONS` (4) conversaciones abiertas, pasado lo cual
 `Chat` esperando al modelo, pasado lo cual da `Busy`. Así siempre quedan
 lugares para la persona. Los dos valores están en el contrato y son ajustables.
 Si el bus no contesta la etiqueta, la conexión cuenta como confinada. Cuando una
-conexión confinada se va, se liberan sus lugares y los de las demás quedan. Un
+conexión se va, se liberan sus conversaciones, pero un `Chat` suyo que sigue
+esperando al modelo ocupa su lugar hasta que termina: desconectarse no lo
+devuelve antes. Un
 proceso sin confinar queda fuera de alcance: puede abrir conexiones y esquivar
 los topes por conexión, pero igual puede leer o matar al servicio.
 

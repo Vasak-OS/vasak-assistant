@@ -137,9 +137,10 @@ impl Conversations {
     pub fn release_owner(&mut self, owner: &str) -> usize {
         let before = self.open.len();
         self.open.retain(|_, c| c.owner != owner);
-        // La conexión ya no existe, y su nombre único no vuelve: no hay a
-        // quién ponerle el tope. Los lugares de los demás confinados quedan.
-        self.in_flight.retain(|_, chat| chat.owner != owner);
+        // Los chats en vuelo no se tocan: el pedido sigue ocupando el backend
+        // aunque la conexión se haya ido, y sacarlo acá dejaría a un confinado
+        // esquivar el cupo compartido desconectándose a mitad de un chat. La
+        // entrada la saca siempre `finish_turn`, por el `Drop` del turno.
         before - self.open.len()
     }
 

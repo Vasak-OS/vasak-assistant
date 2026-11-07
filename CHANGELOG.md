@@ -17,8 +17,11 @@ ya no esquiva los topes (#32).
   confinados, entre todos, tienen a lo sumo 4 conversaciones abiertas
   (`LimitExceeded`) y 1 `Chat` esperando al modelo (`Busy`), además de los
   topes por dueño, que siguen. Sin respuesta del bus, cuenta como confinado.
-  Al irse una conexión confinada se liberan sólo sus lugares. Un proceso sin
-  confinar queda fuera de alcance.
+  Al irse una conexión se liberan sus conversaciones, pero sus chats en vuelo
+  siguen ocupando el cupo hasta que el modelo termina: el pedido sigue en el
+  backend, y desconectarse a mitad de un chat ya no devuelve el lugar (antes
+  `release_owner` lo devolvía, y repitiéndolo un confinado ocupaba los 4
+  lugares). Un proceso sin confinar queda fuera de alcance.
 
 ## vasak-assistant 0.3.10
 
