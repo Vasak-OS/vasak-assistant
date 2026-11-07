@@ -199,6 +199,10 @@ systemd, `$STATE_DIRECTORY`). No va en el almacén de cuentas.
     se reinicia antes, la lista se pierde y el resumen queda: para eso,
     `ClearMemory` (#28). La lista guarda hasta 256 ids; pasado eso se olvida el
     más viejo y su resumen queda.
+  - Sólo entra a la lista una conversación con un resumen guardado en esta
+    ejecución del servicio, así un cliente no la llena borrando conversaciones
+    vacías. Las conversaciones no sobreviven al reinicio, así que un resumen
+    de una ejecución anterior no tiene conversación que borrar (ver abajo).
   - Los resúmenes de conversaciones de antes de reiniciar el servicio (las
     conversaciones no sobreviven al reinicio, así que ya no se pueden borrar
     una por una) no se borran a pedido: se van con `ClearMemory`, o solos

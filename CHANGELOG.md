@@ -14,6 +14,10 @@ resumen para siempre (#28).
   nada (decisión 10). Lo que falle al aplicarse queda en la lista; `ClearMemory`
   la vacía. Tope: 256 ids; lleno, se olvida el más viejo con un aviso. Si el
   servicio se reinicia, la lista se pierde.
+- **`daemon`** — sólo se anota una conversación con un resumen guardado en esta
+  ejecución: un cliente que no usa la memoria ya no puede vaciar la lista
+  borrando conversaciones vacías. El registro de un borrado pendiente que
+  falla lleva sólo el código del error.
 
 ## vasak-assistant 0.3.10
 

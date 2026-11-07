@@ -50,7 +50,7 @@
 //!   borrarla. La base se abre la primera vez que alguien la necesita, así un
 //!   llavero que se desbloquea después alcanza.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
@@ -168,6 +168,14 @@ pub struct Memory {
     /// escribir): se borran al abrir la base ([`Self::ensure_open`]). Sólo en
     /// RAM, sólo el id, y se toca con el candado de la base tomado.
     pending_deletes: parking_lot::Mutex<std::collections::VecDeque<String>>,
+    /// Los ids de conversaciones con un resumen guardado en esta ejecución.
+    /// Sólo esos entran a `pending_deletes`: un cliente que no usa la memoria
+    /// (un confinado) no puede vaciar la lista borrando conversaciones vacías.
+    /// Con el candado de la base tomado.
+    // shortcut: sin tope; crece un id por conversación resumida (una
+    // extracción a la vez, con ida y vuelta al modelo) y lo pierde al borrarse.
+    // Ponerle tope si el demonio corre semanas con miles de conversaciones.
+    summarized: parking_lot::Mutex<HashSet<String>>,
 }
 
 /// Cuántos borrados de resúmenes se guardan para después. Lleno, se olvida el
@@ -220,6 +228,7 @@ impl Memory {
             last_open_problem: parking_lot::Mutex::default(),
             forgotten: parking_lot::Mutex::default(),
             pending_deletes: parking_lot::Mutex::default(),
+            summarized: parking_lot::Mutex::default(),
         }
     }
 
@@ -490,6 +499,11 @@ impl Memory {
             return Err("la conversación se borró mientras se extraían los recuerdos".into());
         }
         let db = self.usable(dir, &mut guard).await?;
+        // Antes de escribir: si la escritura falla a medias, sobra un id, que
+        // sólo cuesta un borrado que no encuentra nada.
+        if extraction.summary.is_some() {
+            self.summarized.lock().insert(conversation_id.to_owned());
+        }
         let (dir, conversation_id) = (dir.clone(), conversation_id.to_owned());
         let pruned = self.pruned_over_limit.clone();
         blocking(move || write(&db, &dir, &extraction, &conversation_id, &pruned).map_err(db_error))
@@ -545,11 +559,14 @@ impl Memory {
         let id = conversation_id.to_owned();
         let short = short_id(conversation_id);
         match blocking(move || schema::delete_summaries(&db, &id).map_err(db_error)).await {
-            Ok(deleted) => tracing::debug!(
-                conversation = %short,
-                deleted,
-                "se borraron los resúmenes de la conversación"
-            ),
+            Ok(deleted) => {
+                self.summarized.lock().remove(conversation_id);
+                tracing::debug!(
+                    conversation = %short,
+                    deleted,
+                    "se borraron los resúmenes de la conversación"
+                )
+            }
             Err(error) => {
                 tracing::warn!(
                     conversation = %short,
@@ -560,9 +577,13 @@ impl Memory {
         }
     }
 
-    /// Anota el id en `pending_deletes`, sin repetirlo. Con el candado de la
-    /// base tomado.
+    /// Anota el id en `pending_deletes`, sin repetirlo, si tiene un resumen
+    /// guardado en esta ejecución (`summarized`). Con el candado de la base
+    /// tomado.
     fn defer_delete(&self, conversation_id: &str) {
+        if !self.summarized.lock().contains(conversation_id) {
+            return;
+        }
         let mut pending = self.pending_deletes.lock();
         if pending.iter().any(|id| id == conversation_id) {
             return;
@@ -595,14 +616,21 @@ impl Memory {
                 .filter(|id| match schema::delete_summaries(&db, id) {
                     Ok(_) => false,
                     Err(error) => {
-                        tracing::debug!(conversation = %short_id(id), "{error}");
+                        // Sólo el código: el texto de un error de grafeo es libre.
+                        tracing::debug!(conversation = %short_id(id), "{}", db_error(error));
                         true
                     }
                 })
                 .collect::<Vec<_>>())
         })
         .await
-        .unwrap_or(all);
+        .unwrap_or_else(|_| all.clone());
+        {
+            let mut summarized = self.summarized.lock();
+            for id in all.iter().filter(|id| !failed.contains(id)) {
+                summarized.remove(id);
+            }
+        }
         if failed.is_empty() {
             tracing::debug!(total, "se borraron los resúmenes pendientes");
             return;
@@ -732,6 +760,7 @@ impl Memory {
             })?;
         // Los resúmenes pendientes se fueron con los archivos.
         self.pending_deletes.lock().clear();
+        self.summarized.lock().clear();
         let recreated = is_file(&flag(dir)).await;
         if recreated {
             self.create(dir, &mut db).await?;
@@ -836,6 +865,7 @@ impl Memory {
             Ok(opened) => {
                 // Una base nueva no tiene resúmenes de nadie.
                 self.pending_deletes.lock().clear();
+                self.summarized.lock().clear();
                 *db = Some(Arc::new(opened));
                 Ok(())
             }
@@ -3882,6 +3912,8 @@ mod pending_deletes_tests {
     async fn encender_cuando_no_habia_memoria_tambien_vacia_la_lista() {
         let tmp = TempDir::new();
         let memory = Memory::new(Some(tmp.memory_dir()), FixedKey::new(None));
+        // Como si A tuviera un resumen guardado en esta ejecución.
+        memory.summarized.lock().insert(A.to_owned());
         memory.forget_conversation(A).await;
         assert_eq!(pending(&memory), [A]);
 
@@ -3899,6 +3931,7 @@ mod pending_deletes_tests {
         let ids: Vec<String> = (0..=MAX_PENDING_DELETES)
             .map(|n| format!("{n:08x}-e89b-12d3-a456-426614174000"))
             .collect();
+        memory.summarized.lock().extend(ids.iter().cloned());
         let (log, _guard) = capture_logs();
 
         for id in &ids {
@@ -3926,6 +3959,10 @@ mod pending_deletes_tests {
     async fn el_mismo_id_anotado_dos_veces_no_se_repite() {
         let tmp = TempDir::new();
         let memory = Memory::new(Some(tmp.memory_dir()), FixedKey::new(None));
+        memory
+            .summarized
+            .lock()
+            .extend([A.to_owned(), B.to_owned()]);
 
         memory.forget_conversation(A).await;
         memory.forget_conversation(A).await;
