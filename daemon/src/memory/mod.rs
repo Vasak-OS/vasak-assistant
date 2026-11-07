@@ -4107,6 +4107,12 @@ mod pending_deletes_tests {
         memory.clear().await.unwrap();
         assert!(summarized(&memory).is_empty());
 
+        // Apagada, `clear` no recrea nada: lo vacía por sí solo.
+        let (_tmp2, _keys2, off) = with_two_summaries().await;
+        off.set_enabled(false).await.unwrap();
+        off.clear().await.unwrap();
+        assert!(summarized(&off).is_empty());
+
         let tmp = TempDir::new();
         let fresh = Memory::new(Some(tmp.memory_dir()), FixedKey::new(None));
         fresh.summarized.lock().insert("x".to_owned());
