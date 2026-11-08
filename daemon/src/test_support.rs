@@ -996,3 +996,42 @@ impl std::io::Write for CurrentCapture {
         Ok(())
     }
 }
+
+/// Una extracción con sólo un resumen.
+pub fn summary(text: &str) -> crate::memory::learn::Extraction {
+    crate::memory::learn::Extraction {
+        items: Vec::new(),
+        summary: Some(text.into()),
+    }
+}
+
+/// Los textos de los resúmenes guardados en la memoria (encendida), en orden.
+pub async fn summaries(memory: &Memory) -> Vec<String> {
+    use crate::memory::schema::{entries, MemoryKind};
+    let db = memory.database().await.unwrap();
+    let mut all: Vec<String> = tokio::task::spawn_blocking(move || {
+        entries(&db, MemoryKind::ConversationSummary)
+            .into_iter()
+            .map(|e| e.text)
+            .collect()
+    })
+    .await
+    .unwrap();
+    all.sort();
+    all
+}
+
+/// Cada archivo bajo `path`, con su ruta y su contenido, en orden.
+pub fn files_under(path: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(files_under(&path));
+        } else {
+            found.push((path.clone(), std::fs::read(&path).unwrap()));
+        }
+    }
+    found.sort();
+    found
+}

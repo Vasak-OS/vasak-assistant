@@ -370,8 +370,23 @@ fn delete(db: &GrafeoDB, node: NodeId) -> grafeo::Result<()> {
 
 /// Borra los resúmenes de la conversación `conversation` (su propiedad
 /// `conversation`) y después corre `gc` y `wal_checkpoint`, como la poda.
-/// Devuelve cuántos borró.
+/// Devuelve cuántos borró. El checkpoint corre aunque no encuentre nodos: un
+/// intento anterior pudo borrarlos y fallar justo en el checkpoint, y el
+/// reintento sólo da `Ok` cuando el borrado quedó volcado al archivo.
 pub fn delete_summaries(db: &GrafeoDB, conversation: &str) -> grafeo::Result<usize> {
+    // Gancho de prueba: un id que empieza con `falla-` falla y uno que empieza
+    // con `panico-` entra en pánico, para probar los borrados pendientes.
+    #[cfg(test)]
+    {
+        if conversation.starts_with("panico-") {
+            panic!("mensajecanarioqzx del borrado");
+        }
+        if conversation.starts_with("falla-") {
+            return Err(grafeo::Error::Internal(
+                "textocanarioqzx del borrado".into(),
+            ));
+        }
+    }
     let summaries: Vec<NodeId> = db
         .find_nodes_by_property("conversation", &Value::from(conversation))
         .into_iter()
@@ -385,9 +400,24 @@ pub fn delete_summaries(db: &GrafeoDB, conversation: &str) -> grafeo::Result<usi
     }
     if !summaries.is_empty() {
         db.gc();
-        db.wal_checkpoint()?;
     }
+    db.wal_checkpoint()?;
     Ok(summaries.len())
+}
+
+/// Las conversaciones que tienen al menos un resumen vivo en la base.
+pub fn summarized_conversations(db: &GrafeoDB) -> std::collections::HashSet<String> {
+    db.store()
+        .nodes_by_label(MemoryKind::ConversationSummary.label())
+        .into_iter()
+        .filter_map(|node| db.get_node(node))
+        .filter_map(|found| {
+            found
+                .get_property("conversation")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 /// Deja como mucho `keep` nodos de la clase, sacando los de menor puntaje.

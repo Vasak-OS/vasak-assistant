@@ -49,8 +49,15 @@
 //!   abre la base, la memoria queda no disponible con el motivo, y la salida es
 //!   borrarla. La base se abre la primera vez que alguien la necesita, así un
 //!   llavero que se desbloquea después alcanza.
+//! - **Borrar una conversación** con la memoria apagada o sin abrir deja su
+//!   id pendiente en RAM (`pending_deletes`), y su resumen se borra la próxima
+//!   vez que se usa la base abierta.
+//!
+//! Orden de los candados: primero la base (`db`), después `pending_deletes` y
+//! por último `summarized`; esos dos nunca se sostienen a través de un
+//! `await`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
@@ -163,7 +170,27 @@ pub struct Memory {
     /// [`Self::store_at`], bajo el candado. Hace de época por conversación:
     /// los ids son uuid y no vuelven, así que basta con recordar que se borró.
     forgotten: parking_lot::Mutex<std::collections::VecDeque<String>>,
+    /// Los ids de conversaciones borradas cuyos resúmenes no se pudieron
+    /// borrar en el momento (memoria apagada, sin abrir o un fallo al
+    /// escribir): se borran al abrir la base ([`Self::ensure_open`]). Sólo en
+    /// RAM, sólo el id, y se toca con el candado de la base tomado.
+    pending_deletes: parking_lot::Mutex<std::collections::VecDeque<String>>,
+    /// Los ids de conversaciones con un resumen guardado en esta ejecución.
+    /// Sólo esos entran a `pending_deletes`: un cliente que no usa la memoria
+    /// (un confinado) no puede vaciar la lista borrando conversaciones vacías.
+    /// Con el candado de la base tomado. No crece sin tope: después de cada
+    /// escritura se queda sólo con las conversaciones que siguen teniendo un
+    /// resumen en la base (la poda saca los viejos) y con las pendientes.
+    summarized: parking_lot::Mutex<HashSet<String>>,
+    /// Si ya se avisó (WARN) que hay borrados pendientes que fallan: se
+    /// reintentan en cada uso de la base, y los demás fallos van a DEBUG
+    /// hasta que la lista se vacíe.
+    pending_warned: AtomicBool,
 }
+
+/// Cuántos borrados de resúmenes se guardan para después. Lleno, se olvida el
+/// más viejo (su resumen queda, como antes de #28) con un aviso.
+const MAX_PENDING_DELETES: usize = vasak_assistant_protocol::MAX_CONVERSATIONS * 8;
 
 /// Cuántas conversaciones borradas se recuerdan en `forgotten`. Vaciarlo no
 /// deja pasar nada: la extracción en vuelo se cancela por `in_flight`, y el
@@ -210,6 +237,9 @@ impl Memory {
             pruned_over_limit: Arc::default(),
             last_open_problem: parking_lot::Mutex::default(),
             forgotten: parking_lot::Mutex::default(),
+            pending_deletes: parking_lot::Mutex::default(),
+            summarized: parking_lot::Mutex::default(),
+            pending_warned: AtomicBool::new(false),
         }
     }
 
@@ -480,11 +510,27 @@ impl Memory {
             return Err("la conversación se borró mientras se extraían los recuerdos".into());
         }
         let db = self.usable(dir, &mut guard).await?;
+        // Antes de escribir: si la escritura falla a medias, sobra un id, que
+        // sólo cuesta un borrado que no encuentra nada.
+        if extraction.summary.is_some() {
+            self.summarized.lock().insert(conversation_id.to_owned());
+        }
         let (dir, conversation_id) = (dir.clone(), conversation_id.to_owned());
         let pruned = self.pruned_over_limit.clone();
-        blocking(move || write(&db, &dir, &extraction, &conversation_id, &pruned).map_err(db_error))
-            .await
-            .inspect_err(|error| tracing::warn!("no se pudo escribir en la memoria: {error}"))
+        let (written, live) = blocking(move || {
+            let written =
+                write(&db, &dir, &extraction, &conversation_id, &pruned).map_err(db_error)?;
+            Ok((written, schema::summarized_conversations(&db)))
+        })
+        .await
+        .inspect_err(|error| tracing::warn!("no se pudo escribir en la memoria: {error}"))?;
+        // La escritura pudo podar resúmenes: sus conversaciones ya no tienen
+        // nada que borrar, salvo las pendientes, que se borran igual.
+        let pending = self.pending_deletes.lock();
+        self.summarized
+            .lock()
+            .retain(|id| live.contains(id) || pending.contains(id));
+        Ok(written)
     }
 
     /// Una conversación borrada (`DeleteConversation`): se descarta lo que
@@ -492,11 +538,10 @@ impl Memory {
     /// memoria no se puede usar, sólo queda la cancelación.
     ///
     /// Con la memoria apagada no se toca la base (apagar no lee ni escribe,
-    /// decisión 10), y el resumen de una conversación borrada mientras estaba
-    /// apagada queda: no se anota en ningún lado para borrarlo al encender,
-    /// porque eso sería escribir con la memoria apagada. La salida para eso es
-    /// `ClearMemory`. Lo mismo si la memoria no se pudo abrir (llavero
-    /// bloqueado, llave que falta): no se reintenta después.
+    /// decisión 10): el id queda en `pending_deletes`, en RAM, y el resumen se
+    /// borra la próxima vez que se abra la base. Lo mismo si no se pudo abrir
+    /// (llavero bloqueado, llave que falta) o falló el borrado. Si el servicio
+    /// se reinicia antes, la lista se pierde y el resumen queda (#28).
     pub async fn forget_conversation(&self, conversation_id: &str) {
         if let Some((id, cancelled)) = &*self.in_flight.lock() {
             if id == conversation_id {
@@ -516,26 +561,132 @@ impl Memory {
         };
         let mut db = self.db.lock().await;
         if !is_file(&flag(dir)).await {
+            self.defer_delete(conversation_id);
             return;
         }
         // Borrar no le manda nada a ningún modelo: la puerta del remoto no
         // aplica, sólo que esté encendida y abierta.
         if let Err(reason) = self.ensure_open(dir, &mut db).await {
-            tracing::warn!("no se borraron los resúmenes de la conversación: {reason}");
+            if self.defer_delete(conversation_id) {
+                tracing::warn!(
+                    conversation = %short_id(conversation_id),
+                    "los resúmenes de la conversación se borrarán al abrir la memoria: {reason}"
+                );
+            }
             return;
         }
-        let Some(db) = db.clone() else { return };
+        let Some(db) = db.clone() else {
+            self.defer_delete(conversation_id);
+            return;
+        };
         let id = conversation_id.to_owned();
         let short = short_id(conversation_id);
         match blocking(move || schema::delete_summaries(&db, &id).map_err(db_error)).await {
-            Ok(deleted) => tracing::debug!(
-                conversation = %short,
-                deleted,
-                "se borraron los resúmenes de la conversación"
-            ),
-            Err(error) => {
-                tracing::warn!("no se borraron los resúmenes de la conversación: {error}")
+            Ok(deleted) => {
+                self.summarized.lock().remove(conversation_id);
+                tracing::debug!(
+                    conversation = %short,
+                    deleted,
+                    "se borraron los resúmenes de la conversación"
+                )
             }
+            Err(error) => {
+                if self.defer_delete(conversation_id) {
+                    tracing::warn!(
+                        conversation = %short,
+                        "no se borraron los resúmenes de la conversación, se reintenta: {error}"
+                    );
+                } else {
+                    tracing::warn!(
+                        conversation = %short,
+                        "no se borraron los resúmenes de la conversación: {error}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Anota el id en `pending_deletes`, sin repetirlo, si tiene un resumen
+    /// guardado en esta ejecución (`summarized`). Devuelve si quedó pendiente.
+    /// Con el candado de la base tomado.
+    fn defer_delete(&self, conversation_id: &str) -> bool {
+        if !self.summarized.lock().contains(conversation_id) {
+            return false;
+        }
+        let mut pending = self.pending_deletes.lock();
+        if pending.iter().any(|id| id == conversation_id) {
+            return true;
+        }
+        if pending.len() >= MAX_PENDING_DELETES {
+            if let Some(dropped) = pending.pop_front() {
+                self.summarized.lock().remove(&dropped);
+                tracing::warn!(
+                    conversation = %short_id(&dropped),
+                    "demasiados borrados pendientes: el resumen de esta conversación queda"
+                );
+            }
+        }
+        pending.push_back(conversation_id.to_owned());
+        true
+    }
+
+    /// Borra los resúmenes de `pending_deletes` en la base abierta. Lo que
+    /// falla vuelve a la lista y se reintenta en el próximo uso de la base.
+    /// Con el candado de la base tomado.
+    async fn apply_pending_deletes(&self, db: &Arc<GrafeoDB>) {
+        let pending: Vec<String> = self.pending_deletes.lock().drain(..).collect();
+        if pending.is_empty() {
+            return;
+        }
+        let db = db.clone();
+        let total = pending.len();
+        // Si la tarea entera falla (un pánico), vuelven todos.
+        let all = pending.clone();
+        let failed = blocking(move || {
+            Ok(pending
+                .into_iter()
+                .filter(|id| match schema::delete_summaries(&db, id) {
+                    Ok(_) => false,
+                    Err(error) => {
+                        // Sólo el código: el texto de un error de grafeo es libre.
+                        tracing::debug!(conversation = %short_id(id), "{}", db_error(error));
+                        true
+                    }
+                })
+                .collect::<Vec<_>>())
+        })
+        .await
+        .unwrap_or_else(|_| all.clone());
+        {
+            let mut summarized = self.summarized.lock();
+            for id in all.iter().filter(|id| !failed.contains(id)) {
+                summarized.remove(id);
+            }
+        }
+        if failed.is_empty() {
+            self.pending_warned.store(false, Ordering::SeqCst);
+            tracing::debug!(total, "se borraron los resúmenes pendientes");
+            return;
+        }
+        let failed_count = failed.len();
+        if self.pending_warned.swap(true, Ordering::SeqCst) {
+            tracing::debug!(
+                failed = failed_count,
+                total,
+                "siguen sin borrarse algunos resúmenes pendientes"
+            );
+        } else {
+            tracing::warn!(
+                failed = failed_count,
+                total,
+                "no se borraron algunos resúmenes pendientes, se reintenta"
+            );
+        }
+        // Sin tope que mirar: `failed` sale de lo que se sacó de la lista, y
+        // con el candado de la base nadie más la llenó mientras tanto.
+        let mut list = self.pending_deletes.lock();
+        for id in failed.into_iter().rev() {
+            list.push_front(id);
         }
     }
 
@@ -650,6 +801,10 @@ impl Memory {
             .map_err(|error| {
                 Error::Unavailable(format!("No se pudo borrar la memoria: {error}"))
             })?;
+        // Los resúmenes pendientes se fueron con los archivos.
+        self.pending_deletes.lock().clear();
+        self.summarized.lock().clear();
+        self.pending_warned.store(false, Ordering::SeqCst);
         let recreated = is_file(&flag(dir)).await;
         if recreated {
             self.create(dir, &mut db).await?;
@@ -668,17 +823,22 @@ impl Memory {
         // Una línea la primera vez y cada vez que cambia el motivo: el estado y
         // cada `recall` vuelven a intentarlo, y no hace falta repetirla. El
         // motivo es un texto fijo, sin la llave.
-        let mut last = self.last_open_problem.lock();
-        match result {
-            Err(reason) if *last != Some(reason) => {
-                tracing::warn!("la memoria no se puede abrir: {reason}");
-                *last = Some(reason);
+        {
+            let mut last = self.last_open_problem.lock();
+            match result {
+                Err(reason) if *last != Some(reason) => {
+                    tracing::warn!("la memoria no se puede abrir: {reason}");
+                    *last = Some(reason);
+                }
+                Ok(()) if last.is_some() => {
+                    tracing::info!("la memoria se abrió");
+                    *last = None;
+                }
+                _ => {}
             }
-            Ok(()) if last.is_some() => {
-                tracing::info!("la memoria se abrió");
-                *last = None;
-            }
-            _ => {}
+        }
+        if let Some(opened) = db.as_ref().filter(|_| result.is_ok()) {
+            self.apply_pending_deletes(opened).await;
         }
         result
     }
@@ -747,6 +907,10 @@ impl Memory {
         let created = blocking(move || create_files(&dir, &stored)).await;
         match created {
             Ok(opened) => {
+                // Una base nueva no tiene resúmenes de nadie.
+                self.pending_deletes.lock().clear();
+                self.summarized.lock().clear();
+                self.pending_warned.store(false, Ordering::SeqCst);
                 *db = Some(Arc::new(opened));
                 Ok(())
             }
@@ -1762,7 +1926,7 @@ mod tests {
 mod guard_tests {
     use super::learn::Item;
     use super::*;
-    use crate::test_support::{FixedKey, TempDir};
+    use crate::test_support::{files_under, FixedKey, TempDir};
 
     fn header(magic: &[u8; 4], version: u32, flags: u32) -> Vec<u8> {
         let mut bytes = magic.to_vec();
@@ -1789,21 +1953,6 @@ mod guard_tests {
         ] {
             assert!(!is_encrypted_header(&bytes), "{name}");
         }
-    }
-
-    /// Cada archivo bajo `path`, con su ruta y su contenido, en orden.
-    fn files_under(path: &Path) -> Vec<(PathBuf, Vec<u8>)> {
-        let mut found = Vec::new();
-        for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                found.extend(files_under(&path));
-            } else {
-                found.push((path.clone(), std::fs::read(&path).unwrap()));
-            }
-        }
-        found.sort();
-        found
     }
 
     async fn enabled() -> (TempDir, Arc<FixedKey>, Arc<Memory>) {
@@ -2318,20 +2467,15 @@ mod review_tests {
 mod forget_tests {
     use super::learn::Item;
     use super::*;
-    use crate::test_support::{FakeBackend, FixedKey, ScriptedBackend, TempDir};
+    use crate::test_support::{
+        files_under, summaries, summary, FakeBackend, FixedKey, ScriptedBackend, TempDir,
+    };
 
     async fn enabled() -> (TempDir, Arc<Memory>) {
         let tmp = TempDir::new();
         let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), FixedKey::new(None)));
         memory.set_enabled(true).await.unwrap();
         (tmp, memory)
-    }
-
-    fn summary(text: &str) -> Extraction {
-        Extraction {
-            items: Vec::new(),
-            summary: Some(text.into()),
-        }
     }
 
     fn preference(text: &str) -> Extraction {
@@ -2344,20 +2488,6 @@ mod forget_tests {
             }],
             summary: None,
         }
-    }
-
-    async fn summaries(memory: &Memory) -> Vec<String> {
-        let db = memory.database().await.unwrap();
-        let mut all = blocking(move || {
-            Ok(schema::entries(&db, MemoryKind::ConversationSummary)
-                .into_iter()
-                .map(|e| e.text)
-                .collect::<Vec<_>>())
-        })
-        .await
-        .unwrap();
-        all.sort();
-        all
     }
 
     fn turn() -> Vec<Message> {
@@ -2444,33 +2574,17 @@ mod forget_tests {
     }
 
     #[tokio::test]
-    async fn con_la_memoria_apagada_no_se_toca_la_base_y_el_resumen_queda() {
+    async fn con_la_memoria_apagada_no_se_toca_la_base_y_el_resumen_se_borra_al_encender() {
         let (tmp, memory) = enabled().await;
         memory.store(summary("Resumen de A"), "a").await.unwrap();
         memory.set_enabled(false).await.unwrap();
-        let files = |dir: &Path| -> Vec<(PathBuf, Vec<u8>)> {
-            fn walk(path: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
-                for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
-                    let p = entry.path();
-                    if p.is_dir() {
-                        walk(&p, out);
-                    } else {
-                        out.push((p.clone(), std::fs::read(&p).unwrap()));
-                    }
-                }
-            }
-            let mut out = Vec::new();
-            walk(dir, &mut out);
-            out.sort();
-            out
-        };
-        let before = files(&tmp.memory_dir());
+        let before = files_under(&tmp.memory_dir());
 
         memory.forget_conversation("a").await;
 
-        assert_eq!(files(&tmp.memory_dir()), before);
+        assert_eq!(files_under(&tmp.memory_dir()), before);
         memory.set_enabled(true).await.unwrap();
-        assert_eq!(summaries(&memory).await, ["Resumen de A"]);
+        assert!(summaries(&memory).await.is_empty());
     }
 
     #[tokio::test]
@@ -2808,11 +2922,14 @@ mod log_tests {
         memory.close().await;
         let keys = FixedKey::new(None);
         let broken = Memory::new(Some(tmp.memory_dir()), keys);
+        // Con un resumen guardado en esta ejecución: si no, no queda pendiente
+        // y no hay nada que avisar.
+        broken.summarized.lock().insert("c1".to_owned());
         let (log, _guard) = capture_logs();
 
         broken.forget_conversation("c1").await;
 
-        let l = line(&log, &["no se borraron los resúmenes de la conversación"]);
+        let l = line(&log, &["se borrarán al abrir la memoria"]);
         assert!(l.contains("WARN"), "{l}");
     }
 
@@ -3606,6 +3723,485 @@ mod canary_tests {
         assert_eq!(status.reason, REASON_NOT_OPENED);
         assert_log_has_no_path(&tmp, &log, "restos");
         assert!(!status.reason.contains(&tmp.path().display().to_string()));
+    }
+}
+
+/// Los borrados de resúmenes que esperan a que se abra la memoria (#28).
+#[cfg(test)]
+mod pending_deletes_tests {
+    use super::*;
+    use crate::test_support::{capture_logs, files_under, summaries, summary, FixedKey, TempDir};
+
+    const A: &str = "123e4567-e89b-12d3-a456-426614174000";
+    const B: &str = "223e4567-e89b-12d3-a456-426614174000";
+
+    /// Una memoria encendida con un resumen de cada conversación (A y B).
+    async fn with_two_summaries() -> (TempDir, Arc<FixedKey>, Arc<Memory>) {
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
+        memory.set_enabled(true).await.unwrap();
+        memory.store(summary("Resumen de A"), A).await.unwrap();
+        memory.store(summary("Resumen de B"), B).await.unwrap();
+        (tmp, keys, memory)
+    }
+
+    fn pending(memory: &Memory) -> Vec<String> {
+        memory.pending_deletes.lock().iter().cloned().collect()
+    }
+
+    #[tokio::test]
+    async fn con_la_memoria_apagada_borrar_no_escribe_en_disco_y_al_encender_se_borra() {
+        let (tmp, _keys, memory) = with_two_summaries().await;
+        memory.set_enabled(false).await.unwrap();
+        let before = files_under(&tmp.memory_dir());
+
+        memory.forget_conversation(A).await;
+
+        assert_eq!(files_under(&tmp.memory_dir()), before, "nada escrito");
+        assert_eq!(pending(&memory), [A]);
+        memory.set_enabled(true).await.unwrap();
+        assert_eq!(summaries(&memory).await, ["Resumen de B"]);
+        assert!(pending(&memory).is_empty());
+    }
+
+    #[tokio::test]
+    async fn con_el_llavero_bloqueado_el_id_queda_y_el_siguiente_uso_borra_el_resumen() {
+        for next_use in ["status", "recall", "database"] {
+            let (_tmp, keys, memory) = with_two_summaries().await;
+            memory.close().await;
+            *keys.locked.lock() = true;
+
+            memory.forget_conversation(A).await;
+
+            assert_eq!(pending(&memory), [A], "{next_use}");
+            *keys.locked.lock() = false;
+            match next_use {
+                "status" => assert!(memory.status().await.available),
+                "recall" => {
+                    memory.recall("hola", true).await;
+                }
+                _ => {
+                    memory.database().await.unwrap();
+                }
+            }
+            assert!(pending(&memory).is_empty(), "{next_use}");
+            assert_eq!(summaries(&memory).await, ["Resumen de B"], "{next_use}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sin_llave_el_id_queda_y_con_la_llave_de_vuelta_se_borra() {
+        let (_tmp, keys, memory) = with_two_summaries().await;
+        memory.close().await;
+        let key = keys.memory_key.lock().take();
+
+        memory.forget_conversation(A).await;
+        memory.forget_conversation(B).await;
+
+        assert_eq!(pending(&memory), [A, B]);
+        *keys.memory_key.lock() = key;
+        assert!(memory.status().await.available);
+        assert!(pending(&memory).is_empty());
+        assert!(summaries(&memory).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn con_la_memoria_encendida_y_abierta_el_borrado_sigue_siendo_inmediato() {
+        let (_tmp, _keys, memory) = with_two_summaries().await;
+
+        memory.forget_conversation(A).await;
+
+        assert!(pending(&memory).is_empty());
+        assert_eq!(summaries(&memory).await, ["Resumen de B"]);
+    }
+
+    #[tokio::test]
+    async fn los_pendientes_se_aplican_en_orden_y_con_la_lista_vacia_no_se_hace_nada() {
+        let (_tmp, _keys, memory) = with_two_summaries().await;
+        let db = memory.database().await.unwrap();
+        // Sin pendientes, aplicar no toca nada.
+        memory.apply_pending_deletes(&db).await;
+        assert_eq!(summaries(&memory).await, ["Resumen de A", "Resumen de B"]);
+
+        memory
+            .pending_deletes
+            .lock()
+            .extend([A.to_owned(), B.to_owned()]);
+        memory.apply_pending_deletes(&db).await;
+
+        assert!(pending(&memory).is_empty());
+        assert!(summaries(&memory).await.is_empty());
+        // Un id que no existe se da por borrado: no queda en la lista.
+        memory
+            .pending_deletes
+            .lock()
+            .push_back("no-existe".to_owned());
+        memory.apply_pending_deletes(&db).await;
+        assert!(pending(&memory).is_empty());
+    }
+
+    #[tokio::test]
+    async fn borrar_la_memoria_con_exito_vacia_la_lista_y_con_el_llavero_bloqueado_la_conserva() {
+        let (tmp, keys, memory) = with_two_summaries().await;
+        memory.set_enabled(false).await.unwrap();
+        memory.forget_conversation(A).await;
+        memory.forget_conversation(B).await;
+        assert_eq!(pending(&memory).len(), 2);
+
+        // Bloqueado: falla y no se toca nada, tampoco la lista.
+        *keys.locked.lock() = true;
+        assert!(memory.clear().await.is_err());
+        assert_eq!(pending(&memory), [A, B]);
+        assert!(tmp.memory_dir().exists());
+
+        // Desbloqueado: se borra todo, y la lista se vacía.
+        *keys.locked.lock() = false;
+        memory.clear().await.unwrap();
+        assert!(pending(&memory).is_empty());
+        assert!(!tmp.memory_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn encender_cuando_no_habia_memoria_tambien_vacia_la_lista() {
+        let tmp = TempDir::new();
+        let memory = Memory::new(Some(tmp.memory_dir()), FixedKey::new(None));
+        // Como si A tuviera un resumen guardado en esta ejecución.
+        memory.summarized.lock().insert(A.to_owned());
+        memory.forget_conversation(A).await;
+        assert_eq!(pending(&memory), [A]);
+
+        memory.set_enabled(true).await.unwrap();
+
+        // Una base nueva no tiene resúmenes de nadie.
+        assert!(pending(&memory).is_empty());
+        assert!(summaries(&memory).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn con_la_lista_llena_el_id_257_descarta_el_mas_viejo_con_su_aviso() {
+        let tmp = TempDir::new();
+        let memory = Memory::new(Some(tmp.memory_dir()), FixedKey::new(None));
+        let ids: Vec<String> = (0..=MAX_PENDING_DELETES)
+            .map(|n| format!("{n:08x}-e89b-12d3-a456-426614174000"))
+            .collect();
+        memory.summarized.lock().extend(ids.iter().cloned());
+        let (log, _guard) = capture_logs();
+
+        for id in &ids {
+            memory.forget_conversation(id).await;
+        }
+
+        let kept = pending(&memory);
+        assert_eq!(kept.len(), MAX_PENDING_DELETES);
+        assert_eq!(kept.first(), Some(&ids[1]));
+        assert_eq!(kept.last(), ids.last());
+        assert!(!kept.contains(&ids[0]));
+        let l = log
+            .text()
+            .lines()
+            .find(|l| l.contains("demasiados borrados pendientes"))
+            .unwrap_or_else(|| panic!("falta el aviso:\n{}", log.text()))
+            .to_owned();
+        assert!(
+            l.contains("WARN") && l.contains("conversation=00000000"),
+            "{l}"
+        );
+        assert!(!l.contains(&ids[0]), "{l}");
+    }
+
+    #[tokio::test]
+    async fn el_mismo_id_anotado_dos_veces_no_se_repite() {
+        let tmp = TempDir::new();
+        let memory = Memory::new(Some(tmp.memory_dir()), FixedKey::new(None));
+        memory
+            .summarized
+            .lock()
+            .extend([A.to_owned(), B.to_owned()]);
+
+        memory.forget_conversation(A).await;
+        memory.forget_conversation(A).await;
+        memory.forget_conversation(B).await;
+        memory.forget_conversation(A).await;
+
+        assert_eq!(pending(&memory), [A, B]);
+    }
+
+    #[tokio::test]
+    async fn el_registro_lleva_el_id_corto_y_cantidades_pero_nunca_el_id_entero_ni_el_resumen() {
+        let (_tmp, keys, memory) = with_two_summaries().await;
+        memory.close().await;
+        *keys.locked.lock() = true;
+        let (log, _guard) = capture_logs();
+
+        memory.forget_conversation(A).await;
+        *keys.locked.lock() = false;
+        memory.status().await;
+
+        let all = log.text();
+        let deferred = all
+            .lines()
+            .find(|l| l.contains("se borrarán al abrir la memoria"))
+            .unwrap_or_else(|| panic!("falta la línea:\n{all}"));
+        assert!(deferred.contains("conversation=123e4567"), "{deferred}");
+        assert!(
+            all.contains("se borraron los resúmenes pendientes"),
+            "{all}"
+        );
+        assert!(all.contains("total=1"), "{all}");
+        assert!(!all.contains(A), "el id entero:\n{all}");
+        assert!(
+            !all.contains("Resumen de A") && !all.contains("Resumen de B"),
+            "{all}"
+        );
+    }
+
+    #[tokio::test]
+    async fn los_pendientes_se_pierden_si_el_servicio_se_reinicia_y_el_resumen_queda() {
+        let (tmp, keys, memory) = with_two_summaries().await;
+        memory.set_enabled(false).await.unwrap();
+        memory.forget_conversation(A).await;
+        drop(memory);
+
+        // Es un límite conocido: la lista es sólo RAM.
+        let restarted = Memory::new(Some(tmp.memory_dir()), keys);
+        restarted.set_enabled(true).await.unwrap();
+        assert_eq!(
+            summaries(&restarted).await,
+            ["Resumen de A", "Resumen de B"]
+        );
+    }
+
+    fn summarized(memory: &Memory) -> Vec<String> {
+        let mut ids: Vec<String> = memory.summarized.lock().iter().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn borrar_256_conversaciones_sin_resumen_no_saca_de_la_lista_a_un_pendiente_real() {
+        let (_tmp, _keys, memory) = with_two_summaries().await;
+        memory.set_enabled(false).await.unwrap();
+        memory.forget_conversation(A).await;
+        assert_eq!(pending(&memory), [A]);
+
+        // El ataque: llenar la lista con conversaciones que nunca tuvieron resumen.
+        for n in 0..=MAX_PENDING_DELETES {
+            memory
+                .forget_conversation(&format!("{n:08x}-0000-4000-8000-000000000000"))
+                .await;
+        }
+
+        assert_eq!(pending(&memory), [A], "sólo el que tiene resumen se anota");
+        memory.set_enabled(true).await.unwrap();
+        assert_eq!(summaries(&memory).await, ["Resumen de B"]);
+        assert!(pending(&memory).is_empty());
+    }
+
+    #[tokio::test]
+    async fn una_conversacion_sin_resumen_no_se_anota_ni_con_la_memoria_apagada_ni_con_el_llavero_bloqueado(
+    ) {
+        let (_tmp, keys, memory) = with_two_summaries().await;
+        memory.set_enabled(false).await.unwrap();
+        memory.forget_conversation("sin-resumen").await;
+        assert!(pending(&memory).is_empty());
+        memory.set_enabled(true).await.unwrap();
+        memory.close().await;
+        *keys.locked.lock() = true;
+        memory.forget_conversation("sin-resumen-2").await;
+        assert!(pending(&memory).is_empty());
+    }
+
+    #[tokio::test]
+    async fn store_con_resumen_marca_el_id_y_sin_resumen_no() {
+        let tmp = TempDir::new();
+        let memory = Memory::new(Some(tmp.memory_dir()), FixedKey::new(None));
+        memory.set_enabled(true).await.unwrap();
+
+        memory
+            .store(
+                Extraction {
+                    items: Vec::new(),
+                    summary: None,
+                },
+                "sin",
+            )
+            .await
+            .unwrap();
+        assert!(summarized(&memory).is_empty());
+        memory.store(summary("Resumen"), "con").await.unwrap();
+
+        assert_eq!(summarized(&memory), ["con"]);
+    }
+
+    #[tokio::test]
+    async fn al_aplicarse_el_borrado_el_id_sale_de_summarized_y_el_de_otra_conversacion_se_queda() {
+        let (_tmp, keys, memory) = with_two_summaries().await;
+        assert_eq!(summarized(&memory), [A, B]);
+
+        // Borrado inmediato: A sale.
+        memory.forget_conversation(A).await;
+        assert_eq!(summarized(&memory), [B]);
+
+        // Borrado diferido: B sale cuando se aplica, no antes.
+        memory.close().await;
+        *keys.locked.lock() = true;
+        memory.forget_conversation(B).await;
+        assert_eq!(summarized(&memory), [B], "pendiente, todavía no se borró");
+        assert_eq!(pending(&memory), [B]);
+        *keys.locked.lock() = false;
+        memory.status().await;
+        assert!(summarized(&memory).is_empty());
+        assert!(pending(&memory).is_empty());
+    }
+
+    #[tokio::test]
+    async fn borrar_la_memoria_y_crear_una_nueva_vacian_summarized() {
+        let (_tmp, _keys, memory) = with_two_summaries().await;
+        assert_eq!(summarized(&memory).len(), 2);
+        memory.clear().await.unwrap();
+        assert!(summarized(&memory).is_empty());
+
+        // Apagada, `clear` no recrea nada: lo vacía por sí solo.
+        let (_tmp2, _keys2, off) = with_two_summaries().await;
+        off.set_enabled(false).await.unwrap();
+        off.clear().await.unwrap();
+        assert!(summarized(&off).is_empty());
+
+        let tmp = TempDir::new();
+        let fresh = Memory::new(Some(tmp.memory_dir()), FixedKey::new(None));
+        fresh.summarized.lock().insert("x".to_owned());
+        fresh.set_enabled(true).await.unwrap();
+        assert!(summarized(&fresh).is_empty());
+    }
+
+    // ── El fallo parcial de los pendientes (gancho: ids `falla-…` y `panico-…`) ──
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    #[tokio::test]
+    async fn los_ids_que_fallan_vuelven_a_la_lista_en_orden_y_los_demas_se_borran() {
+        let (_tmp, _keys, memory) = with_two_summaries().await;
+        let db = memory.database().await.unwrap();
+        let list = ids(&["falla-1", A, "falla-2", B, "falla-3"]);
+        memory.pending_deletes.lock().extend(list.clone());
+        memory.summarized.lock().extend(list);
+
+        memory.apply_pending_deletes(&db).await;
+
+        assert_eq!(pending(&memory), ["falla-1", "falla-2", "falla-3"]);
+        // Los que no fallaron se borraron de verdad.
+        assert!(summaries(&memory).await.is_empty());
+        // Los que fallaron siguen en `summarized`, los demás salieron.
+        assert_eq!(summarized(&memory), ["falla-1", "falla-2", "falla-3"]);
+    }
+
+    #[tokio::test]
+    async fn el_primer_fallo_deja_warn_y_los_siguientes_debug_hasta_que_la_lista_se_vacia() {
+        let (_tmp, _keys, memory) = with_two_summaries().await;
+        let db = memory.database().await.unwrap();
+        let (log, _guard) = capture_logs();
+        memory
+            .pending_deletes
+            .lock()
+            .push_back("falla-1".to_owned());
+
+        memory.apply_pending_deletes(&db).await;
+        memory.apply_pending_deletes(&db).await;
+        memory.apply_pending_deletes(&db).await;
+
+        let all = log.text();
+        let warns = all
+            .lines()
+            .filter(|l| l.contains(" WARN ") && l.contains("no se borraron algunos"))
+            .count();
+        let debugs = all
+            .lines()
+            .filter(|l| l.contains(" DEBUG ") && l.contains("siguen sin borrarse"))
+            .count();
+        assert_eq!((warns, debugs), (1, 2), "{all}");
+        assert!(memory.pending_warned.load(Ordering::SeqCst));
+
+        // Se vacía la lista: vuelve a avisar si falla de nuevo más adelante.
+        memory.pending_deletes.lock().clear();
+        memory.pending_deletes.lock().push_back(A.to_owned());
+        memory.apply_pending_deletes(&db).await;
+        assert!(!memory.pending_warned.load(Ordering::SeqCst));
+        assert!(log.text().contains("se borraron los resúmenes pendientes"));
+        memory
+            .pending_deletes
+            .lock()
+            .push_back("falla-2".to_owned());
+        memory.apply_pending_deletes(&db).await;
+        let warns = log
+            .text()
+            .lines()
+            .filter(|l| l.contains(" WARN ") && l.contains("no se borraron algunos"))
+            .count();
+        assert_eq!(warns, 2, "{}", log.text());
+    }
+
+    #[tokio::test]
+    async fn el_registro_de_un_fallo_de_borrado_lleva_el_id_corto_y_el_codigo_pero_no_el_texto() {
+        let (_tmp, _keys, memory) = with_two_summaries().await;
+        let db = memory.database().await.unwrap();
+        let (log, _guard) = capture_logs();
+        memory
+            .pending_deletes
+            .lock()
+            .push_back("falla-1234567890".to_owned());
+
+        memory.apply_pending_deletes(&db).await;
+
+        let all = log.text();
+        assert!(all.contains("conversation=falla-12"), "{all}");
+        assert!(all.contains("GRAFEO-"), "{all}");
+        assert!(!all.contains("canarioqzx"), "{all}");
+        assert!(!all.contains("falla-1234567890"), "{all}");
+    }
+
+    #[tokio::test]
+    async fn si_la_tarea_entera_entra_en_panico_vuelven_todos_y_summarized_no_cambia() {
+        let (_tmp, _keys, memory) = with_two_summaries().await;
+        let db = memory.database().await.unwrap();
+        let (log, _guard) = capture_logs();
+        let list = ids(&[A, "panico-1", B]);
+        memory.pending_deletes.lock().extend(list.clone());
+        memory.summarized.lock().extend(list.clone());
+
+        memory.apply_pending_deletes(&db).await;
+
+        assert_eq!(pending(&memory), list);
+        assert!(summarized(&memory).contains(&A.to_owned()));
+        assert!(summarized(&memory).contains(&"panico-1".to_owned()));
+        // El mensaje del pánico no llega al registro.
+        assert!(!log.text().contains("canarioqzx"), "{}", log.text());
+        // Se reintenta: sacado el que entra en pánico, se borran los demás.
+        memory.pending_deletes.lock().retain(|id| id != "panico-1");
+        memory.apply_pending_deletes(&db).await;
+        assert!(pending(&memory).is_empty());
+    }
+
+    #[tokio::test]
+    async fn el_id_descartado_por_el_tope_sale_de_summarized() {
+        let tmp = TempDir::new();
+        let memory = Memory::new(Some(tmp.memory_dir()), FixedKey::new(None));
+        let all: Vec<String> = (0..=MAX_PENDING_DELETES)
+            .map(|n| format!("{n:08x}-e89b-12d3-a456-426614174000"))
+            .collect();
+        memory.summarized.lock().extend(all.iter().cloned());
+
+        for id in &all {
+            memory.forget_conversation(id).await;
+        }
+
+        assert_eq!(pending(&memory).len(), MAX_PENDING_DELETES);
+        let kept = summarized(&memory);
+        assert!(!kept.contains(&all[0]), "el descartado sale de summarized");
+        assert_eq!(kept.len(), MAX_PENDING_DELETES);
+        assert!(kept.contains(&all[1]) && kept.contains(all.last().unwrap()));
     }
 }
 

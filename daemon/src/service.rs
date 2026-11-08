@@ -3181,9 +3181,9 @@ mod no_sender_tests {
 #[cfg(test)]
 mod delete_conversation_tests {
     use super::*;
-    use crate::memory::learn::{Extraction, Item};
-    use crate::memory::schema::{entries, MemoryKind};
-    use crate::test_support::{p2p_pair_as, FakeBackend, FixedKey, FixedLabel, TempDir};
+    use crate::test_support::{
+        p2p_pair_as, summaries, summary, FakeBackend, FixedKey, FixedLabel, TempDir,
+    };
     use vasak_assistant_protocol::{AssistantProxy, SERVICE_PATH};
 
     const OWNER: &str = ":1.1";
@@ -3208,28 +3208,6 @@ mod delete_conversation_tests {
             labels: FixedLabel::none(),
         };
         Rig { tmp, service }
-    }
-
-    fn summary(text: &str) -> Extraction {
-        Extraction {
-            items: Vec::<Item>::new(),
-            summary: Some(text.into()),
-        }
-    }
-
-    /// Los textos de los resúmenes guardados, en orden.
-    async fn summaries(memory: &Memory) -> Vec<String> {
-        let db = memory.database().await.unwrap();
-        let mut all: Vec<String> = tokio::task::spawn_blocking(move || {
-            entries(&db, MemoryKind::ConversationSummary)
-                .into_iter()
-                .map(|e| e.text)
-                .collect()
-        })
-        .await
-        .unwrap();
-        all.sort();
-        all
     }
 
     /// Dos conversaciones del mismo dueño, cada una con su resumen.
@@ -3294,7 +3272,7 @@ mod delete_conversation_tests {
     }
 
     #[tokio::test]
-    async fn con_la_memoria_apagada_borrar_la_conversacion_no_toca_la_base_y_el_resumen_queda() {
+    async fn con_la_memoria_apagada_borrar_no_toca_la_base_y_el_resumen_se_va_al_encender() {
         let rig = rig().await;
         let (a, _b) = two_with_summaries(&rig).await;
         rig.service.memory.set_enabled(false).await.unwrap();
@@ -3303,12 +3281,9 @@ mod delete_conversation_tests {
 
         // La conversación se cerró; la memoria apagada no se leyó ni se escribió.
         assert!(rig.service.history_of(OWNER, &a).is_err());
-        rig.service.memory.set_enabled(true).await.unwrap();
-        assert_eq!(
-            summaries(&rig.service.memory).await,
-            ["Resumen de A", "Resumen de B"]
-        );
         assert!(rig.tmp.memory_dir().exists());
+        rig.service.memory.set_enabled(true).await.unwrap();
+        assert_eq!(summaries(&rig.service.memory).await, ["Resumen de B"]);
     }
 
     #[tokio::test]

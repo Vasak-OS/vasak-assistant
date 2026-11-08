@@ -2,6 +2,27 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-assistant 0.3.11
+
+Borrar una conversación con la memoria apagada o sin abrir ya no deja su
+resumen para siempre (#28).
+
+- **`daemon`** — si `DeleteConversation` no puede borrar el resumen en el
+  momento (memoria apagada, llavero bloqueado, llave que falta o un fallo al
+  escribir), anota el id de la conversación en una lista en RAM y lo borra la
+  próxima vez que se abre la memoria. Con la memoria apagada no se escribe
+  nada (decisión 10). Lo que falle al aplicarse queda en la lista y se
+  reintenta en cada uso de la memoria abierta (estado, notas, aprendizaje),
+  con un solo aviso hasta que la lista se vacíe; `ClearMemory` la vacía. Tope: 256 ids; lleno, se olvida el más viejo con un aviso. Si el
+  servicio se reinicia, la lista se pierde.
+- **`daemon`** — sólo se anota una conversación con un resumen guardado en esta
+  ejecución: un cliente que no usa la memoria ya no puede vaciar la lista
+  borrando conversaciones vacías. El registro de un borrado pendiente que
+  falla lleva sólo el código del error.
+- **`daemon`** — un borrado de resúmenes sólo cuenta como hecho cuando el
+  checkpoint de la base salió bien, aunque ya no queden nodos que borrar: si
+  un intento borró y falló al volcarlo, el reintento lo vuelca.
+
 ## vasak-assistant 0.3.10
 
 Lo de un turno no se aprende en una memoria que se borró mientras se respondía
