@@ -2650,8 +2650,7 @@ mod effective_model_tests {
     }
 
     #[tokio::test]
-    async fn si_la_respuesta_de_ollama_llega_con_remote_host_sin_allow_remote_da_error_no_se_reintenta_ni_se_aprende(
-    ) {
+    async fn con_remote_host_y_sin_allow_remote_da_error_sin_reintento_y_sin_aprender() {
         use crate::test_support::{ollama_backend, FakeServer, Reply, REMOTE_HOST};
 
         let chat = serde_json::json!({
@@ -3521,7 +3520,10 @@ mod log_tests {
     use crate::test_support::{
         capture_logs, p2p_pair, p2p_pair_as, FakeBackend, FixedKey, FixedLabel, TempDir,
     };
-    use vasak_assistant_protocol::{AssistantProxy, MAX_CONVERSATIONS_PER_OWNER, SERVICE_PATH};
+    use vasak_assistant_protocol::{
+        AssistantProxy, MAX_CHATS_IN_FLIGHT_PER_OWNER, MAX_CONFINED_CHATS_IN_FLIGHT,
+        MAX_CONFINED_CONVERSATIONS, MAX_CONVERSATIONS_PER_OWNER, SERVICE_PATH,
+    };
 
     const SENDER: &str = ":1.42";
     const CONFINED: &[u8] = b"vasak-appimage (enforce)\0";
@@ -3599,19 +3601,29 @@ mod log_tests {
         ]
     }
 
+    // Supuestos de la prueba de abajo: los chats confinados caben en el tope por
+    // dueño (hay un solo remitente) y quedan conversaciones para el de más.
+    const _: () = {
+        assert!(
+            MAX_CONFINED_CHATS_IN_FLIGHT < MAX_CHATS_IN_FLIGHT_PER_OWNER,
+            "ajustar por_el_bus_solo_una_etiqueta_confinada_cuenta_en_los_cupos"
+        );
+        assert!(MAX_CONFINED_CONVERSATIONS > MAX_CONFINED_CHATS_IN_FLIGHT);
+    };
+
     #[tokio::test]
-    async fn por_el_bus_solo_una_etiqueta_confinada_o_que_no_se_pudo_leer_cuenta_en_el_cupo_de_conversaciones(
-    ) {
-        use vasak_assistant_protocol::MAX_CONFINED_CONVERSATIONS;
+    async fn por_el_bus_solo_una_etiqueta_confinada_cuenta_en_los_cupos_compartidos() {
         for (name, label, confined) in caller_labels() {
-            let rig = rig_with(label, FakeBackend::replying("hola"), Some(SENDER)).await;
+            let (fake, gate) = FakeBackend::gated("hola");
+            let rig = rig_with(label, fake, Some(SENDER)).await;
+            let mut ids = Vec::new();
             for _ in 0..MAX_CONFINED_CONVERSATIONS {
-                rig.proxy.new_conversation().await.unwrap();
+                ids.push(rig.proxy.new_conversation().await.unwrap());
             }
             let (log, _guard) = capture_logs();
 
+            // Conversaciones: la de más sólo se rechaza para los confinados.
             let extra = rig.proxy.new_conversation().await;
-
             if confined {
                 assert!(
                     matches!(extra, Err(Error::LimitExceeded(_))),
@@ -3622,54 +3634,50 @@ mod log_tests {
             } else {
                 assert!(extra.is_ok(), "{name}: {extra:?}");
             }
-        }
-    }
 
-    #[tokio::test]
-    async fn por_el_bus_un_chat_confinado_en_vuelo_hace_que_el_siguiente_de_un_confinado_de_busy_sin_contenido_en_el_registro(
-    ) {
-        for (name, label, confined) in caller_labels() {
-            let (fake, gate) = FakeBackend::gated("hola");
-            let rig = rig_with(label, fake, Some(SENDER)).await;
-            let first = rig.proxy.new_conversation().await.unwrap();
-            let second = rig.proxy.new_conversation().await.unwrap();
-            let pending = {
-                let proxy = rig.proxy.clone();
-                tokio::spawn(async move { proxy.chat(&first, "primero").await })
-            };
-            rig.backend.entered.notified().await;
-            let (log, _guard) = capture_logs();
-
-            let result = if confined {
-                // Falla en vez de colgarse si el segundo chat entra al modelo.
-                tokio::time::timeout(
+            // Chats: con el cupo lleno, el de más sólo se rechaza para los confinados.
+            let pending: Vec<_> = ids[..MAX_CONFINED_CHATS_IN_FLIGHT]
+                .iter()
+                .map(|id| {
+                    let (proxy, id) = (rig.proxy.clone(), id.clone());
+                    tokio::spawn(async move { proxy.chat(&id, "primero").await })
+                })
+                .collect();
+            for _ in &pending {
+                rig.backend.entered.notified().await;
+            }
+            let next = ids[MAX_CONFINED_CHATS_IN_FLIGHT].clone();
+            let mut running = pending.len();
+            if confined {
+                // Falla en vez de colgarse si el chat de más entra al modelo.
+                let result = tokio::time::timeout(
                     std::time::Duration::from_secs(3),
-                    rig.proxy.chat(&second, "contenido-canario-qzx"),
+                    rig.proxy.chat(&next, "contenido-canario-qzx"),
                 )
                 .await
-                .expect("el chat confinado de más tenía que rechazarse, no esperar al modelo")
-            } else {
-                // Sin confinar entra al mismo tiempo (el tope por dueño es 2).
-                let proxy = rig.proxy.clone();
-                let second_chat =
-                    tokio::spawn(async move { proxy.chat(&second, "contenido-canario-qzx").await });
-                rig.backend.entered.notified().await;
-                // Los dos están esperando al modelo: se sueltan los dos.
-                gate.notify_one();
-                gate.notify_one();
-                second_chat.await.unwrap()
-            };
-
-            if confined {
+                .expect("el chat confinado de más tenía que rechazarse, no esperar al modelo");
                 assert!(matches!(result, Err(Error::Busy(_))), "{name}: {result:?}");
                 let l = line(&log, &["la llamada se rechazó", "method=\"Chat\""]);
                 assert!(l.contains("error=\"Busy\""), "{name}: {l}");
             } else {
-                assert_eq!(result.unwrap(), "hola", "{name}");
+                let proxy = rig.proxy.clone();
+                let extra_chat =
+                    tokio::spawn(async move { proxy.chat(&next, "contenido-canario-qzx").await });
+                rig.backend.entered.notified().await;
+                running += 1;
+                for _ in 0..running {
+                    gate.notify_one();
+                }
+                assert_eq!(extra_chat.await.unwrap().unwrap(), "hola", "{name}");
+                running = 0;
             }
             assert!(!log.text().contains("canario"), "{name}: {}", log.text());
-            gate.notify_one();
-            pending.await.unwrap().unwrap();
+            for _ in 0..running {
+                gate.notify_one();
+            }
+            for task in pending {
+                task.await.unwrap().unwrap();
+            }
         }
     }
 
@@ -4503,7 +4511,7 @@ mod owner_chat_limit_tests {
     }
 
     #[tokio::test]
-    async fn al_irse_el_duenio_con_chats_colgados_sus_lugares_siguen_ocupados_hasta_que_terminan_los_pedidos_viejos(
+    async fn al_irse_el_duenio_con_chats_colgados_sus_lugares_siguen_hasta_que_terminan_los_pedidos(
     ) {
         let (fake, gate) = FakeBackend::gated("hola");
         let backend = Arc::new(fake);

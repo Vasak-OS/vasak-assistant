@@ -967,14 +967,16 @@ mod owner_limit_tests {
     }
 }
 
-/// El cupo compartido de los confinados (#32).
+/// El cupo compartido de los confinados (#32). Las pruebas se escriben en
+/// función de `MAX_CONFINED_*`: si se ajustan, siguen valiendo dentro de lo que
+/// fijan los `const _` de abajo.
 #[cfg(test)]
 mod confined_quota_tests {
     use super::*;
 
     const A: &str = ":1.1";
-    const B: &str = ":1.2";
     const C: &str = ":1.3";
+    const EXTRA: &str = ":1.99";
 
     // El cupo de los confinados deja lugar al resto, y el de chats no puede
     // llenar el del servicio (`backend::MAX_IN_FLIGHT`).
@@ -983,25 +985,76 @@ mod confined_quota_tests {
         assert!(MAX_CONFINED_CHATS_IN_FLIGHT < crate::backend::MAX_IN_FLIGHT);
         assert!(MAX_CONFINED_CONVERSATIONS > 0 && MAX_CONFINED_CHATS_IN_FLIGHT > 0);
     };
+    // Supuestos de las pruebas: cada confinado en vuelo es un dueño distinto
+    // (así el tope por dueño no interviene), y las conversaciones se reparten
+    // entre dos dueños. Si se ajustan las constantes más allá, ajustar las pruebas.
+    const _: () = assert!(
+        MAX_CONFINED_CONVERSATIONS <= 2 * MAX_CONVERSATIONS_PER_OWNER,
+        "ajustar las pruebas de confined_quota_tests"
+    );
 
-    #[test]
-    fn entre_dos_duenios_confinados_la_conversacion_de_mas_da_limit_exceeded_y_un_duenio_sin_confinar_sigue_abriendo(
-    ) {
-        let mut conversations = Conversations::default();
-        for _ in 0..MAX_CONFINED_CONVERSATIONS / 2 {
-            conversations.create(A, true).unwrap();
-            conversations.create(B, true).unwrap();
+    /// Un dueño y el id de una de sus conversaciones.
+    type Chat = (String, String);
+
+    fn owner(i: usize) -> String {
+        format!(":2.{i}")
+    }
+
+    /// El cupo compartido de chats lleno de confinados, más un confinado de
+    /// otra conexión con su conversación lista.
+    struct Quota {
+        conversations: Conversations,
+        running: Vec<Chat>,
+        extra: Chat,
+    }
+
+    impl Quota {
+        fn full() -> Self {
+            let mut conversations = Conversations::default();
+            let running = (0..MAX_CONFINED_CHATS_IN_FLIGHT)
+                .map(|i| {
+                    let id = conversations.create(&owner(i), true).unwrap();
+                    conversations.begin_turn(&owner(i), &id, "uno").unwrap();
+                    (owner(i), id)
+                })
+                .collect();
+            let id = conversations.create(EXTRA, true).unwrap();
+            Self {
+                conversations,
+                running,
+                extra: (EXTRA.to_owned(), id),
+            }
         }
 
-        // Ni un dueño nuevo confinado ni uno que ya tenía entran.
-        for owner in [A, B, C] {
-            assert!(
-                matches!(
-                    conversations.create(owner, true),
-                    Err(Error::LimitExceeded(_))
-                ),
-                "{owner}"
-            );
+        /// El confinado de más no entra, y lo rechazado no ocupó nada.
+        fn assert_extra_busy(&mut self) {
+            let (owner, id) = &self.extra;
+            let busy = self.conversations.begin_turn(owner, id, "dos");
+            assert!(matches!(busy, Err(Error::Busy(_))), "{busy:?}");
+            assert!(!self.conversations.open[id].busy);
+            assert!(self.conversations.history(owner, id).unwrap().is_empty());
+        }
+
+        /// Termina el primer pedido en vuelo: su lugar vuelve y el de más entra.
+        fn finish_first_and_enter_extra(&mut self) {
+            self.conversations
+                .finish_turn(&self.running[0].1, "uno", Some("ok"));
+            let (owner, id) = &self.extra;
+            self.conversations.begin_turn(owner, id, "dos").unwrap();
+        }
+    }
+
+    #[test]
+    fn entre_dos_duenios_confinados_la_de_mas_da_limit_exceeded_y_sin_confinar_sigue_abriendo() {
+        let mut conversations = Conversations::default();
+        for i in 0..MAX_CONFINED_CONVERSATIONS {
+            conversations.create(&owner(i % 2), true).unwrap();
+        }
+
+        // Ni un dueño nuevo confinado ni los que ya tenían entran.
+        for who in [owner(0), owner(1), EXTRA.to_owned()] {
+            let result = conversations.create(&who, true);
+            assert!(matches!(result, Err(Error::LimitExceeded(_))), "{who}");
         }
         // Sin confinar sigue abriendo, y lo suyo no gasta el cupo compartido.
         for _ in 0..MAX_CONVERSATIONS_PER_OWNER {
@@ -1017,112 +1070,76 @@ mod confined_quota_tests {
     fn cerrar_una_conversacion_confinada_devuelve_su_lugar_al_cupo_compartido() {
         let mut conversations = Conversations::default();
         let ids: Vec<String> = (0..MAX_CONFINED_CONVERSATIONS)
-            .map(|_| conversations.create(A, true).unwrap())
+            .map(|i| conversations.create(&owner(i % 2), true).unwrap())
             .collect();
-        assert!(conversations.create(B, true).is_err());
+        assert!(conversations.create(EXTRA, true).is_err());
 
-        conversations.delete(A, &ids[0]).unwrap();
+        conversations.delete(&owner(0), &ids[0]).unwrap();
 
-        assert!(conversations.create(B, true).is_ok());
+        assert!(conversations.create(EXTRA, true).is_ok());
     }
 
     #[test]
-    fn con_un_chat_confinado_en_vuelo_el_de_otro_confinado_da_busy_y_el_sin_confinar_chatea() {
-        let mut conversations = Conversations::default();
-        let a = conversations.create(A, true).unwrap();
-        let b = conversations.create(B, true).unwrap();
-        let c = conversations.create(C, false).unwrap();
-        conversations.begin_turn(A, &a, "uno").unwrap();
-
-        let busy = conversations.begin_turn(B, &b, "dos");
-
-        assert_eq!(MAX_CONFINED_CHATS_IN_FLIGHT, 1);
-        assert!(matches!(busy, Err(Error::Busy(_))), "{busy:?}");
-        // El rechazado no ocupó nada: ni la conversación ni su mensaje.
-        assert!(!conversations.open[&b].busy);
-        assert!(conversations.history(B, &b).unwrap().is_empty());
+    fn con_el_cupo_de_chats_confinados_lleno_el_siguiente_da_busy_y_el_sin_confinar_chatea() {
+        let mut quota = Quota::full();
+        quota.assert_extra_busy();
         // Sin confinar chatea al mismo tiempo, y no gasta el cupo compartido.
-        conversations.begin_turn(C, &c, "tres").unwrap();
+        let free = quota.conversations.create(C, false).unwrap();
+        quota.conversations.begin_turn(C, &free, "tres").unwrap();
 
-        // Al terminar el turno, el lugar vuelve.
-        conversations.finish_turn(&a, "uno", Some("ok"));
-        conversations.begin_turn(B, &b, "dos").unwrap();
+        quota.finish_first_and_enter_extra();
     }
 
     #[test]
-    fn un_chat_sin_confinar_en_vuelo_no_ocupa_el_lugar_de_los_confinados() {
+    fn los_chats_sin_confinar_en_vuelo_no_ocupan_el_lugar_de_los_confinados() {
         let mut conversations = Conversations::default();
-        let c = conversations.create(C, false).unwrap();
-        let a = conversations.create(A, true).unwrap();
-        conversations.begin_turn(C, &c, "uno").unwrap();
+        for i in 0..MAX_CONFINED_CHATS_IN_FLIGHT {
+            let id = conversations.create(&owner(i), false).unwrap();
+            conversations.begin_turn(&owner(i), &id, "uno").unwrap();
+        }
+        let id = conversations.create(A, true).unwrap();
 
-        assert!(conversations.begin_turn(A, &a, "dos").is_ok());
+        assert!(conversations.begin_turn(A, &id, "dos").is_ok());
     }
 
     #[test]
-    fn al_irse_un_confinado_se_liberan_solo_sus_conversaciones_y_el_lugar_en_vuelo_lo_devuelve_el_fin_del_turno(
-    ) {
-        let mut conversations = Conversations::default();
-        let a = conversations.create(A, true).unwrap();
-        let b = conversations.create(B, true).unwrap();
-        conversations.begin_turn(A, &a, "uno").unwrap();
+    fn al_irse_un_confinado_sin_chats_no_se_toca_lo_de_los_demas() {
+        let mut quota = Quota::full();
 
-        // Se va B: lo de A sigue, conversación y lugar en vuelo.
-        assert_eq!(conversations.release_owner(B), 1);
-        assert!(conversations.history(B, &b).is_err());
-        let b2 = conversations.create(B, true).unwrap();
-        assert!(matches!(
-            conversations.begin_turn(B, &b2, "dos"),
-            Err(Error::Busy(_))
-        ));
-        assert!(conversations.history(A, &a).is_ok());
-
-        // Se va A: su conversación se libera, pero el pedido sigue en el
-        // backend y el lugar no vuelve hasta que termina.
-        assert_eq!(conversations.release_owner(A), 1);
-        assert!(matches!(
-            conversations.begin_turn(B, &b2, "dos"),
-            Err(Error::Busy(_))
-        ));
-        conversations.finish_turn(&a, "uno", None);
-        conversations.begin_turn(B, &b2, "dos").unwrap();
+        // Se va el de más: sólo se libera su conversación.
+        assert_eq!(quota.conversations.release_owner(EXTRA), 1);
+        assert!(quota.conversations.history(EXTRA, &quota.extra.1).is_err());
+        assert!(quota
+            .conversations
+            .history(&quota.running[0].0, &quota.running[0].1)
+            .is_ok());
+        // Y lo que ocupa el cupo sigue ocupándolo.
+        let id = quota.conversations.create(EXTRA, true).unwrap();
+        quota.extra.1 = id;
+        quota.assert_extra_busy();
     }
 
     // El ataque que cerró security (#32): un confinado se desconectaba a mitad
     // de un chat para que su lugar del cupo compartido se devolviera mientras
     // el pedido seguía corriendo.
     #[test]
-    fn un_confinado_que_se_desconecta_a_mitad_de_un_chat_no_libera_el_cupo_compartido() {
-        let mut conversations = Conversations::default();
-        let a = conversations.create(A, true).unwrap();
-        let b = conversations.create(B, true).unwrap();
-        conversations.begin_turn(A, &a, "colgado").unwrap();
+    fn al_desconectarse_a_mitad_de_un_chat_el_confinado_no_libera_el_cupo_compartido() {
+        let mut quota = Quota::full();
 
-        conversations.release_owner(A);
+        // Se va el dueño de un chat colgado: su conversación se libera, el pedido no.
+        assert_eq!(quota.conversations.release_owner(&quota.running[0].0), 1);
 
-        // Otra conexión confinada no entra mientras el pedido de A siga corriendo.
-        let busy = conversations.begin_turn(B, &b, "dos");
-        assert!(matches!(busy, Err(Error::Busy(_))), "{busy:?}");
-        // Al terminar el primer pedido (`finish_turn`), el segundo entra.
-        conversations.finish_turn(&a, "colgado", None);
-        conversations.begin_turn(B, &b, "dos").unwrap();
+        quota.assert_extra_busy();
+        quota.finish_first_and_enter_extra();
     }
 
     #[test]
-    fn borrar_una_conversacion_confinada_con_su_chat_en_vuelo_no_libera_el_lugar_hasta_terminar_el_turno(
-    ) {
-        let mut conversations = Conversations::default();
-        let a = conversations.create(A, true).unwrap();
-        let b = conversations.create(B, true).unwrap();
-        conversations.begin_turn(A, &a, "uno").unwrap();
-        conversations.delete(A, &a).unwrap();
+    fn borrar_una_conversacion_confinada_en_vuelo_no_libera_el_lugar_hasta_terminar_el_turno() {
+        let mut quota = Quota::full();
+        let (owner, id) = quota.running[0].clone();
+        quota.conversations.delete(&owner, &id).unwrap();
 
-        assert!(matches!(
-            conversations.begin_turn(B, &b, "dos"),
-            Err(Error::Busy(_))
-        ));
-
-        conversations.finish_turn(&a, "uno", Some("ok"));
-        conversations.begin_turn(B, &b, "dos").unwrap();
+        quota.assert_extra_busy();
+        quota.finish_first_and_enter_extra();
     }
 }
