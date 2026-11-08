@@ -338,9 +338,10 @@ impl AssistantService {
         let Some(sender) = header.sender() else {
             return Err(no_sender());
         };
-        // Una sola consulta de la etiqueta: la conversación guarda si es de un
-        // confinado, y `Chat` la cuenta en el cupo compartido sin preguntar otra
-        // vez (#32).
+        // La conversación guarda si es de un confinado, y para el cupo
+        // compartido `Chat` usa eso sin volver a preguntar (#32). `Chat` sí
+        // pregunta la etiqueta otra vez para decidir la memoria; unificar las
+        // dos consultas queda fuera de alcance.
         let confined = self.confined(connection, header).await;
         let id = self.open(sender.as_str(), confined)?;
         // Punto a punto no hay demonio del bus a quien preguntar (el par no

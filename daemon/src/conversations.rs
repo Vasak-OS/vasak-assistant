@@ -44,6 +44,8 @@ struct Conversation {
     busy: bool,
 }
 
+/// Un chat esperando al modelo: quién lo pidió y si cuenta en el cupo de los
+/// confinados.
 struct InFlight {
     owner: String,
     confined: bool,
@@ -53,11 +55,11 @@ struct InFlight {
 pub struct Conversations {
     open: HashMap<String, Conversation>,
     /// Los chats en vuelo: id de la conversación → su dueño y si está
-    /// confinado. Se anota en
-    /// `begin_turn` y se saca en `finish_turn` (que corre siempre, por el
-    /// `Drop` del turno), exista o no la conversación: borrarla mientras espera
-    /// al modelo no devuelve el lugar, porque el pedido sigue ocupando el
-    /// backend. Sólo tiene los que están en vuelo, así que no acumula nada.
+    /// confinado. Se anota en `begin_turn` y se saca en `finish_turn` (que
+    /// corre siempre, por el `Drop` del turno), exista o no la conversación:
+    /// borrarla, o que su dueño se vaya, mientras espera al modelo no devuelve
+    /// el lugar, porque el pedido sigue ocupando el backend. Sólo tiene los que
+    /// están en vuelo, así que no acumula nada.
     in_flight: HashMap<String, InFlight>,
 }
 
@@ -85,9 +87,8 @@ impl Conversations {
         if confined
             && self.open.values().filter(|c| c.confined).count() >= MAX_CONFINED_CONVERSATIONS
         {
-            return Err(Error::LimitExceeded(format!(
-                "las aplicaciones confinadas ya tienen {MAX_CONFINED_CONVERSATIONS} conversaciones abiertas entre todas; cerrá alguna"
-            )));
+            // Genérico: no dice cuánto usan las demás aplicaciones.
+            return Err(Error::LimitExceeded(CONFINED_QUOTA_FULL.into()));
         }
         if self.open.len() >= MAX_CONVERSATIONS {
             return Err(Error::LimitExceeded(format!(
@@ -148,6 +149,11 @@ impl Conversations {
     /// devuelve lo que hay que mandarle al modelo (el historial más el mensaje
     /// nuevo). El mensaje todavía no se guarda: si el modelo falla, la
     /// conversación queda como estaba.
+    ///
+    /// `Busy` por tres motivos: la conversación ya espera una respuesta, el
+    /// dueño llegó a `MAX_CHATS_IN_FLIGHT_PER_OWNER`, o la conversación es de un
+    /// confinado y los confinados llegaron entre todos a
+    /// `MAX_CONFINED_CHATS_IN_FLIGHT`.
     pub fn begin_turn(
         &mut self,
         owner: &str,
@@ -184,9 +190,8 @@ impl Conversations {
             && self.in_flight.values().filter(|chat| chat.confined).count()
                 >= MAX_CONFINED_CHATS_IN_FLIGHT
         {
-            return Err(Error::Busy(format!(
-                "las aplicaciones confinadas ya tienen {MAX_CONFINED_CHATS_IN_FLIGHT} pedidos esperando respuesta del modelo; esperá a que termine uno"
-            )));
+            // Genérico: no dice cuánto usan las demás aplicaciones.
+            return Err(Error::Busy(CONFINED_QUOTA_FULL.into()));
         }
         self.in_flight.insert(
             id.to_owned(),
@@ -288,6 +293,10 @@ pub fn trim_history(messages: &mut Vec<Message>) {
     }
     messages.drain(..drop);
 }
+
+/// El rechazo del cupo compartido de los confinados, igual para los dos topes.
+const CONFINED_QUOTA_FULL: &str =
+    "Hay demasiadas aplicaciones usando el asistente; probá en un momento.";
 
 fn not_found() -> Error {
     Error::NotFound("no hay ninguna conversación con ese id".into())

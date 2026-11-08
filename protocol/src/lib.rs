@@ -73,16 +73,18 @@ pub const MAX_CHATS_IN_FLIGHT_PER_OWNER: usize = 2;
 /// topes por dueño se cuentan por nombre único del bus, y un proceso que abre
 /// varias conexiones los esquivaría. Chico a propósito, para que siempre queden
 /// lugares de [`MAX_CONVERSATIONS`] para la persona. Es ajustable, siempre
-/// bastante por debajo de ese total. Pasado, `NewConversation` da
-/// `LimitExceeded`.
+/// bastante por debajo de ese total; las pruebas fijan los supuestos de este
+/// valor, así que al cambiarlo hay que revisarlas. Pasado, `NewConversation`
+/// da `LimitExceeded`.
 pub const MAX_CONFINED_CONVERSATIONS: usize = 4;
 
 /// Cuántos `Chat` pueden tener esperando respuesta, entre todos, los
 /// llamadores confinados (#32). Compartido por la misma razón que
 /// [`MAX_CONFINED_CONVERSATIONS`]: las aplicaciones confinadas ocupan a lo sumo
-/// un lugar del cupo de pedidos al modelo del servicio (4), abran las
-/// conexiones que abran, y el resto queda para la persona. Es ajustable,
-/// siempre por debajo de ese cupo. Pasado, `Chat` da `Busy`.
+/// un lugar del cupo de pedidos al modelo del servicio, abran las conexiones
+/// que abran, y el resto queda para la persona. Es ajustable, siempre por
+/// debajo de ese cupo; las pruebas fijan los supuestos de este valor, así que
+/// al cambiarlo hay que revisarlas. Pasado, `Chat` da `Busy`.
 pub const MAX_CONFINED_CHATS_IN_FLIGHT: usize = 1;
 
 /// Cuántos mensajes guarda una conversación. Pasado eso se olvidan los más

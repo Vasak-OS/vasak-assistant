@@ -145,9 +145,11 @@ lugares para la persona. Los dos valores están en el contrato y son ajustables.
 Si el bus no contesta la etiqueta, la conexión cuenta como confinada. Cuando una
 conexión se va, se liberan sus conversaciones, pero un `Chat` suyo que sigue
 esperando al modelo ocupa su lugar hasta que termina: desconectarse no lo
-devuelve antes. Un
-proceso sin confinar queda fuera de alcance: puede abrir conexiones y esquivar
-los topes por conexión, pero igual puede leer o matar al servicio.
+devuelve antes. El costo del diseño: un solo proceso confinado puede ocupar todo
+el cupo compartido hasta irse, y un chat colgado retiene el único lugar hasta
+que termina el pedido, como mucho el plazo del backend. Un proceso sin confinar
+queda fuera de alcance: puede abrir conexiones y esquivar los topes por
+conexión, pero igual puede leer o matar al servicio.
 
 | Método | Qué hace |
 |---|---|
