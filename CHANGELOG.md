@@ -19,6 +19,9 @@ resumen para siempre (#28).
   ejecución: un cliente que no usa la memoria ya no puede vaciar la lista
   borrando conversaciones vacías. El registro de un borrado pendiente que
   falla lleva sólo el código del error.
+- **`daemon`** — un borrado de resúmenes sólo cuenta como hecho cuando el
+  checkpoint de la base salió bien, aunque ya no queden nodos que borrar: si
+  un intento borró y falló al volcarlo, el reintento lo vuelca.
 
 ## vasak-assistant 0.3.10
 

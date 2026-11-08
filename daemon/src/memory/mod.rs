@@ -178,10 +178,9 @@ pub struct Memory {
     /// Los ids de conversaciones con un resumen guardado en esta ejecución.
     /// Sólo esos entran a `pending_deletes`: un cliente que no usa la memoria
     /// (un confinado) no puede vaciar la lista borrando conversaciones vacías.
-    /// Con el candado de la base tomado.
-    // shortcut: sin tope; crece un id por conversación resumida (una
-    // extracción a la vez, con ida y vuelta al modelo) y lo pierde al borrarse.
-    // Ponerle tope si el demonio corre semanas con miles de conversaciones.
+    /// Con el candado de la base tomado. No crece sin tope: después de cada
+    /// escritura se queda sólo con las conversaciones que siguen teniendo un
+    /// resumen en la base (la poda saca los viejos) y con las pendientes.
     summarized: parking_lot::Mutex<HashSet<String>>,
     /// Si ya se avisó (WARN) que hay borrados pendientes que fallan: se
     /// reintentan en cada uso de la base, y los demás fallos van a DEBUG
@@ -518,9 +517,20 @@ impl Memory {
         }
         let (dir, conversation_id) = (dir.clone(), conversation_id.to_owned());
         let pruned = self.pruned_over_limit.clone();
-        blocking(move || write(&db, &dir, &extraction, &conversation_id, &pruned).map_err(db_error))
-            .await
-            .inspect_err(|error| tracing::warn!("no se pudo escribir en la memoria: {error}"))
+        let (written, live) = blocking(move || {
+            let written =
+                write(&db, &dir, &extraction, &conversation_id, &pruned).map_err(db_error)?;
+            Ok((written, schema::summarized_conversations(&db)))
+        })
+        .await
+        .inspect_err(|error| tracing::warn!("no se pudo escribir en la memoria: {error}"))?;
+        // La escritura pudo podar resúmenes: sus conversaciones ya no tienen
+        // nada que borrar, salvo las pendientes, que se borran igual.
+        let pending = self.pending_deletes.lock();
+        self.summarized
+            .lock()
+            .retain(|id| live.contains(id) || pending.contains(id));
+        Ok(written)
     }
 
     /// Una conversación borrada (`DeleteConversation`): se descarta lo que
@@ -557,11 +567,12 @@ impl Memory {
         // Borrar no le manda nada a ningún modelo: la puerta del remoto no
         // aplica, sólo que esté encendida y abierta.
         if let Err(reason) = self.ensure_open(dir, &mut db).await {
-            tracing::warn!(
-                conversation = %short_id(conversation_id),
-                "los resúmenes de la conversación se borrarán al abrir la memoria: {reason}"
-            );
-            self.defer_delete(conversation_id);
+            if self.defer_delete(conversation_id) {
+                tracing::warn!(
+                    conversation = %short_id(conversation_id),
+                    "los resúmenes de la conversación se borrarán al abrir la memoria: {reason}"
+                );
+            }
             return;
         }
         let Some(db) = db.clone() else {
@@ -580,25 +591,31 @@ impl Memory {
                 )
             }
             Err(error) => {
-                tracing::warn!(
-                    conversation = %short,
-                    "no se borraron los resúmenes de la conversación, se reintenta: {error}"
-                );
-                self.defer_delete(conversation_id);
+                if self.defer_delete(conversation_id) {
+                    tracing::warn!(
+                        conversation = %short,
+                        "no se borraron los resúmenes de la conversación, se reintenta: {error}"
+                    );
+                } else {
+                    tracing::warn!(
+                        conversation = %short,
+                        "no se borraron los resúmenes de la conversación: {error}"
+                    );
+                }
             }
         }
     }
 
     /// Anota el id en `pending_deletes`, sin repetirlo, si tiene un resumen
-    /// guardado en esta ejecución (`summarized`). Con el candado de la base
-    /// tomado.
-    fn defer_delete(&self, conversation_id: &str) {
+    /// guardado en esta ejecución (`summarized`). Devuelve si quedó pendiente.
+    /// Con el candado de la base tomado.
+    fn defer_delete(&self, conversation_id: &str) -> bool {
         if !self.summarized.lock().contains(conversation_id) {
-            return;
+            return false;
         }
         let mut pending = self.pending_deletes.lock();
         if pending.iter().any(|id| id == conversation_id) {
-            return;
+            return true;
         }
         if pending.len() >= MAX_PENDING_DELETES {
             if let Some(dropped) = pending.pop_front() {
@@ -610,6 +627,7 @@ impl Memory {
             }
         }
         pending.push_back(conversation_id.to_owned());
+        true
     }
 
     /// Borra los resúmenes de `pending_deletes` en la base abierta. Lo que
@@ -786,6 +804,7 @@ impl Memory {
         // Los resúmenes pendientes se fueron con los archivos.
         self.pending_deletes.lock().clear();
         self.summarized.lock().clear();
+        self.pending_warned.store(false, Ordering::SeqCst);
         let recreated = is_file(&flag(dir)).await;
         if recreated {
             self.create(dir, &mut db).await?;
@@ -891,6 +910,7 @@ impl Memory {
                 // Una base nueva no tiene resúmenes de nadie.
                 self.pending_deletes.lock().clear();
                 self.summarized.lock().clear();
+                self.pending_warned.store(false, Ordering::SeqCst);
                 *db = Some(Arc::new(opened));
                 Ok(())
             }
@@ -2902,6 +2922,9 @@ mod log_tests {
         memory.close().await;
         let keys = FixedKey::new(None);
         let broken = Memory::new(Some(tmp.memory_dir()), keys);
+        // Con un resumen guardado en esta ejecución: si no, no queda pendiente
+        // y no hay nada que avisar.
+        broken.summarized.lock().insert("c1".to_owned());
         let (log, _guard) = capture_logs();
 
         broken.forget_conversation("c1").await;
