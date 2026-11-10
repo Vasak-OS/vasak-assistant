@@ -786,4 +786,36 @@ mod tests {
             assert!(!cgroup_is_service("0::///", UNIT));
         }
     }
+
+    mod owner_runs_service {
+        use super::*;
+        use std::io::{Error as IoError, ErrorKind};
+
+        #[test]
+        fn el_duenio_que_corre_en_el_unit_pasa() {
+            let leer = |_| Ok("0::/user.slice/app.slice/vasak-assistant.service\n".to_string());
+            assert!(owner_runs_service(123, leer).is_ok());
+        }
+
+        #[test]
+        fn un_proceso_que_no_es_el_unit_se_niega() {
+            let leer = |_| Ok("0::/user.slice/app.slice/impostor.service\n".to_string());
+            match owner_runs_service(123, leer) {
+                Err(Error::AccessDenied(motivo)) => {
+                    assert!(motivo.contains("123"), "{motivo}");
+                    assert!(!motivo.contains("impostor"), "{motivo}");
+                }
+                otro => panic!("se esperaba AccessDenied, vino {otro:?}"),
+            }
+        }
+
+        #[test]
+        fn si_no_se_puede_leer_el_cgroup_falla_cerrado() {
+            let leer = |_| Err(IoError::new(ErrorKind::NotFound, "no such process"));
+            match owner_runs_service(456, leer) {
+                Err(Error::AccessDenied(motivo)) => assert!(motivo.contains("456"), "{motivo}"),
+                otro => panic!("se esperaba AccessDenied, vino {otro:?}"),
+            }
+        }
+    }
 }
