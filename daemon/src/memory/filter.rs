@@ -175,6 +175,7 @@ pub fn is_clean_note(text: &str) -> bool {
         && !mentions_credentials(text)
         && !contains_secret(text)
         && !is_user_data(text)
+        && !mentions_sensitive(text)
 }
 
 /// Si `c` es de formato (Cf), separador de línea o de párrafo (Zl, Zp), de uso
@@ -373,6 +374,111 @@ pub fn mentions_credentials(text: &str) -> bool {
     normalize_terms(text)
         .split(|c: char| !c.is_alphanumeric())
         .any(|word| CREDENTIAL_WORDS.contains(&word))
+}
+
+/// Categorías de datos sensibles que la memoria no necesita para saber cómo
+/// hablarle a la persona —salud, religión, orientación sexual, afiliación
+/// política—. Van normalizadas (sin tildes, en minúsculas) para compararse
+/// contra [`normalize_terms`]. Ante la duda se descarta, como el resto de
+/// `filter`: la lista prefiere descartar una nota legítima a guardar un dato
+/// de categoría especial.
+const SENSITIVE_WORDS: &[&str] = &[
+    // Salud
+    "diabetes",
+    "diabetico",
+    "diabetica",
+    "cancer",
+    "oncologico",
+    "tumor",
+    "vih",
+    "sida",
+    "hiv",
+    "depresion",
+    "ansiedad",
+    "bipolar",
+    "esquizofrenia",
+    "discapacidad",
+    "discapacitado",
+    "discapacitada",
+    "embarazo",
+    "embarazada",
+    "medicacion",
+    "medicado",
+    "medicada",
+    "diagnostico",
+    "enfermedad",
+    "cronica",
+    "psiquiatra",
+    "psiquiatrico",
+    // Religión
+    "catolico",
+    "catolica",
+    "cristiano",
+    "cristiana",
+    "evangelico",
+    "evangelica",
+    "judio",
+    "judia",
+    "musulman",
+    "musulmana",
+    "islam",
+    "islamico",
+    "ateo",
+    "atea",
+    "agnostico",
+    "budista",
+    "iglesia",
+    "parroquia",
+    "sinagoga",
+    "mezquita",
+    "religion",
+    "religioso",
+    "religiosa",
+    // Orientación sexual
+    "gay",
+    "lesbiana",
+    "lesbico",
+    "bisexual",
+    "homosexual",
+    "heterosexual",
+    "hetero",
+    "trans",
+    "transexual",
+    "transgenero",
+    "queer",
+    // Afiliación política
+    "peronista",
+    "peronismo",
+    "kirchnerista",
+    "kirchnerismo",
+    "macrista",
+    "socialista",
+    "comunista",
+    "troskista",
+    "trotskista",
+    "anarquista",
+    "libertario",
+    "militante",
+];
+
+/// Un domicilio: un tipo de vía, el nombre y la altura («Av. Corrientes 1234»).
+/// No busca ser exhaustivo; con el tipo de vía por delante alcanza para la
+/// forma común, y ante la duda se descarta.
+static ADDRESS: LazyLock<Regex> = LazyLock::new(|| {
+    regex(concat!(
+        r"(?i)\b(?:av|avda|avenida|calle|pasaje|psje|diagonal|diag|ruta|camino",
+        r"|boulevard|bulevar|bv)\.?\s+\w+(?:\s+\w+){0,3}\s+\d{1,5}\b",
+    ))
+});
+
+/// Si el texto nombra una categoría sensible (salud, religión, orientación
+/// sexual, afiliación política) o un domicilio. Como [`is_user_data`], son
+/// datos de la persona que la memoria descarta.
+pub fn mentions_sensitive(text: &str) -> bool {
+    normalize_terms(text)
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| SENSITIVE_WORDS.contains(&word))
+        || ADDRESS.is_match(&nfkc(text))
 }
 
 /// Los términos con los que se indexa y se busca: descompuesto (NFD), sin

@@ -11,7 +11,9 @@ use serde::Deserialize;
 use serde_json::json;
 use vasak_assistant_protocol::{Message, Role};
 
-use super::filter::{contains_secret, is_clean_note, is_user_data, nfkc, normalize_terms};
+use super::filter::{
+    contains_secret, is_clean_note, is_user_data, mentions_sensitive, nfkc, normalize_terms,
+};
 use super::schema::{MemoryKind, MAX_ABOUT, MAX_PHRASE_BYTES};
 
 /// Cuántos recuerdos se aceptan de una extracción.
@@ -106,7 +108,9 @@ pub fn extraction_window(exchange: &[Message], gate: Gate) -> Option<(Vec<Messag
         if message.role == Role::System {
             continue;
         }
-        let tainted = contains_secret(&message.content) || is_user_data(&message.content);
+        let tainted = contains_secret(&message.content)
+            || is_user_data(&message.content)
+            || mentions_sensitive(&message.content);
         if message.role == Role::User
             && (tainted
                 || message.content.len() > MAX_SUMMARY_USER_BYTES
