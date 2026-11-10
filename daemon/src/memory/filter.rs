@@ -435,6 +435,7 @@ const SENSITIVE_WORDS: &[&str] = &[
     "religioso",
     "religiosa",
     "misa",
+    "creyente",
     // Orientación sexual
     "gay",
     "lesbiana",
@@ -473,6 +474,11 @@ const SENSITIVE_WORDS: &[&str] = &[
     "militas",
 ];
 
+/// Frases que delatan una categoría sensible sin nombrar un término suelto de
+/// [`SENSITIVE_WORDS`] (una creencia dicha como oración). Se buscan sobre el
+/// texto plegado, que colapsa los espacios, así que van con un solo espacio.
+const SENSITIVE_PHRASES: &[&str] = &["creo en dios", "cree en dios"];
+
 /// Un domicilio: un tipo de vía, el nombre y la altura («Av. Corrientes 1234»).
 /// No busca ser exhaustivo; con el tipo de vía por delante alcanza para la
 /// forma común, y ante la duda se descarta.
@@ -497,8 +503,25 @@ pub fn mentions_sensitive(text: &str) -> bool {
         .collect();
     folded
         .split(|c: char| !c.is_alphanumeric())
-        .any(|word| SENSITIVE_WORDS.contains(&word))
+        .any(is_sensitive_word)
+        || SENSITIVE_PHRASES
+            .iter()
+            .any(|phrase| folded.contains(phrase))
+        || ADDRESS.is_match(&folded)
         || ADDRESS.is_match(&nfkc(text))
+}
+
+/// Una palabra sensible, también en plural: el español lo forma con `-s` o
+/// `-es`, así que se mira la palabra y su forma sin ese sufijo. No es prefijo
+/// amplio —sólo quita el plural— y sólo cuenta si el singular está en la lista.
+fn is_sensitive_word(word: &str) -> bool {
+    SENSITIVE_WORDS.contains(&word)
+        || word
+            .strip_suffix("es")
+            .is_some_and(|singular| SENSITIVE_WORDS.contains(&singular))
+        || word
+            .strip_suffix('s')
+            .is_some_and(|singular| SENSITIVE_WORDS.contains(&singular))
 }
 
 /// Los términos con los que se indexa y se busca: descompuesto (NFD), sin
