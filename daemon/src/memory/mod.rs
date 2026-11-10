@@ -163,7 +163,19 @@ pub struct Memory {
     /// [`Self::store_at`], bajo el candado. Hace de época por conversación:
     /// los ids son uuid y no vuelven, así que basta con recordar que se borró.
     forgotten: parking_lot::Mutex<std::collections::VecDeque<String>>,
+    /// Conversaciones borradas (`DeleteConversation`) con la memoria apagada o
+    /// la base sin abrir: su borrado queda pendiente y se aplica en el próximo
+    /// open exitoso de la base ([`Self::flush_pending_deletes`]). Vive sólo
+    /// mientras corre el demonio (best-effort). Aparte de `forgotten`, que
+    /// bloquea el re-guardado de extracciones en vuelo y no debe perder un id
+    /// de borrado al evictarse.
+    pending_deletes: parking_lot::Mutex<std::collections::VecDeque<String>>,
 }
+
+/// Cuántos borrados pendientes se recuerdan. Al llegar al tope se descarta el
+/// más viejo (como `forgotten`): la cola es best-effort y sólo vive mientras
+/// corre el demonio, la salida para un borrado seguro es `ClearMemory`.
+const MAX_PENDING_DELETES: usize = 256;
 
 /// Cuántas conversaciones borradas se recuerdan en `forgotten`. Vaciarlo no
 /// deja pasar nada: la extracción en vuelo se cancela por `in_flight`, y el
@@ -210,6 +222,7 @@ impl Memory {
             pruned_over_limit: Arc::default(),
             last_open_problem: parking_lot::Mutex::default(),
             forgotten: parking_lot::Mutex::default(),
+            pending_deletes: parking_lot::Mutex::default(),
         }
     }
 
@@ -501,11 +514,12 @@ impl Memory {
     /// memoria no se puede usar, sólo queda la cancelación.
     ///
     /// Con la memoria apagada no se toca la base (apagar no lee ni escribe,
-    /// decisión 10), y el resumen de una conversación borrada mientras estaba
-    /// apagada queda: no se anota en ningún lado para borrarlo al encender,
-    /// porque eso sería escribir con la memoria apagada. La salida para eso es
-    /// `ClearMemory`. Lo mismo si la memoria no se pudo abrir (llavero
-    /// bloqueado, llave que falta): no se reintenta después.
+    /// decisión 10) y con el llavero bloqueado tampoco se puede abrir: en esos
+    /// casos el borrado queda pendiente en RAM ([`Self::enqueue_pending_delete`])
+    /// y se aplica en el próximo open exitoso de la base
+    /// ([`Self::flush_pending_deletes`]). Es best-effort: la cola vive sólo
+    /// mientras corre el demonio. No se escribe nada con la memoria apagada; la
+    /// salida para un borrado seguro sigue siendo `ClearMemory`.
     pub async fn forget_conversation(&self, conversation_id: &str) {
         if let Some((id, cancelled)) = &*self.in_flight.lock() {
             if id == conversation_id {
@@ -525,12 +539,20 @@ impl Memory {
         };
         let mut db = self.db.lock().await;
         if !is_file(&flag(dir)).await {
+            // Apagada: no se escribe (decisión 10). Queda pendiente para el
+            // próximo open.
+            self.enqueue_pending_delete(conversation_id);
             return;
         }
         // Borrar no le manda nada a ningún modelo: la puerta del remoto no
         // aplica, sólo que esté encendida y abierta.
         if let Err(reason) = self.ensure_open(dir, &mut db).await {
-            tracing::warn!("no se borraron los resúmenes de la conversación: {reason}");
+            // Base sin abrir (llavero bloqueado, llave que falta): queda
+            // pendiente para el próximo open exitoso.
+            self.enqueue_pending_delete(conversation_id);
+            tracing::warn!(
+                "los resúmenes de la conversación quedan pendientes de borrado: {reason}"
+            );
             return;
         }
         let Some(db) = db.clone() else { return };
@@ -544,6 +566,50 @@ impl Memory {
             ),
             Err(error) => {
                 tracing::warn!("no se borraron los resúmenes de la conversación: {error}")
+            }
+        }
+    }
+
+    /// Encola una conversación para borrar sus resúmenes en el próximo open de
+    /// la base. Dedup por id (no encola uno ya presente) y tope propio: al
+    /// llegar a [`MAX_PENDING_DELETES`] descarta el más viejo, como `forgotten`.
+    fn enqueue_pending_delete(&self, conversation_id: &str) {
+        let mut pending = self.pending_deletes.lock();
+        if pending.iter().any(|id| id == conversation_id) {
+            return;
+        }
+        if pending.len() >= MAX_PENDING_DELETES {
+            pending.pop_front();
+        }
+        pending.push_back(conversation_id.to_owned());
+    }
+
+    /// Drena los borrados pendientes contra la base recién abierta. Best-effort:
+    /// cada id sale de la cola sólo cuando su borrado terminó bien; si uno falla
+    /// se vuelve a poner y se corta, para reintentarlo en el próximo open. Corre
+    /// bajo el candado de la base que tiene el llamador de `open_now`, mismo
+    /// invariante de serialización que el resto de escritores.
+    async fn flush_pending_deletes(&self, db: &Arc<GrafeoDB>) {
+        loop {
+            let Some(id) = self.pending_deletes.lock().pop_front() else {
+                break;
+            };
+            let db = db.clone();
+            let for_delete = id.clone();
+            let short = short_id(&id);
+            match blocking(move || schema::delete_summaries(&db, &for_delete).map_err(db_error))
+                .await
+            {
+                Ok(deleted) => tracing::debug!(
+                    conversation = %short,
+                    deleted,
+                    "se borraron los resúmenes pendientes de la conversación"
+                ),
+                Err(error) => {
+                    tracing::warn!("no se borraron los resúmenes pendientes: {error}");
+                    self.pending_deletes.lock().push_front(id);
+                    break;
+                }
             }
         }
     }
@@ -757,17 +823,29 @@ impl Memory {
         // Una línea la primera vez y cada vez que cambia el motivo: el estado y
         // cada `recall` vuelven a intentarlo, y no hace falta repetirla. El
         // motivo es un texto fijo, sin la llave.
-        let mut last = self.last_open_problem.lock();
-        match result {
-            Err(reason) if *last != Some(reason) => {
-                tracing::warn!("la memoria no se puede abrir: {reason}");
-                *last = Some(reason);
+        {
+            let mut last = self.last_open_problem.lock();
+            match result {
+                Err(reason) if *last != Some(reason) => {
+                    tracing::warn!("la memoria no se puede abrir: {reason}");
+                    *last = Some(reason);
+                }
+                Ok(()) if last.is_some() => {
+                    tracing::info!("la memoria se abrió");
+                    *last = None;
+                }
+                _ => {}
             }
-            Ok(()) if last.is_some() => {
-                tracing::info!("la memoria se abrió");
-                *last = None;
+        }
+        // Con la base abierta se drenan los borrados pendientes, en CADA
+        // apertura, no sólo en la transición cerrada→abierta: si un borrado
+        // falló antes y dejó la base abierta, la próxima operación lo reintenta
+        // (la cola vacía sale enseguida). Cubre el desbloqueo del llavero y el
+        // re-encendido, que pasan por acá vía `set_enabled`.
+        if result.is_ok() {
+            if let Some(db) = db.clone() {
+                self.flush_pending_deletes(&db).await;
             }
-            _ => {}
         }
         result
     }
@@ -2605,34 +2683,98 @@ mod forget_tests {
         backend.wait_for_calls(1).await;
     }
 
-    #[tokio::test]
-    async fn con_la_memoria_apagada_no_se_toca_la_base_y_el_resumen_queda() {
-        let (tmp, memory) = enabled().await;
-        memory.store(summary("Resumen de A"), "a").await.unwrap();
-        memory.set_enabled(false).await.unwrap();
-        let files = |dir: &Path| -> Vec<(PathBuf, Vec<u8>)> {
-            fn walk(path: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
-                for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
-                    let p = entry.path();
-                    if p.is_dir() {
-                        walk(&p, out);
-                    } else {
-                        out.push((p.clone(), std::fs::read(&p).unwrap()));
-                    }
+    /// Contenido de todos los archivos bajo `dir`, para probar que no se escribió nada.
+    fn files(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn walk(path: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+            for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else {
+                    out.push((p.clone(), std::fs::read(&p).unwrap()));
                 }
             }
-            let mut out = Vec::new();
-            walk(dir, &mut out);
-            out.sort();
-            out
-        };
+        }
+        let mut out = Vec::new();
+        walk(dir, &mut out);
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn con_la_memoria_apagada_no_se_escribe_y_el_resumen_se_borra_al_re_encender() {
+        let (tmp, memory) = enabled().await;
+        memory.store(summary("Resumen de A"), "a").await.unwrap();
+        memory.store(summary("Resumen de B"), "b").await.unwrap();
+        memory.set_enabled(false).await.unwrap();
         let before = files(&tmp.memory_dir());
 
         memory.forget_conversation("a").await;
 
+        // Apagada no se escribe nada (decisión 10).
         assert_eq!(files(&tmp.memory_dir()), before);
         memory.set_enabled(true).await.unwrap();
-        assert_eq!(summaries(&memory).await, ["Resumen de A"]);
+        // El borrado pendiente se aplica al reabrir; el de B queda intacto.
+        assert_eq!(summaries(&memory).await, ["Resumen de B"]);
+    }
+
+    #[tokio::test]
+    async fn con_el_llavero_bloqueado_el_borrado_queda_pendiente_y_se_aplica_al_desbloquear() {
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
+        memory.set_enabled(true).await.unwrap();
+        memory.store(summary("Resumen de A"), "a").await.unwrap();
+        memory.store(summary("Resumen de B"), "b").await.unwrap();
+        memory.close().await;
+        *keys.locked.lock() = true;
+        let before = files(&tmp.memory_dir());
+
+        memory.forget_conversation("a").await;
+
+        // Bloqueado no se pudo abrir: la base no se tocó.
+        assert_eq!(files(&tmp.memory_dir()), before);
+        *keys.locked.lock() = false;
+        // La próxima apertura drena el borrado.
+        assert_eq!(summaries(&memory).await, ["Resumen de B"]);
+    }
+
+    #[tokio::test]
+    async fn un_borrado_pendiente_se_reintenta_aunque_la_base_ya_este_abierta() {
+        let (_tmp, memory) = enabled().await;
+        memory.store(summary("Resumen de A"), "a").await.unwrap();
+        memory.store(summary("Resumen de B"), "b").await.unwrap();
+        // Estado «un borrado falló y la base siguió abierta»: sin transición
+        // cerrada→abierta de por medio.
+        memory.pending_deletes.lock().push_back("a".into());
+
+        // Una operación que no es un olvido pasa por `ensure_open` y drena.
+        let listed = memory.list_memories().await.unwrap();
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(summaries(&memory).await, ["Resumen de B"]);
+        assert!(memory.pending_deletes.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn encolar_el_mismo_borrado_dos_veces_no_lo_duplica_y_la_cola_tiene_tope() {
+        let (_tmp, memory) = enabled().await;
+        memory.set_enabled(false).await.unwrap();
+
+        memory.forget_conversation("a").await;
+        memory.forget_conversation("a").await;
+        assert_eq!(memory.pending_deletes.lock().len(), 1);
+
+        for n in 0..(MAX_PENDING_DELETES + 10) {
+            memory.forget_conversation(&format!("c{n}")).await;
+        }
+        let pending = memory.pending_deletes.lock();
+        assert_eq!(pending.len(), MAX_PENDING_DELETES);
+        // Se descartan los más viejos, queda el último.
+        assert!(!pending.iter().any(|id| id == "a"));
+        assert!(pending
+            .iter()
+            .any(|id| *id == format!("c{}", MAX_PENDING_DELETES + 9)));
     }
 
     #[tokio::test]
@@ -2974,7 +3116,7 @@ mod log_tests {
 
         broken.forget_conversation("c1").await;
 
-        let l = line(&log, &["no se borraron los resúmenes de la conversación"]);
+        let l = line(&log, &["quedan pendientes de borrado"]);
         assert!(l.contains("WARN"), "{l}");
     }
 

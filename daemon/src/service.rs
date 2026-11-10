@@ -3339,21 +3339,24 @@ mod delete_conversation_tests {
     }
 
     #[tokio::test]
-    async fn con_la_memoria_apagada_borrar_la_conversacion_no_toca_la_base_y_el_resumen_queda() {
+    async fn con_la_memoria_apagada_borrar_la_conversacion_no_escribe_y_el_resumen_se_borra_al_re_encender(
+    ) {
         let rig = rig().await;
         let (a, _b) = two_with_summaries(&rig).await;
         rig.service.memory.set_enabled(false).await.unwrap();
+        let before = std::fs::read(rig.tmp.memory_dir().join("lince.grafeo")).ok();
 
         rig.service.delete_conversation_as(OWNER, &a).await.unwrap();
 
-        // La conversación se cerró; la memoria apagada no se leyó ni se escribió.
+        // La conversación se cerró; la memoria apagada no se escribió.
         assert!(rig.service.history_of(OWNER, &a).is_err());
-        rig.service.memory.set_enabled(true).await.unwrap();
         assert_eq!(
-            summaries(&rig.service.memory).await,
-            ["Resumen de A", "Resumen de B"]
+            std::fs::read(rig.tmp.memory_dir().join("lince.grafeo")).ok(),
+            before
         );
-        assert!(rig.tmp.memory_dir().exists());
+        // Al re-encender se aplica el borrado pendiente; el resumen de B queda.
+        rig.service.memory.set_enabled(true).await.unwrap();
+        assert_eq!(summaries(&rig.service.memory).await, ["Resumen de B"]);
     }
 
     #[tokio::test]

@@ -2,6 +2,25 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-assistant 0.3.14
+
+El borrado de una conversación ya no se olvida en silencio si la memoria está
+apagada o el llavero bloqueado: queda pendiente y se aplica al volver a abrir la
+memoria (#28).
+
+- **`daemon`** — `forget_conversation`, cuando no puede borrar los resúmenes
+  porque la memoria está apagada o la base no se puede abrir (llavero bloqueado
+  o llave ausente), anota la conversación en una cola en RAM de borrados
+  pendientes (`pending_deletes`, sin duplicados) en vez de responder como si
+  hubiera borrado y olvidarlo. La cola admite 256 borrados distintos; si se
+  agrega otro estando llena, descarta el más viejo. `flush_pending_deletes`
+  intenta vaciarla en cada apertura de la base y con la base ya abierta (al
+  desbloquear el llavero, al volver a encender la memoria, o en la próxima
+  operación); si un borrado falla, queda pendiente junto con los siguientes y se
+  reintenta después. Apagada no escribe nada, sólo acumula en RAM (decisión 10);
+  la cola vive mientras el demonio corre. Antes el resumen quedaba guardado y no
+  se reintentaba.
+
 ## vasak-assistant 0.3.11
 
 La memoria no guarda datos de categoría especial ni domicilios (#11).
