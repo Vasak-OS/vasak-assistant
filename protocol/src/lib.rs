@@ -299,13 +299,18 @@ pub enum Error {
 ///
 /// # Límites conocidos (para la revisión de seguridad)
 ///
-/// - **No distingue el unit activado por D-Bus de uno transitorio del mismo
-///   nombre.** Un usuario puede crear `systemd-run --user
-///   --unit=vasak-assistant.service …`, cuyo cgroup termina en el mismo
-///   segmento. El cgroup no lleva esa procedencia, así que esto no se puede
-///   cerrar sólo con la ruta; sube la barrera (ya no alcanza un proceso
-///   cualquiera: tiene que ser un unit de systemd con ese nombre exacto), no la
-///   elimina.
+/// - **No distingue el unit real de un cgroup forjado con el mismo nombre.**
+///   Bajo el gestor de usuario de systemd (cgroup v2), el subárbol
+///   `user@<uid>.service` está delegado y es propiedad del UID: cualquier
+///   proceso del mismo usuario puede crear un cgroup hijo llamado
+///   `vasak-assistant.service` y escribir su pid en `cgroup.procs` —sin
+///   `systemd-run` y sin ser un unit—, y su última componente queda idéntica.
+///   El cgroup no lleva la procedencia (activado por D-Bus vs forjado), así que
+///   esto no se cierra sólo con la ruta. Sube la barrera frente a un squat
+///   accidental o un atacante ingenuo, no frente a un atacante local que
+///   controla su propio cgroup. El cierre real es del lado del demonio: pedir
+///   el nombre con `DO_NOT_QUEUE` y abortar ruidoso si ya está tomado, con esta
+///   verificación como defensa en capas.
 /// - **Anidamiento.** Si systemd alguna vez deja el proceso principal en un
 ///   sub-cgroup por debajo del unit (p. ej. `Delegate=yes`), esto lo rechaza
 ///   (falla cerrado, rompe la verificación en vez de aceptar de más). El unit
