@@ -1934,7 +1934,10 @@ mod gate_tests {
     use crate::memory::learn::{Extraction, Item};
     use crate::memory::schema::MemoryKind;
     use crate::test_support::{FixedKey, FixedLabel, ScriptedBackend, TempDir};
-    use vasak_assistant_protocol::{AssistantProxy, DOMAIN_MEMORY, SERVICE_PATH};
+    use vasak_assistant_protocol::{
+        AssistantProxy, DOMAIN_MEMORY, MAX_CONVERSATIONS_CONFINED, MAX_CONVERSATIONS_PER_OWNER,
+        SERVICE_PATH,
+    };
 
     const CONFINED: &[u8] = b"vasak-appimage (enforce)\0";
 
@@ -2032,6 +2035,35 @@ mod gate_tests {
             ("confinado", FixedLabel::of(CONFINED)),
             ("el bus no contesta", FixedLabel::failing()),
         ]
+    }
+
+    #[tokio::test]
+    async fn una_llamada_confinada_o_con_el_bus_mudo_abre_solo_el_cupo_confinado() {
+        for (name, label) in labels() {
+            let gate = gate(label, []).await;
+            for _ in 0..MAX_CONVERSATIONS_CONFINED {
+                gate.proxy.new_conversation().await.unwrap();
+            }
+            assert!(
+                matches!(
+                    gate.proxy.new_conversation().await,
+                    Err(Error::LimitExceeded(_))
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn una_llamada_sin_confinar_sigue_con_su_cupo_por_dueno() {
+        let gate = gate(FixedLabel::none(), []).await;
+        for _ in 0..MAX_CONVERSATIONS_PER_OWNER {
+            gate.proxy.new_conversation().await.unwrap();
+        }
+        assert!(matches!(
+            gate.proxy.new_conversation().await,
+            Err(Error::LimitExceeded(_))
+        ));
     }
 
     #[tokio::test]

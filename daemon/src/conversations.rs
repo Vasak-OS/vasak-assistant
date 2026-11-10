@@ -948,3 +948,149 @@ mod owner_limit_tests {
         assert!(conversations.in_flight.is_empty());
     }
 }
+
+/// El cupo compartido de las aplicaciones confinadas (#32): se comparte el
+/// cupo, no la propiedad.
+#[cfg(test)]
+mod confined_quota_tests {
+    use super::*;
+
+    // Dos conexiones (dos nombres únicos) de un mismo proceso confinado.
+    const C1: &str = ":1.10";
+    const C2: &str = ":1.11";
+    const U1: &str = ":1.20";
+    const U2: &str = ":1.21";
+
+    fn texto(e: Error) -> String {
+        match e {
+            Error::NotFound(text) => text,
+            other => panic!("se esperaba NotFound, dio {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dos_conexiones_confinadas_no_abren_mas_del_maximo_confinado_entre_las_dos() {
+        let mut conversations = Conversations::default();
+        assert_eq!(MAX_CONVERSATIONS_CONFINED, 3);
+        conversations.create(C1, true).unwrap();
+        conversations.create(C2, true).unwrap();
+        conversations.create(C1, true).unwrap();
+
+        for owner in [C1, C2] {
+            assert!(
+                matches!(
+                    conversations.create(owner, true),
+                    Err(Error::LimitExceeded(_))
+                ),
+                "la cuarta de {owner} tenía que fallar"
+            );
+        }
+        assert_eq!(
+            conversations.count_for(C1) + conversations.count_for(C2),
+            MAX_CONVERSATIONS_CONFINED
+        );
+    }
+
+    #[test]
+    fn cerrar_una_confinada_devuelve_el_lugar_al_cupo_compartido() {
+        let mut conversations = Conversations::default();
+        let ids: Vec<String> = (0..MAX_CONVERSATIONS_CONFINED)
+            .map(|_| conversations.create(C1, true).unwrap())
+            .collect();
+        assert!(conversations.create(C2, true).is_err());
+
+        conversations.delete(C1, &ids[0]).unwrap();
+
+        assert!(conversations.create(C2, true).is_ok());
+    }
+
+    #[test]
+    fn dos_conexiones_confinadas_no_tienen_dos_chats_en_vuelo_a_la_vez() {
+        let mut conversations = Conversations::default();
+        let a = conversations.create(C1, true).unwrap();
+        let b = conversations.create(C2, true).unwrap();
+        assert_eq!(MAX_CHATS_IN_FLIGHT_CONFINED, 1);
+
+        conversations.begin_turn(C1, &a, "uno").unwrap();
+
+        assert!(matches!(
+            conversations.begin_turn(C2, &b, "dos"),
+            Err(Error::Busy(_))
+        ));
+        // Al terminar el primero, el lugar vuelve y el otro puede.
+        conversations.finish_turn(&a, "uno", Some("ok"));
+        assert!(conversations.begin_turn(C2, &b, "dos").is_ok());
+    }
+
+    #[test]
+    fn un_chat_sin_confinar_no_gasta_el_cupo_de_en_vuelo_de_los_confinados() {
+        let mut conversations = Conversations::default();
+        let libre = conversations.create(U1, false).unwrap();
+        let confinada = conversations.create(C1, true).unwrap();
+
+        conversations.begin_turn(U1, &libre, "uno").unwrap();
+
+        assert!(conversations.begin_turn(C1, &confinada, "dos").is_ok());
+    }
+
+    #[test]
+    fn sin_confinar_cada_dueno_conserva_su_tope_y_no_comparte_cupo() {
+        let mut conversations = Conversations::default();
+        let mut ids = Vec::new();
+        for owner in [U1, U2] {
+            for _ in 0..MAX_CONVERSATIONS_PER_OWNER {
+                ids.push((owner, conversations.create(owner, false).unwrap()));
+            }
+            assert!(matches!(
+                conversations.create(owner, false),
+                Err(Error::LimitExceeded(_))
+            ));
+        }
+        assert_eq!(MAX_CONVERSATIONS_PER_OWNER, 8);
+        // Dos chats en vuelo por dueño, el tercero da Busy; el otro dueño no se entera.
+        for owner in [U1, U2] {
+            let propias: Vec<&String> = ids
+                .iter()
+                .filter(|(o, _)| *o == owner)
+                .map(|(_, id)| id)
+                .collect();
+            assert_eq!(MAX_CHATS_IN_FLIGHT_PER_OWNER, 2);
+            conversations.begin_turn(owner, propias[0], "a").unwrap();
+            conversations.begin_turn(owner, propias[1], "b").unwrap();
+            assert!(matches!(
+                conversations.begin_turn(owner, propias[2], "c"),
+                Err(Error::Busy(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn compartir_el_cupo_no_comparte_la_propiedad_entre_confinados() {
+        let mut conversations = Conversations::default();
+        let id = conversations.create(C1, true).unwrap();
+        conversations.begin_turn(C1, &id, "secreto").unwrap();
+        conversations.finish_turn(&id, "secreto", Some("respuesta"));
+        let antes = conversations.history(C1, &id).unwrap();
+
+        // La otra conexión confinada no la lista, ni la lee, ni la cierra, ni chatea.
+        assert!(conversations.ids(C2).is_empty());
+        assert_eq!(conversations.count_for(C2), 0);
+        assert!(!conversations.contains(C2, &id));
+        let ajeno = texto(conversations.history(C2, &id).unwrap_err());
+        let inexistente = texto(
+            conversations
+                .history(C2, &Uuid::new_v4().to_string())
+                .unwrap_err(),
+        );
+        assert_eq!(ajeno, inexistente);
+        assert_eq!(texto(conversations.delete(C2, &id).unwrap_err()), ajeno);
+        assert_eq!(
+            texto(conversations.begin_turn(C2, &id, "intruso").unwrap_err()),
+            ajeno
+        );
+
+        // Y nada de eso la tocó ni la dejó ocupada.
+        assert_eq!(conversations.history(C1, &id).unwrap(), antes);
+        assert!(conversations.begin_turn(C1, &id, "yo").is_ok());
+    }
+}
