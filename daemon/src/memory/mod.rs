@@ -2674,6 +2674,47 @@ mod review_tests {
             .unwrap();
         assert_eq!(preferences(&memory).await, 9);
     }
+
+    /// Un corte en plena compactación deja `lince.compacting` entero junto a
+    /// la base: el directorio pasa el tope, la poda no lo toca (borra nodos, no
+    /// archivos) y antes la memoria quedaba sin escribir para siempre. Sólo la
+    /// compactación limpia ese temporal. No se pudo inflar la base misma con
+    /// espacio muerto que el checkpoint de Grafeo no devuelva: en esta versión
+    /// lo reclama siempre.
+    #[tokio::test]
+    async fn pasado_el_tope_por_un_temporal_de_compactacion_se_compacta_y_vuelve_a_escribir() {
+        let (tmp, memory) = enabled().await;
+        for n in 0..20 {
+            memory
+                .store(preference(&format!("Prefiere la cosa número {n}")), "c")
+                .await
+                .unwrap();
+        }
+        std::fs::write(
+            tmp.memory_dir().join(COMPACT_TMP),
+            vec![0u8; MAX_MEMORY_DISK_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        let wrote = memory
+            .store(preference("Prefiere lo que entra tras compactar"), "c")
+            .await
+            .unwrap();
+
+        assert!(wrote, "la memoria quedó sin escribir pasada del tope");
+        assert!(dir_size(&tmp.memory_dir()) < MAX_MEMORY_DISK_BYTES);
+        // La poda del 10 % saca dos de veinte; la compactación no pierde nada más.
+        assert_eq!(preferences(&memory).await, 19);
+        assert_eq!(
+            memory
+                .recall("compactar", false)
+                .await
+                .unwrap()
+                .matches("Prefiere lo que entra tras compactar")
+                .count(),
+            1
+        );
+    }
 }
 
 /// Olvidar una conversación borrada.
