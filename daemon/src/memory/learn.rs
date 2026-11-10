@@ -368,7 +368,14 @@ const STOPWORDS: &[&str] = &[
 /// y ese mensaje es chico. Un `Style` o una `Correction` pesan más que nada y
 /// se inyectan en todos los turnos, así que un texto pegado no tiene que poder
 /// plantar uno con palabras que la persona nunca dijo.
-pub fn derives_from_user(text: &str, last_user: &str) -> bool {
+/// Si un recuerdo extraído entra en la memoria: un `Style` o una `Correction`
+/// sólo si nacen de lo que dijo la persona (#10); las demás clases, siempre.
+pub fn item_is_grounded(kind: MemoryKind, text: &str, last_user: &str) -> bool {
+    !matches!(kind, MemoryKind::Style | MemoryKind::Correction)
+        || derives_from_user(text, last_user)
+}
+
+fn derives_from_user(text: &str, last_user: &str) -> bool {
     if last_user.len() > MAX_GROUNDING_USER_BYTES
         || last_user.lines().count() >= MAX_GROUNDING_USER_LINES
     {

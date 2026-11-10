@@ -423,10 +423,9 @@ impl Memory {
             // peso más alto, así que sólo se acepta si nace de lo que dijo la
             // persona —no de un texto pegado que el modelo haya convertido en
             // «preferencia»—.
-            extraction.items.retain(|item| {
-                !matches!(item.kind, MemoryKind::Style | MemoryKind::Correction)
-                    || learn::derives_from_user(&item.text, &last_user)
-            });
+            extraction
+                .items
+                .retain(|item| learn::item_is_grounded(item.kind, &item.text, &last_user));
             if extraction.items.is_empty() && extraction.summary.is_none() {
                 tracing::debug!(
                     conversation = %short_id(&conversation_id),
