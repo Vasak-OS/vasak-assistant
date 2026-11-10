@@ -1094,3 +1094,139 @@ mod delete_summaries_tests {
         assert_eq!(entries(&db, MemoryKind::Preference).len(), 1);
     }
 }
+
+/// Ver y borrar recuerdos sueltos por su `id`.
+#[cfg(test)]
+mod loose_tests {
+    use super::*;
+
+    const NOW: i64 = 1_800_000_000;
+
+    fn db() -> GrafeoDB {
+        let db = GrafeoDB::new_in_memory();
+        ensure_indexes(&db).unwrap();
+        db
+    }
+
+    fn add(db: &GrafeoDB, kind: MemoryKind, text: &str) -> NodeId {
+        upsert(
+            db,
+            &NewMemory {
+                kind,
+                text,
+                phrase: None,
+                conversation: None,
+            },
+            NOW,
+        )
+        .unwrap()
+    }
+
+    fn listed(db: &GrafeoDB) -> Vec<(MemoryKind, String)> {
+        let mut all: Vec<_> = list_all(db)
+            .into_iter()
+            .map(|(_, e)| (e.kind, e.text))
+            .collect();
+        all.sort_by(|a, b| a.1.cmp(&b.1));
+        all
+    }
+
+    #[test]
+    fn listar_trae_todos_los_recuerdos_de_todas_las_clases_cada_uno_con_su_id() {
+        let db = db();
+        add(&db, MemoryKind::Style, "Respuestas cortas");
+        add(&db, MemoryKind::Preference, "Prefiere el mate");
+        add(&db, MemoryKind::Topic, "Gatos");
+
+        let all = list_all(&db);
+
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().all(|(id, _)| !id.is_empty()));
+        let ids: HashSet<&String> = all.iter().map(|(id, _)| id).collect();
+        assert_eq!(ids.len(), 3, "los ids no se repiten");
+        assert_eq!(
+            listed(&db),
+            [
+                (MemoryKind::Topic, "Gatos".to_owned()),
+                (MemoryKind::Preference, "Prefiere el mate".to_owned()),
+                (MemoryKind::Style, "Respuestas cortas".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn listar_una_base_vacia_no_da_nada() {
+        assert!(list_all(&db()).is_empty());
+    }
+
+    #[test]
+    fn el_id_de_un_recuerdo_nuevo_se_lee_y_el_de_un_nodo_ajeno_no_existe() {
+        let db = db();
+        let node = add(&db, MemoryKind::Style, "Respuestas cortas");
+        let meta = db
+            .create_node_with_props(&["LinceMeta"], [("format", 1i64)])
+            .unwrap();
+
+        let id = node_id(&db, node).unwrap();
+
+        assert!(!id.is_empty());
+        assert_eq!(list_all(&db)[0].0, id);
+        assert!(node_id(&db, meta).is_none());
+    }
+
+    #[test]
+    fn borrar_por_id_saca_ese_recuerdo_y_deja_los_demas() {
+        let db = db();
+        let gone = add(&db, MemoryKind::Preference, "Prefiere el mate");
+        add(&db, MemoryKind::Style, "Respuestas cortas");
+        add(&db, MemoryKind::Topic, "Gatos");
+        let id = node_id(&db, gone).unwrap();
+
+        assert!(delete_by_id(&db, &id).unwrap());
+
+        assert!(entry(&db, gone).is_none());
+        assert!(node_id(&db, gone).is_none());
+        assert!(list_all(&db).iter().all(|(other, _)| *other != id));
+        assert_eq!(
+            listed(&db),
+            [
+                (MemoryKind::Topic, "Gatos".to_owned()),
+                (MemoryKind::Style, "Respuestas cortas".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn borrar_un_id_que_no_existe_da_false_y_no_toca_nada() {
+        let db = db();
+        add(&db, MemoryKind::Style, "Respuestas cortas");
+        add(&db, MemoryKind::Topic, "Gatos");
+        let before = listed(&db);
+
+        assert!(!delete_by_id(&db, "no-existe").unwrap());
+
+        assert_eq!(listed(&db), before);
+    }
+
+    #[test]
+    fn borrar_dos_veces_el_mismo_id_la_segunda_da_false() {
+        let db = db();
+        let node = add(&db, MemoryKind::Style, "Respuestas cortas");
+        let id = node_id(&db, node).unwrap();
+
+        assert!(delete_by_id(&db, &id).unwrap());
+        assert!(!delete_by_id(&db, &id).unwrap());
+    }
+
+    #[test]
+    fn borrar_por_id_no_borra_un_nodo_ajeno_que_comparte_el_id() {
+        let db = db();
+        let meta = db
+            .create_node_with_props(&["LinceMeta"], [("id", "ajeno")])
+            .unwrap();
+
+        assert!(!delete_by_id(&db, "ajeno").unwrap());
+
+        assert!(db.get_node(meta).is_some());
+    }
+}

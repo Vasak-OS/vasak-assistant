@@ -1644,6 +1644,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn listar_trae_los_recuerdos_con_el_nombre_de_su_clase_y_el_peso() {
+        let fixture = Fixture::enabled().await;
+        fixture
+            .memory
+            .store(preference("Prefiere el mate"), "c")
+            .await
+            .unwrap();
+
+        let all = fixture.memory.list_memories().await.unwrap();
+
+        assert_eq!(all.len(), 1);
+        assert!(!all[0].id.is_empty());
+        assert_eq!(all[0].kind, MemoryKind::Preference.label());
+        assert_eq!(all[0].text, "Prefiere el mate");
+        assert_eq!(all[0].weight, MemoryKind::Preference.initial_weight());
+    }
+
+    #[tokio::test]
+    async fn borrar_un_recuerdo_deja_los_otros_y_un_id_inexistente_da_ok() {
+        let fixture = Fixture::enabled().await;
+        for text in ["Prefiere el mate", "Prefiere respuestas cortas"] {
+            fixture.memory.store(preference(text), "c").await.unwrap();
+        }
+        let all = fixture.memory.list_memories().await.unwrap();
+        let gone = all.iter().find(|m| m.text == "Prefiere el mate").unwrap();
+
+        fixture.memory.delete_memory(&gone.id).await.unwrap();
+        fixture.memory.delete_memory("no-existe").await.unwrap();
+
+        let left = fixture.memory.list_memories().await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].text, "Prefiere respuestas cortas");
+    }
+
+    #[tokio::test]
+    async fn listar_y_borrar_con_la_memoria_apagada_no_dan_nada_ni_fallan() {
+        let fixture = Fixture::new();
+
+        assert!(fixture.memory.list_memories().await.unwrap().is_empty());
+        fixture.memory.delete_memory("x").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn listar_y_borrar_con_el_llavero_bloqueado_fallan_como_borrar_todo() {
+        let fixture = Fixture::enabled().await;
+        *fixture.keys.locked.lock() = true;
+
+        assert!(matches!(
+            fixture.memory.list_memories().await,
+            Err(Error::Unavailable(text)) if text.contains("bloqueado")
+        ));
+        assert!(matches!(
+            fixture.memory.delete_memory("x").await,
+            Err(Error::Unavailable(text)) if text.contains("bloqueado")
+        ));
+    }
+
+    #[tokio::test]
     async fn borrar_con_el_llavero_caido_no_toca_nada() {
         let fixture = Fixture::enabled().await;
         let before = bytes_under(&fixture.files());
