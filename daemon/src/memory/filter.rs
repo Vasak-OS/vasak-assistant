@@ -175,6 +175,7 @@ pub fn is_clean_note(text: &str) -> bool {
         && !mentions_credentials(text)
         && !contains_secret(text)
         && !is_user_data(text)
+        && !mentions_sensitive(text)
 }
 
 /// Si `c` es de formato (Cf), separador de línea o de párrafo (Zl, Zp), de uso
@@ -375,6 +376,154 @@ pub fn mentions_credentials(text: &str) -> bool {
         .any(|word| CREDENTIAL_WORDS.contains(&word))
 }
 
+/// Categorías de datos sensibles que la memoria no necesita para saber cómo
+/// hablarle a la persona —salud, religión, orientación sexual, afiliación
+/// política—. Van normalizadas (sin tildes, en minúsculas) para compararse
+/// contra [`normalize_terms`]. Ante la duda se descarta, como el resto de
+/// `filter`: la lista prefiere descartar una nota legítima a guardar un dato
+/// de categoría especial.
+const SENSITIVE_WORDS: &[&str] = &[
+    // Salud
+    "diabetes",
+    "diabetico",
+    "diabetica",
+    "cancer",
+    "oncologico",
+    "tumor",
+    "vih",
+    "sida",
+    "hiv",
+    "depresion",
+    "ansiedad",
+    "bipolar",
+    "esquizofrenia",
+    "discapacidad",
+    "discapacitado",
+    "discapacitada",
+    "embarazo",
+    "embarazada",
+    "medicacion",
+    "medicado",
+    "medicada",
+    "diagnostico",
+    "enfermedad",
+    "cronica",
+    "psiquiatra",
+    "psiquiatrico",
+    // Religión
+    "catolico",
+    "catolica",
+    "cristiano",
+    "cristiana",
+    "evangelico",
+    "evangelica",
+    "judio",
+    "judia",
+    "musulman",
+    "musulmana",
+    "islam",
+    "islamico",
+    "ateo",
+    "atea",
+    "agnostico",
+    "budista",
+    "iglesia",
+    "parroquia",
+    "sinagoga",
+    "mezquita",
+    "religion",
+    "religioso",
+    "religiosa",
+    "misa",
+    "creyente",
+    // Orientación sexual
+    "gay",
+    "lesbiana",
+    "lesbico",
+    "bisexual",
+    "homosexual",
+    "heterosexual",
+    "hetero",
+    "trans",
+    "transexual",
+    "transgenero",
+    "queer",
+    // Afiliación política
+    "peronista",
+    "peronismo",
+    "kirchnerista",
+    "kirchnerismo",
+    "macrista",
+    "macrismo",
+    "socialista",
+    "socialismo",
+    "comunista",
+    "comunismo",
+    "troskista",
+    "trotskista",
+    "trotskismo",
+    "anarquista",
+    "anarquismo",
+    "libertario",
+    "militante",
+    "militancia",
+    "milito",
+    "milita",
+    "militamos",
+    "militan",
+    "militas",
+];
+
+/// Frases que delatan una categoría sensible sin nombrar un término suelto de
+/// [`SENSITIVE_WORDS`] (una creencia dicha como oración). Se buscan sobre el
+/// texto plegado, que colapsa los espacios, así que van con un solo espacio.
+const SENSITIVE_PHRASES: &[&str] = &["creo en dios", "cree en dios"];
+
+/// Un domicilio: un tipo de vía, el nombre y la altura («Av. Corrientes 1234»).
+/// No busca ser exhaustivo; con el tipo de vía por delante alcanza para la
+/// forma común, y ante la duda se descarta.
+static ADDRESS: LazyLock<Regex> = LazyLock::new(|| {
+    regex(concat!(
+        r"(?i)\b(?:av|avda|avenida|calle|pasaje|psje|diagonal|diag|ruta|camino",
+        r"|boulevard|bulevar|bv)\.?\s+\w+(?:\s+\w+){0,3}\s+\d{1,5}\b",
+    ))
+});
+
+/// Si el texto nombra una categoría sensible (salud, religión, orientación
+/// sexual, afiliación política) o un domicilio. Como [`is_user_data`], son
+/// datos de la persona que la memoria descarta.
+pub fn mentions_sensitive(text: &str) -> bool {
+    // Mismo plegado que `contains_secret`/`is_user_data` (NFKC + sin tildes +
+    // homoglifos cirílicos a latín): en `extraction_window`, que no pasa por la
+    // lista blanca de `is_clean_note`, un término en ancho completo o escrito
+    // con letras cirílicas no tiene que esquivar el filtro.
+    let folded: String = normalize_terms(&nfkc(text))
+        .chars()
+        .map(cyrillic_to_latin)
+        .collect();
+    folded
+        .split(|c: char| !c.is_alphanumeric())
+        .any(is_sensitive_word)
+        || SENSITIVE_PHRASES
+            .iter()
+            .any(|phrase| folded.contains(phrase))
+        || ADDRESS.is_match(&folded)
+        || ADDRESS.is_match(&nfkc(text))
+}
+
+/// Una palabra sensible, también en plural: el español lo forma con `-s` o
+/// `-es`, así que se mira la palabra y su forma sin ese sufijo. No es prefijo
+/// amplio —sólo quita el plural— y sólo cuenta si el singular está en la lista.
+fn is_sensitive_word(word: &str) -> bool {
+    SENSITIVE_WORDS.contains(&word)
+        || word
+            .strip_suffix("es")
+            .is_some_and(|singular| SENSITIVE_WORDS.contains(&singular))
+        || word
+            .strip_suffix('s')
+            .is_some_and(|singular| SENSITIVE_WORDS.contains(&singular))
+}
+
 /// Los términos con los que se indexa y se busca: descompuesto (NFD), sin
 /// diacríticos, en minúsculas y con los espacios colapsados.
 pub fn normalize_terms(text: &str) -> String {
@@ -544,6 +693,110 @@ mod tests {
 #[cfg(test)]
 mod hardening_tests {
     use super::*;
+
+    #[test]
+    fn cada_categoria_sensible_se_detecta_y_la_nota_se_descarta() {
+        for frase in [
+            "tengo diabetes",
+            "estoy en tratamiento psiquiátrico",
+            "soy discapacitado",
+            "soy católico",
+            "voy a misa los domingos",
+            "soy gay",
+            "mi novia es bisexual",
+            "soy peronista",
+            "milito en el socialismo",
+            "SOY CATÓLICO",
+        ] {
+            assert!(mentions_sensitive(frase), "{frase}");
+            assert!(!is_clean_note(frase), "{frase}");
+        }
+    }
+
+    #[test]
+    fn un_termino_sensible_disfrazado_de_ancho_completo_o_cirilico_se_detecta() {
+        for frase in [
+            "soy ｃａｔólico",
+            // «católico» con с, а y о cirílicas
+            "soy \u{441}\u{430}t\u{43e}lico",
+            // «peronista» con р, е y о cirílicas
+            "soy \u{440}\u{435}r\u{43e}nista",
+        ] {
+            assert!(mentions_sensitive(frase), "{frase}");
+        }
+    }
+
+    #[test]
+    fn los_plurales_de_un_termino_sensible_se_detectan() {
+        for frase in [
+            "somos peronistas",
+            "vamos a la iglesia los católicos",
+            "hay muchos musulmanes",
+        ] {
+            assert!(mentions_sensitive(frase), "{frase}");
+            assert!(!is_clean_note(frase), "{frase}");
+        }
+    }
+
+    #[test]
+    fn las_frases_de_creencia_se_detectan() {
+        for frase in ["creo en dios", "mi viejo cree en dios", "soy creyente"] {
+            assert!(mentions_sensitive(frase), "{frase}");
+            assert!(!is_clean_note(frase), "{frase}");
+        }
+    }
+
+    #[test]
+    fn un_domicilio_con_el_tipo_de_via_en_cirilico_se_detecta() {
+        // «Аv.» con А cirílica
+        let frase = "vivo en \u{410}v. Corrientes 1234";
+        assert!(mentions_sensitive(frase), "{frase}");
+    }
+
+    #[test]
+    fn la_de_pluralizacion_no_rompe_notas_legitimas() {
+        for frase in [
+            "me gustan los lunes",
+            "prefiero los mensajes cortos",
+            "usa los atajos de teclado",
+        ] {
+            assert!(!mentions_sensitive(frase), "{frase}");
+            assert!(is_clean_note(frase), "{frase}");
+        }
+    }
+
+    #[test]
+    fn un_domicilio_se_detecta_y_la_nota_se_descarta() {
+        for frase in [
+            "vivo en Av. Corrientes 1234",
+            "mi casa es calle Falsa 123",
+            "Avenida Siempreviva 742",
+        ] {
+            assert!(mentions_sensitive(frase), "{frase}");
+            assert!(!is_clean_note(frase), "{frase}");
+        }
+    }
+
+    #[test]
+    fn lo_que_no_es_sensible_ni_domicilio_pasa() {
+        for frase in [
+            "prefiero que me hables de vos",
+            "me gusta el mate amargo",
+            "soy ingeniero",
+            "trabajo de noche",
+            "prefiere respuestas cortas",
+        ] {
+            assert!(!mentions_sensitive(frase), "{frase}");
+            assert!(is_clean_note(frase), "{frase}");
+        }
+    }
+
+    #[test]
+    fn el_dato_sensible_pegado_en_medio_de_otro_texto_se_detecta() {
+        let pegado = "Resumen del documento: ítem uno, el autor es peronista, ítem tres";
+        assert!(mentions_sensitive(pegado));
+        assert!(!is_clean_note(pegado));
+    }
 
     #[test]
     fn cada_clase_de_caracter_prohibido_se_detecta() {

@@ -11,7 +11,9 @@ use serde::Deserialize;
 use serde_json::json;
 use vasak_assistant_protocol::{Message, Role};
 
-use super::filter::{contains_secret, is_clean_note, is_user_data, nfkc, normalize_terms};
+use super::filter::{
+    contains_secret, is_clean_note, is_user_data, mentions_sensitive, nfkc, normalize_terms,
+};
 use super::schema::{MemoryKind, MAX_ABOUT, MAX_PHRASE_BYTES};
 
 /// Cuántos recuerdos se aceptan de una extracción.
@@ -106,7 +108,9 @@ pub fn extraction_window(exchange: &[Message], gate: Gate) -> Option<(Vec<Messag
         if message.role == Role::System {
             continue;
         }
-        let tainted = contains_secret(&message.content) || is_user_data(&message.content);
+        let tainted = contains_secret(&message.content)
+            || is_user_data(&message.content)
+            || mentions_sensitive(&message.content);
         if message.role == Role::User
             && (tainted
                 || message.content.len() > MAX_SUMMARY_USER_BYTES
@@ -705,6 +709,56 @@ mod hardening_tests {
 
             assert!(!contents(&window).contains(&tainted), "{tainted}");
             assert_eq!(contents(&window), ["ok", "prefiero el mate", "anotado"]);
+        }
+    }
+
+    #[test]
+    fn un_mensaje_con_un_dato_sensible_no_entra_a_la_ventana_ni_deja_resumir() {
+        for tainted in [
+            "tengo diabetes",
+            "soy peronista",
+            "vivo en Av. Corrientes 1234",
+        ] {
+            let exchange = vec![
+                user(tainted),
+                assistant("ok"),
+                user("prefiero el mate"),
+                assistant("anotado"),
+            ];
+
+            let (window, gate) = extraction_window(&exchange, BOTH).unwrap();
+
+            assert!(!contents(&window).contains(&tainted), "{tainted}");
+            assert_eq!(contents(&window), ["ok", "prefiero el mate", "anotado"]);
+            assert!(!gate.summary, "{tainted}");
+        }
+    }
+
+    #[test]
+    fn un_dato_sensible_disfrazado_tampoco_entra_a_la_ventana() {
+        for tainted in ["soy ｃａｔólico", "soy \u{440}\u{435}r\u{43e}nista"] {
+            let exchange = vec![user(tainted), assistant("ok"), user("prefiero el mate")];
+
+            let (window, gate) = extraction_window(&exchange, BOTH).unwrap();
+
+            assert!(!contents(&window).contains(&tainted), "{tainted}");
+            assert!(!gate.summary, "{tainted}");
+        }
+    }
+
+    #[test]
+    fn un_domicilio_en_cirilico_o_un_plural_sensible_no_entra_a_la_ventana() {
+        for tainted in [
+            "vivo en \u{410}v. Corrientes 1234",
+            "somos peronistas",
+            "creo en dios",
+        ] {
+            let exchange = vec![user(tainted), assistant("ok"), user("prefiero el mate")];
+
+            let (window, gate) = extraction_window(&exchange, BOTH).unwrap();
+
+            assert!(!contents(&window).contains(&tainted), "{tainted}");
+            assert!(!gate.summary, "{tainted}");
         }
     }
 

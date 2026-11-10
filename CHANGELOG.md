@@ -2,6 +2,17 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-assistant 0.3.11
+
+La memoria no guarda datos de categoría especial ni domicilios (#11).
+
+- **`daemon`** — `filter::mentions_sensitive` descarta los recuerdos que nombran
+  salud, religión, orientación sexual o afiliación política, o un domicilio
+  (tipo de vía + nombre + altura). Se aplica como `is_user_data`: en la puerta
+  de la nota (`is_clean_note`) y antes de extraer (`extraction_window`), con el
+  mismo plegado NFKC / sin tildes / homoglifos cirílicos que el resto de los
+  filtros. Ante la duda se descarta.
+
 ## vasak-assistant 0.3.10
 
 Lo de un turno no se aprende en una memoria que se borró mientras se respondía
