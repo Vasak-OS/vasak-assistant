@@ -2677,34 +2677,81 @@ mod forget_tests {
         backend.wait_for_calls(1).await;
     }
 
-    #[tokio::test]
-    async fn con_la_memoria_apagada_no_se_toca_la_base_y_el_resumen_queda() {
-        let (tmp, memory) = enabled().await;
-        memory.store(summary("Resumen de A"), "a").await.unwrap();
-        memory.set_enabled(false).await.unwrap();
-        let files = |dir: &Path| -> Vec<(PathBuf, Vec<u8>)> {
-            fn walk(path: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
-                for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
-                    let p = entry.path();
-                    if p.is_dir() {
-                        walk(&p, out);
-                    } else {
-                        out.push((p.clone(), std::fs::read(&p).unwrap()));
-                    }
+    /// Contenido de todos los archivos bajo `dir`, para probar que no se escribió nada.
+    fn files(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn walk(path: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+            for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else {
+                    out.push((p.clone(), std::fs::read(&p).unwrap()));
                 }
             }
-            let mut out = Vec::new();
-            walk(dir, &mut out);
-            out.sort();
-            out
-        };
+        }
+        let mut out = Vec::new();
+        walk(dir, &mut out);
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn con_la_memoria_apagada_no_se_escribe_y_el_resumen_se_borra_al_re_encender() {
+        let (tmp, memory) = enabled().await;
+        memory.store(summary("Resumen de A"), "a").await.unwrap();
+        memory.store(summary("Resumen de B"), "b").await.unwrap();
+        memory.set_enabled(false).await.unwrap();
         let before = files(&tmp.memory_dir());
 
         memory.forget_conversation("a").await;
 
+        // Apagada no se escribe nada (decisión 10).
         assert_eq!(files(&tmp.memory_dir()), before);
         memory.set_enabled(true).await.unwrap();
-        assert_eq!(summaries(&memory).await, ["Resumen de A"]);
+        // El borrado pendiente se aplica al reabrir; el de B queda intacto.
+        assert_eq!(summaries(&memory).await, ["Resumen de B"]);
+    }
+
+    #[tokio::test]
+    async fn con_el_llavero_bloqueado_el_borrado_queda_pendiente_y_se_aplica_al_desbloquear() {
+        let tmp = TempDir::new();
+        let keys = FixedKey::new(None);
+        let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
+        memory.set_enabled(true).await.unwrap();
+        memory.store(summary("Resumen de A"), "a").await.unwrap();
+        memory.store(summary("Resumen de B"), "b").await.unwrap();
+        memory.close().await;
+        *keys.locked.lock() = true;
+        let before = files(&tmp.memory_dir());
+
+        memory.forget_conversation("a").await;
+
+        // Bloqueado no se pudo abrir: la base no se tocó.
+        assert_eq!(files(&tmp.memory_dir()), before);
+        *keys.locked.lock() = false;
+        // La próxima apertura drena el borrado.
+        assert_eq!(summaries(&memory).await, ["Resumen de B"]);
+    }
+
+    #[tokio::test]
+    async fn encolar_el_mismo_borrado_dos_veces_no_lo_duplica_y_la_cola_tiene_tope() {
+        let (_tmp, memory) = enabled().await;
+        memory.set_enabled(false).await.unwrap();
+
+        memory.forget_conversation("a").await;
+        memory.forget_conversation("a").await;
+        assert_eq!(memory.pending_deletes.lock().len(), 1);
+
+        for n in 0..(MAX_PENDING_DELETES + 10) {
+            memory.forget_conversation(&format!("c{n}")).await;
+        }
+        let pending = memory.pending_deletes.lock();
+        assert_eq!(pending.len(), MAX_PENDING_DELETES);
+        // Se descartan los más viejos, queda el último.
+        assert!(!pending.iter().any(|id| id == "a"));
+        assert!(pending
+            .iter()
+            .any(|id| *id == format!("c{}", MAX_PENDING_DELETES + 9)));
     }
 
     #[tokio::test]
@@ -3046,7 +3093,7 @@ mod log_tests {
 
         broken.forget_conversation("c1").await;
 
-        let l = line(&log, &["no se borraron los resúmenes de la conversación"]);
+        let l = line(&log, &["quedan pendientes de borrado"]);
         assert!(l.contains("WARN"), "{l}");
     }
 
