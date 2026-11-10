@@ -386,17 +386,32 @@ pub async fn verify_service_owner(connection: &zbus::Connection) -> Result<(), E
             ))
         })?;
 
-    // `/proc/<pid>/cgroup` es un pseudo-archivo del kernel: la lectura no toca
-    // disco y vuelve enseguida, así que `std::fs` acá no bloquea el runtime (y
-    // mantiene este crate sin dependencia de tokio, que lo usan clientes de
-    // cualquier versión de zbus).
-    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
-        .map_err(|error| deny(format!("no se pudo leer el cgroup del pid {pid}: {error}")))?;
+    owner_runs_service(pid, read_proc_cgroup)
+}
 
+/// Lee `/proc/<pid>/cgroup`. `std::fs` síncrono a propósito, y aparte de la
+/// `async fn`: es un pseudo-archivo del kernel, la lectura no toca disco ni
+/// bloquea, y así el crate no arrastra un runtime async (lo usan clientes de
+/// cualquier versión de zbus).
+fn read_proc_cgroup(pid: u32) -> std::io::Result<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+}
+
+/// Con el pid del dueño del nombre ya resuelto: lee su cgroup con `read_cgroup`
+/// y comprueba que corre dentro de [`SERVICE_UNIT`]. La decisión está separada
+/// de la resolución por el bus para poder probarla con un lector de prueba.
+/// Falla cerrado: si el cgroup no se puede leer o no es el unit, `AccessDenied`.
+fn owner_runs_service(
+    pid: u32,
+    read_cgroup: impl FnOnce(u32) -> std::io::Result<String>,
+) -> Result<(), Error> {
+    let cgroup = read_cgroup(pid).map_err(|error| {
+        Error::AccessDenied(format!("no se pudo leer el cgroup del pid {pid}: {error}"))
+    })?;
     if cgroup_is_service(&cgroup, SERVICE_UNIT) {
         Ok(())
     } else {
-        Err(deny(format!(
+        Err(Error::AccessDenied(format!(
             "el dueño de {SERVICE_NAME} (pid {pid}) no corre dentro de {SERVICE_UNIT}: \
              no es el servicio del asistente"
         )))
