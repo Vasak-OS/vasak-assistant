@@ -49,6 +49,14 @@ pub const SERVICE_NAME: &str = "ar.net.vasak.os.Assistant";
 pub const SERVICE_PATH: &str = "/ar/net/vasak/os/Assistant";
 pub const SERVICE_INTERFACE: &str = "ar.net.vasak.os.Assistant";
 
+/// El unit de systemd que provee el servicio. La activación por D-Bus mapea
+/// [`SERVICE_NAME`] a este unit (`packaging/ar.net.vasak.os.Assistant.service`,
+/// `SystemdService=`), así que el proceso que de verdad es dueño del nombre
+/// corre dentro de su cgroup. Es el ancla con la que un cliente comprueba que
+/// le está hablando al demonio real y no a un impostor que reclamó el nombre
+/// antes ([`verify_service_owner`], [`cgroup_is_service`]).
+pub const SERVICE_UNIT: &str = "vasak-assistant.service";
+
 // ── Límites ───────────────────────────────────────────────────────────────────
 //
 // Están en el contrato y no escondidos en el servicio para que un cliente pueda
@@ -255,6 +263,139 @@ pub enum Error {
     /// Quien llama no puede hacer eso: una aplicación confinada (AppArmor) no
     /// enciende, apaga ni borra la memoria, ni guarda o consulta claves.
     AccessDenied(String),
+}
+
+// ── Verificar al dueño del nombre ─────────────────────────────────────────────
+//
+// El demonio pide [`SERVICE_NAME`] sin reemplazo ni cola: si un proceso de la
+// sesión reclama ese nombre antes de que el servicio arranque, el servicio no
+// levanta y los clientes le mandarían las conversaciones al impostor. Antes de
+// hablarle, un cliente resuelve quién es el dueño del nombre y comprueba que su
+// proceso corre dentro del cgroup de [`SERVICE_UNIT`]: sólo el unit de systemd
+// activado por D-Bus está ahí.
+
+/// Decide, a partir del contenido de `/proc/<pid>/cgroup`, si el proceso corre
+/// dentro del cgroup del unit `unit` (p. ej. [`SERVICE_UNIT`]).
+///
+/// Es una función **pura y sin dependencias de zbus** a propósito: el escritorio
+/// está clavado en zbus 4 y replica el proxy a mano (ver el doc del proxy más
+/// abajo), así que puede reusar esta misma lógica resolviendo el dueño y su pid
+/// con su propia versión de zbus y pasándole acá el contenido del cgroup.
+///
+/// # Qué acepta y por qué (esto es de seguridad)
+///
+/// Formato de `/proc/<pid>/cgroup`: una línea por jerarquía,
+/// `jerarquía:controladores:/ruta`; en cgroup v2 una sola línea `0::/ruta`.
+/// Devuelve `true` si **el último segmento** de alguna de esas rutas es
+/// exactamente `unit`. El proceso principal de un unit simple (el demonio es
+/// `Type=exec`) vive directamente en el cgroup del unit, así que su ruta termina
+/// en `/<unit>` —por ejemplo `/user.slice/user-1000.slice/user@1000.service/
+/// app.slice/vasak-assistant.service`—.
+///
+/// Se compara el **segmento completo**, no un prefijo ni «contiene»: así
+/// `…/vasak-assistant.service.evil` no pasa, y tampoco un unit distinto que lo
+/// tenga como ancestro. Ante cualquier entrada rara (vacío, línea sin `:`, ruta
+/// sin ese segmento) devuelve `false`: **falla cerrado**, no confía.
+///
+/// # Límites conocidos (para la revisión de seguridad)
+///
+/// - **No distingue el unit activado por D-Bus de uno transitorio del mismo
+///   nombre.** Un usuario puede crear `systemd-run --user
+///   --unit=vasak-assistant.service …`, cuyo cgroup termina en el mismo
+///   segmento. El cgroup no lleva esa procedencia, así que esto no se puede
+///   cerrar sólo con la ruta; sube la barrera (ya no alcanza un proceso
+///   cualquiera: tiene que ser un unit de systemd con ese nombre exacto), no la
+///   elimina.
+/// - **Anidamiento.** Si systemd alguna vez deja el proceso principal en un
+///   sub-cgroup por debajo del unit (p. ej. `Delegate=yes`), esto lo rechaza
+///   (falla cerrado, rompe la verificación en vez de aceptar de más). El unit
+///   actual no delega, así que no pasa; si cambiara, se relaja acá.
+pub fn cgroup_is_service(cgroup_file: &str, unit: &str) -> bool {
+    if unit.is_empty() {
+        return false;
+    }
+    cgroup_file.lines().any(|line| {
+        // La ruta es todo lo que sigue al segundo ':'. `splitn(3, ':')` deja el
+        // resto intacto aunque la ruta tuviera algún ':'. Sin dos ':' la línea
+        // no es del formato esperado.
+        let Some(path) = line.splitn(3, ':').nth(2) else {
+            return false;
+        };
+        path.rsplit('/').next() == Some(unit)
+    })
+}
+
+/// Comprueba que el dueño de [`SERVICE_NAME`] en el bus es el demonio real
+/// —su proceso corre dentro del cgroup de [`SERVICE_UNIT`]— antes de confiarle
+/// una conversación.
+///
+/// Resuelve el dueño único del nombre (`GetNameOwner`), obtiene su pid
+/// (`GetConnectionUnixProcessID`), lee `/proc/<pid>/cgroup` y le aplica
+/// [`cgroup_is_service`]. `Ok(())` si coincide.
+///
+/// # Cuándo llamarla
+///
+/// Una vez, al construir el cliente del asistente o justo antes de abrir la
+/// primera conversación. No hace falta repetirla en cada llamada.
+///
+/// # Límites
+///
+/// Es una comprobación **puntual**: entre que se verifica y que se le habla, el
+/// dueño podría cambiar, o el pid podría reusarse (TOCTOU). Se acepta como
+/// límite conocido. Para los otros, ver [`cgroup_is_service`].
+///
+/// **Fuera de systemd (desarrollo):** si el demonio se corrió a mano desde una
+/// terminal, su cgroup no es el del unit y esto falla —correctamente: reporta
+/// la verdad—. No hay ningún bypass por variable de entorno.
+///
+/// # Falla cerrado
+///
+/// Si no se puede resolver el dueño (nadie tiene el nombre), leer su pid o leer
+/// el cgroup, devuelve `Err` ([`Error::AccessDenied`]) con el motivo: ante la
+/// duda, no se confía. La variante es `AccessDenied` también cuando el dueño
+/// existe pero no es el unit: el cliente no debe hablarle en ningún caso.
+pub async fn verify_service_owner(connection: &zbus::Connection) -> Result<(), Error> {
+    use zbus::names::BusName;
+
+    let deny = |motivo: String| Error::AccessDenied(motivo);
+
+    let bus = zbus::fdo::DBusProxy::new(connection)
+        .await
+        .map_err(|error| deny(format!("no se pudo contactar al bus de sesión: {error}")))?;
+
+    let service = BusName::try_from(SERVICE_NAME)
+        .map_err(|error| deny(format!("nombre de servicio inválido: {error}")))?;
+
+    let owner = bus.get_name_owner(service).await.map_err(|error| {
+        deny(format!(
+            "nadie es dueño de {SERVICE_NAME}: el asistente no está en el bus ({error})"
+        ))
+    })?;
+
+    let pid = bus
+        .get_connection_unix_process_id(BusName::Unique(owner.into()))
+        .await
+        .map_err(|error| {
+            deny(format!(
+                "no se pudo leer el pid del dueño de {SERVICE_NAME}: {error}"
+            ))
+        })?;
+
+    // `/proc/<pid>/cgroup` es un pseudo-archivo del kernel: la lectura no toca
+    // disco y vuelve enseguida, así que `std::fs` acá no bloquea el runtime (y
+    // mantiene este crate sin dependencia de tokio, que lo usan clientes de
+    // cualquier versión de zbus).
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .map_err(|error| deny(format!("no se pudo leer el cgroup del pid {pid}: {error}")))?;
+
+    if cgroup_is_service(&cgroup, SERVICE_UNIT) {
+        Ok(())
+    } else {
+        Err(deny(format!(
+            "el dueño de {SERVICE_NAME} (pid {pid}) no corre dentro de {SERVICE_UNIT}: \
+             no es el servicio del asistente"
+        )))
+    }
 }
 
 // ── El proxy, para quien esté en zbus 5 ───────────────────────────────────────
