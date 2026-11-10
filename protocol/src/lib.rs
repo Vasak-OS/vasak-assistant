@@ -818,4 +818,100 @@ mod tests {
             }
         }
     }
+    mod lectura_real {
+        use super::*;
+
+        #[test]
+        fn el_cgroup_del_propio_proceso_se_lee() {
+            let cgroup = read_proc_cgroup(std::process::id()).unwrap();
+            assert!(cgroup.contains('/'), "{cgroup}");
+        }
+
+        #[test]
+        fn el_proceso_de_prueba_no_es_el_unit() {
+            let pid = std::process::id();
+            assert!(matches!(
+                owner_runs_service(pid, read_proc_cgroup),
+                Err(Error::AccessDenied(_))
+            ));
+        }
+
+        #[test]
+        fn un_pid_inexistente_no_se_puede_leer() {
+            assert!(read_proc_cgroup(u32::MAX).is_err());
+        }
+
+        /// Un `org.freedesktop.DBus` de mentira: lo que responde cada método
+        /// lo decide la prueba.
+        struct FakeBus {
+            owner: Option<&'static str>,
+            pid: Option<u32>,
+        }
+
+        #[zbus::interface(name = "org.freedesktop.DBus")]
+        impl FakeBus {
+            fn get_name_owner(&self, _name: String) -> zbus::fdo::Result<String> {
+                self.owner
+                    .map(String::from)
+                    .ok_or_else(|| zbus::fdo::Error::NameHasNoOwner("sin dueño".into()))
+            }
+
+            #[zbus(name = "GetConnectionUnixProcessID")]
+            fn get_connection_unix_process_id(&self, _name: String) -> zbus::fdo::Result<u32> {
+                self.pid
+                    .ok_or_else(|| zbus::fdo::Error::Failed("sin pid".into()))
+            }
+        }
+
+        async fn verificar_contra(bus: FakeBus) -> Result<(), Error> {
+            let (a, b) = tokio::net::UnixStream::pair().unwrap();
+            let server = zbus::connection::Builder::unix_stream(a)
+                .server(zbus::Guid::generate())
+                .unwrap()
+                .p2p()
+                .serve_at("/org/freedesktop/DBus", bus)
+                .unwrap()
+                .build();
+            let client = zbus::connection::Builder::unix_stream(b).p2p().build();
+            let (_server, client) = tokio::try_join!(server, client).unwrap();
+            verify_service_owner(&client).await
+        }
+
+        fn motivo(resultado: Result<(), Error>) -> String {
+            match resultado {
+                Err(Error::AccessDenied(motivo)) => motivo,
+                otro => panic!("se esperaba AccessDenied, vino {otro:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn si_nadie_es_duenio_del_nombre_falla_cerrado() {
+            let bus = FakeBus {
+                owner: None,
+                pid: None,
+            };
+            let m = motivo(verificar_contra(bus).await);
+            assert!(m.contains("nadie es dueño"), "{m}");
+        }
+
+        #[tokio::test]
+        async fn si_no_se_puede_leer_el_pid_falla_cerrado() {
+            let bus = FakeBus {
+                owner: Some(":1.9"),
+                pid: None,
+            };
+            let m = motivo(verificar_contra(bus).await);
+            assert!(m.contains("pid del dueño"), "{m}");
+        }
+
+        #[tokio::test]
+        async fn un_duenio_que_no_corre_en_el_unit_se_niega() {
+            let bus = FakeBus {
+                owner: Some(":1.9"),
+                pid: Some(std::process::id()),
+            };
+            let m = motivo(verificar_contra(bus).await);
+            assert!(m.contains("no es el servicio del asistente"), "{m}");
+        }
+    }
 }
