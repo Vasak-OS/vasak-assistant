@@ -49,6 +49,14 @@ pub const SERVICE_NAME: &str = "ar.net.vasak.os.Assistant";
 pub const SERVICE_PATH: &str = "/ar/net/vasak/os/Assistant";
 pub const SERVICE_INTERFACE: &str = "ar.net.vasak.os.Assistant";
 
+/// El unit de systemd que provee el servicio. La activación por D-Bus mapea
+/// [`SERVICE_NAME`] a este unit (`packaging/ar.net.vasak.os.Assistant.service`,
+/// `SystemdService=`), así que el proceso que de verdad es dueño del nombre
+/// corre dentro de su cgroup. Es el ancla con la que un cliente comprueba que
+/// le está hablando al demonio real y no a un impostor que reclamó el nombre
+/// antes ([`verify_service_owner`], [`cgroup_is_service`]).
+pub const SERVICE_UNIT: &str = "vasak-assistant.service";
+
 // ── Límites ───────────────────────────────────────────────────────────────────
 //
 // Están en el contrato y no escondidos en el servicio para que un cliente pueda
@@ -255,6 +263,159 @@ pub enum Error {
     /// Quien llama no puede hacer eso: una aplicación confinada (AppArmor) no
     /// enciende, apaga ni borra la memoria, ni guarda o consulta claves.
     AccessDenied(String),
+}
+
+// ── Verificar al dueño del nombre ─────────────────────────────────────────────
+//
+// El demonio pide [`SERVICE_NAME`] sin reemplazo ni cola: si un proceso de la
+// sesión reclama ese nombre antes de que el servicio arranque, el servicio no
+// levanta y los clientes le mandarían las conversaciones al impostor. Antes de
+// hablarle, un cliente resuelve quién es el dueño del nombre y comprueba que su
+// proceso corre dentro del cgroup de [`SERVICE_UNIT`]: sólo el unit de systemd
+// activado por D-Bus está ahí.
+
+/// Decide, a partir del contenido de `/proc/<pid>/cgroup`, si el proceso corre
+/// dentro del cgroup del unit `unit` (p. ej. [`SERVICE_UNIT`]).
+///
+/// Es una función **pura y sin dependencias de zbus** a propósito: el escritorio
+/// está clavado en zbus 4 y replica el proxy a mano (ver el doc del proxy más
+/// abajo), así que puede reusar esta misma lógica resolviendo el dueño y su pid
+/// con su propia versión de zbus y pasándole acá el contenido del cgroup.
+///
+/// # Qué acepta y por qué (esto es de seguridad)
+///
+/// Formato de `/proc/<pid>/cgroup`: una línea por jerarquía,
+/// `jerarquía:controladores:/ruta`; en cgroup v2 una sola línea `0::/ruta`.
+/// Devuelve `true` si **el último segmento** de alguna de esas rutas es
+/// exactamente `unit`. El proceso principal de un unit simple (el demonio es
+/// `Type=exec`) vive directamente en el cgroup del unit, así que su ruta termina
+/// en `/<unit>` —por ejemplo `/user.slice/user-1000.slice/user@1000.service/
+/// app.slice/vasak-assistant.service`—.
+///
+/// Se compara el **segmento completo**, no un prefijo ni «contiene»: así
+/// `…/vasak-assistant.service.evil` no pasa, y tampoco un unit distinto que lo
+/// tenga como ancestro. Ante cualquier entrada rara (vacío, línea sin `:`, ruta
+/// sin ese segmento) devuelve `false`: **falla cerrado**, no confía.
+///
+/// # Límites conocidos (para la revisión de seguridad)
+///
+/// - **No distingue el unit real de un cgroup forjado con el mismo nombre.**
+///   Bajo el gestor de usuario de systemd (cgroup v2), el subárbol
+///   `user@<uid>.service` está delegado y es propiedad del UID: cualquier
+///   proceso del mismo usuario puede crear un cgroup hijo llamado
+///   `vasak-assistant.service` y escribir su pid en `cgroup.procs` —sin
+///   `systemd-run` y sin ser un unit—, y su última componente queda idéntica.
+///   El cgroup no lleva la procedencia (activado por D-Bus vs forjado), así que
+///   esto no se cierra sólo con la ruta. Sube la barrera frente a un squat
+///   accidental o un atacante ingenuo, no frente a un atacante local que
+///   controla su propio cgroup. El cierre real es del lado del demonio: pedir
+///   el nombre con `DO_NOT_QUEUE` y abortar ruidoso si ya está tomado, con esta
+///   verificación como defensa en capas.
+/// - **Anidamiento.** Si systemd alguna vez deja el proceso principal en un
+///   sub-cgroup por debajo del unit (p. ej. `Delegate=yes`), esto lo rechaza
+///   (falla cerrado, rompe la verificación en vez de aceptar de más). El unit
+///   actual no delega, así que no pasa; si cambiara, se relaja acá.
+pub fn cgroup_is_service(cgroup_file: &str, unit: &str) -> bool {
+    if unit.is_empty() {
+        return false;
+    }
+    cgroup_file.lines().any(|line| {
+        // La ruta es todo lo que sigue al segundo ':'. `splitn(3, ':')` deja el
+        // resto intacto aunque la ruta tuviera algún ':'. Sin dos ':' la línea
+        // no es del formato esperado.
+        let Some(path) = line.splitn(3, ':').nth(2) else {
+            return false;
+        };
+        path.rsplit('/').next() == Some(unit)
+    })
+}
+
+/// Comprueba que el dueño de [`SERVICE_NAME`] en el bus es el demonio real
+/// —su proceso corre dentro del cgroup de [`SERVICE_UNIT`]— antes de confiarle
+/// una conversación.
+///
+/// Resuelve el dueño único del nombre (`GetNameOwner`), obtiene su pid
+/// (`GetConnectionUnixProcessID`), lee `/proc/<pid>/cgroup` y le aplica
+/// [`cgroup_is_service`]. `Ok(())` si coincide.
+///
+/// # Cuándo llamarla
+///
+/// Una vez, al construir el cliente del asistente o justo antes de abrir la
+/// primera conversación. No hace falta repetirla en cada llamada.
+///
+/// # Límites
+///
+/// Es una comprobación **puntual**: entre que se verifica y que se le habla, el
+/// dueño podría cambiar, o el pid podría reusarse (TOCTOU). Se acepta como
+/// límite conocido. Para los otros, ver [`cgroup_is_service`].
+///
+/// **Fuera de systemd (desarrollo):** si el demonio se corrió a mano desde una
+/// terminal, su cgroup no es el del unit y esto falla —correctamente: reporta
+/// la verdad—. No hay ningún bypass por variable de entorno.
+///
+/// # Falla cerrado
+///
+/// Si no se puede resolver el dueño (nadie tiene el nombre), leer su pid o leer
+/// el cgroup, devuelve `Err` ([`Error::AccessDenied`]) con el motivo: ante la
+/// duda, no se confía. La variante es `AccessDenied` también cuando el dueño
+/// existe pero no es el unit: el cliente no debe hablarle en ningún caso.
+pub async fn verify_service_owner(connection: &zbus::Connection) -> Result<(), Error> {
+    use zbus::names::BusName;
+
+    let deny = |motivo: String| Error::AccessDenied(motivo);
+
+    let bus = zbus::fdo::DBusProxy::new(connection)
+        .await
+        .map_err(|error| deny(format!("no se pudo contactar al bus de sesión: {error}")))?;
+
+    let service = BusName::try_from(SERVICE_NAME)
+        .map_err(|error| deny(format!("nombre de servicio inválido: {error}")))?;
+
+    let owner = bus.get_name_owner(service).await.map_err(|error| {
+        deny(format!(
+            "nadie es dueño de {SERVICE_NAME}: el asistente no está en el bus ({error})"
+        ))
+    })?;
+
+    let pid = bus
+        .get_connection_unix_process_id(BusName::Unique(owner.into()))
+        .await
+        .map_err(|error| {
+            deny(format!(
+                "no se pudo leer el pid del dueño de {SERVICE_NAME}: {error}"
+            ))
+        })?;
+
+    owner_runs_service(pid, read_proc_cgroup)
+}
+
+/// Lee `/proc/<pid>/cgroup`. `std::fs` síncrono a propósito, y aparte de la
+/// `async fn`: es un pseudo-archivo del kernel, la lectura no toca disco ni
+/// bloquea, y así el crate no arrastra un runtime async (lo usan clientes de
+/// cualquier versión de zbus).
+fn read_proc_cgroup(pid: u32) -> std::io::Result<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+}
+
+/// Con el pid del dueño del nombre ya resuelto: lee su cgroup con `read_cgroup`
+/// y comprueba que corre dentro de [`SERVICE_UNIT`]. La decisión está separada
+/// de la resolución por el bus para poder probarla con un lector de prueba.
+/// Falla cerrado: si el cgroup no se puede leer o no es el unit, `AccessDenied`.
+fn owner_runs_service(
+    pid: u32,
+    read_cgroup: impl FnOnce(u32) -> std::io::Result<String>,
+) -> Result<(), Error> {
+    let cgroup = read_cgroup(pid).map_err(|error| {
+        Error::AccessDenied(format!("no se pudo leer el cgroup del pid {pid}: {error}"))
+    })?;
+    if cgroup_is_service(&cgroup, SERVICE_UNIT) {
+        Ok(())
+    } else {
+        Err(Error::AccessDenied(format!(
+            "el dueño de {SERVICE_NAME} (pid {pid}) no corre dentro de {SERVICE_UNIT}: \
+             no es el servicio del asistente"
+        )))
+    }
 }
 
 // ── El proxy, para quien esté en zbus 5 ───────────────────────────────────────
@@ -540,6 +701,217 @@ mod tests {
             assert!(MAX_MESSAGE_BYTES * 2 <= MAX_HISTORY_BYTES);
             assert!(MAX_HISTORY_MESSAGES >= 2);
             assert!(MAX_CONVERSATIONS > 0);
+        }
+    }
+
+    mod dueno_del_nombre {
+        use super::*;
+
+        const UNIT: &str = "vasak-assistant.service";
+        const V2: &str =
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/vasak-assistant.service";
+
+        #[test]
+        fn el_unit_del_contrato_es_el_del_demonio() {
+            assert_eq!(SERVICE_UNIT, UNIT);
+        }
+
+        #[test]
+        fn cgroup_v2_real_es_el_servicio_con_y_sin_salto_final() {
+            assert!(cgroup_is_service(&format!("{V2}\n"), UNIT));
+            assert!(cgroup_is_service(V2, UNIT));
+        }
+
+        #[test]
+        fn cgroup_v1_con_varias_lineas_acepta_si_una_termina_en_el_unit() {
+            let v1 = "12:pids:/user.slice/user@1000.service/app.slice/vasak-assistant.service\n\
+                      4:cpu:/user.slice\n\
+                      0::/user.slice/user@1000.service/app.slice/vasak-assistant.service\n";
+            assert!(cgroup_is_service(v1, UNIT));
+            // Basta una línea buena aunque las otras no lo sean.
+            assert!(cgroup_is_service(
+                "4:cpu:/user.slice\n0::/x/vasak-assistant.service",
+                UNIT
+            ));
+        }
+
+        #[test]
+        fn un_sufijo_pegado_al_unit_no_pasa() {
+            for evil in [
+                "0::/user.slice/vasak-assistant.service.evil",
+                "0::/user.slice/vasak-assistant.service-evil",
+                "0::/user.slice/xvasak-assistant.service",
+                "0::/user.slice/evil-vasak-assistant.service",
+            ] {
+                assert!(!cgroup_is_service(evil, UNIT), "{evil}");
+            }
+        }
+
+        #[test]
+        fn el_unit_en_un_segmento_intermedio_no_pasa() {
+            // Anidamiento: el unit no es el último segmento, falla cerrado.
+            assert!(!cgroup_is_service(
+                "0::/a/vasak-assistant.service/algo",
+                UNIT
+            ));
+            assert!(!cgroup_is_service("0::/a/vasak-assistant.service/", UNIT));
+        }
+
+        #[test]
+        fn otro_unit_no_pasa() {
+            assert!(!cgroup_is_service("0::/user.slice/otra-cosa.service", UNIT));
+        }
+
+        #[test]
+        fn entrada_vacia_o_malformada_no_pasa() {
+            assert!(!cgroup_is_service("", UNIT));
+            assert!(!cgroup_is_service("\n\n", UNIT));
+            assert!(!cgroup_is_service("vasak-assistant.service", UNIT));
+            assert!(!cgroup_is_service("0:/vasak-assistant.service", UNIT));
+            assert!(!cgroup_is_service("basura sin dos puntos", UNIT));
+        }
+
+        #[test]
+        fn un_unit_vacio_no_pasa_contra_ningun_cgroup() {
+            assert!(!cgroup_is_service(V2, ""));
+            assert!(!cgroup_is_service("0::/", ""));
+            assert!(!cgroup_is_service("0::", ""));
+            assert!(!cgroup_is_service("", ""));
+        }
+
+        #[test]
+        fn una_ruta_sin_segmentos_no_pasa() {
+            assert!(!cgroup_is_service("0::/", UNIT));
+            assert!(!cgroup_is_service("0::", UNIT));
+            assert!(!cgroup_is_service("0::///", UNIT));
+        }
+    }
+
+    mod owner_runs_service {
+        use super::*;
+        use std::io::{Error as IoError, ErrorKind};
+
+        #[test]
+        fn el_duenio_que_corre_en_el_unit_pasa() {
+            let leer = |_| Ok("0::/user.slice/app.slice/vasak-assistant.service\n".to_string());
+            assert!(owner_runs_service(123, leer).is_ok());
+        }
+
+        #[test]
+        fn un_proceso_que_no_es_el_unit_se_niega() {
+            let leer = |_| Ok("0::/user.slice/app.slice/impostor.service\n".to_string());
+            match owner_runs_service(123, leer) {
+                Err(Error::AccessDenied(motivo)) => {
+                    assert!(motivo.contains("123"), "{motivo}");
+                    assert!(!motivo.contains("impostor"), "{motivo}");
+                }
+                otro => panic!("se esperaba AccessDenied, vino {otro:?}"),
+            }
+        }
+
+        #[test]
+        fn si_no_se_puede_leer_el_cgroup_falla_cerrado() {
+            let leer = |_| Err(IoError::new(ErrorKind::NotFound, "no such process"));
+            match owner_runs_service(456, leer) {
+                Err(Error::AccessDenied(motivo)) => assert!(motivo.contains("456"), "{motivo}"),
+                otro => panic!("se esperaba AccessDenied, vino {otro:?}"),
+            }
+        }
+    }
+    mod lectura_real {
+        use super::*;
+
+        #[test]
+        fn el_cgroup_del_propio_proceso_se_lee() {
+            let cgroup = read_proc_cgroup(std::process::id()).unwrap();
+            assert!(cgroup.contains('/'), "{cgroup}");
+        }
+
+        #[test]
+        fn el_proceso_de_prueba_no_es_el_unit() {
+            let pid = std::process::id();
+            assert!(matches!(
+                owner_runs_service(pid, read_proc_cgroup),
+                Err(Error::AccessDenied(_))
+            ));
+        }
+
+        #[test]
+        fn un_pid_inexistente_no_se_puede_leer() {
+            assert!(read_proc_cgroup(u32::MAX).is_err());
+        }
+
+        /// Un `org.freedesktop.DBus` de mentira: lo que responde cada método
+        /// lo decide la prueba.
+        struct FakeBus {
+            owner: Option<&'static str>,
+            pid: Option<u32>,
+        }
+
+        #[zbus::interface(name = "org.freedesktop.DBus")]
+        impl FakeBus {
+            fn get_name_owner(&self, _name: String) -> zbus::fdo::Result<String> {
+                self.owner
+                    .map(String::from)
+                    .ok_or_else(|| zbus::fdo::Error::NameHasNoOwner("sin dueño".into()))
+            }
+
+            #[zbus(name = "GetConnectionUnixProcessID")]
+            fn get_connection_unix_process_id(&self, _name: String) -> zbus::fdo::Result<u32> {
+                self.pid
+                    .ok_or_else(|| zbus::fdo::Error::Failed("sin pid".into()))
+            }
+        }
+
+        async fn verificar_contra(bus: FakeBus) -> Result<(), Error> {
+            let (a, b) = tokio::net::UnixStream::pair().unwrap();
+            let server = zbus::connection::Builder::unix_stream(a)
+                .server(zbus::Guid::generate())
+                .unwrap()
+                .p2p()
+                .serve_at("/org/freedesktop/DBus", bus)
+                .unwrap()
+                .build();
+            let client = zbus::connection::Builder::unix_stream(b).p2p().build();
+            let (_server, client) = tokio::try_join!(server, client).unwrap();
+            verify_service_owner(&client).await
+        }
+
+        fn motivo(resultado: Result<(), Error>) -> String {
+            match resultado {
+                Err(Error::AccessDenied(motivo)) => motivo,
+                otro => panic!("se esperaba AccessDenied, vino {otro:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn si_nadie_es_duenio_del_nombre_falla_cerrado() {
+            let bus = FakeBus {
+                owner: None,
+                pid: None,
+            };
+            let m = motivo(verificar_contra(bus).await);
+            assert!(m.contains("nadie es dueño"), "{m}");
+        }
+
+        #[tokio::test]
+        async fn si_no_se_puede_leer_el_pid_falla_cerrado() {
+            let bus = FakeBus {
+                owner: Some(":1.9"),
+                pid: None,
+            };
+            let m = motivo(verificar_contra(bus).await);
+            assert!(m.contains("pid del dueño"), "{m}");
+        }
+
+        #[tokio::test]
+        async fn un_duenio_que_no_corre_en_el_unit_se_niega() {
+            let bus = FakeBus {
+                owner: Some(":1.9"),
+                pid: Some(std::process::id()),
+            };
+            let m = motivo(verificar_contra(bus).await);
+            assert!(m.contains("no es el servicio del asistente"), "{m}");
         }
     }
 }

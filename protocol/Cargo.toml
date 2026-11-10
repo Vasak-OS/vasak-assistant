@@ -9,3 +9,7 @@ license.workspace = true
 [dependencies]
 serde.workspace = true
 zbus.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+zbus = { workspace = true, features = ["p2p"] }

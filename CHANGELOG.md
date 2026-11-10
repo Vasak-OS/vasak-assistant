@@ -2,6 +2,21 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-assistant 0.3.17
+
+Una ayuda para que los clientes verifiquen que el dueño del nombre del bus es el
+demonio real antes de hablarle (#5).
+
+- **`protocol`** — `verify_service_owner` resuelve el dueño de
+  `ar.net.vasak.os.Assistant`, lee su pid (`GetConnectionUnixProcessID`) y
+  comprueba que su `/proc/<pid>/cgroup` corresponde a `vasak-assistant.service`;
+  falla cerrado (`AccessDenied`) ante cualquier duda. La lógica del cgroup es
+  una función pura (`cgroup_is_service`) para que también la reusen los clientes
+  en zbus 4. Es defensa en capas contra un impostor que reclame el nombre antes
+  de que arranque el servicio; todavía no la usa ningún cliente (adopción
+  aparte) y el cierre real es del lado del demonio. Sale de la revisión de
+  seguridad del #2 (N8).
+
 ## vasak-assistant 0.3.16
 
 Las aplicaciones confinadas comparten un cupo chico y no pueden esquivar los
