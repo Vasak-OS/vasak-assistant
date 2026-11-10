@@ -696,7 +696,7 @@ mod hardening_tests {
 
     #[test]
     fn el_dato_sensible_pegado_en_medio_de_otro_texto_se_detecta() {
-        let pegado = "Resumen del documento:\n- ítem uno\n- el autor es peronista\n- ítem tres";
+        let pegado = "Resumen del documento: ítem uno, el autor es peronista, ítem tres";
         assert!(mentions_sensitive(pegado));
         assert!(!is_clean_note(pegado));
     }
