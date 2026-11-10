@@ -2,6 +2,23 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-assistant 0.3.16
+
+Las aplicaciones confinadas comparten un cupo chico y no pueden esquivar los
+topes abriendo varias conexiones (#32).
+
+- **`daemon` / `protocol`** — los topes de conversaciones y de chats en vuelo
+  se contaban por nombre único de bus, y cada conexión tiene el suyo: un
+  proceso que abría varias los multiplicaba y podía agotar el cupo global,
+  dejando sin lugar al chat de la persona. Ahora todos los llamadores
+  confinados por AppArmor comparten un cupo chico (`MAX_CONVERSATIONS_CONFINED`
+  = 3, `MAX_CHATS_IN_FLIGHT_CONFINED` = 1), cualquiera sea la cantidad de
+  conexiones. El confinamiento sale de la etiqueta que da el bus
+  (`LinuxSecurityLabel`) y falla cerrado. Se comparte el cupo, no la propiedad:
+  una aplicación confinada sigue sin ver ni tocar las conversaciones de otra.
+  Un proceso sin confinar conserva su cupo por dueño. Sale de la revisión de
+  seguridad del #3.
+
 ## vasak-assistant 0.3.15
 
 La poda por espacio de la memoria compacta la base si borrar no alcanza, para

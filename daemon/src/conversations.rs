@@ -20,8 +20,9 @@ use std::collections::HashMap;
 
 use uuid::Uuid;
 use vasak_assistant_protocol::{
-    Error, Message, Role, MAX_CHATS_IN_FLIGHT_PER_OWNER, MAX_CONVERSATIONS,
-    MAX_CONVERSATIONS_PER_OWNER, MAX_HISTORY_BYTES, MAX_HISTORY_MESSAGES, MAX_MESSAGE_BYTES,
+    Error, Message, Role, MAX_CHATS_IN_FLIGHT_CONFINED, MAX_CHATS_IN_FLIGHT_PER_OWNER,
+    MAX_CONVERSATIONS, MAX_CONVERSATIONS_CONFINED, MAX_CONVERSATIONS_PER_OWNER, MAX_HISTORY_BYTES,
+    MAX_HISTORY_MESSAGES, MAX_MESSAGE_BYTES,
 };
 
 struct Conversation {
@@ -31,17 +32,24 @@ struct Conversation {
     /// Hay un pedido al modelo en curso: un segundo `Chat` sobre la misma
     /// conversación se rechaza en vez de entreverar las respuestas.
     busy: bool,
+    /// Si la abrió una aplicación confinada (AppArmor). Decide contra qué cupo
+    /// cuenta —el bucket compartido de los confinados o el tope por dueño—, sin
+    /// cambiar de quién es: la propiedad sigue por `owner`. Se fija al abrirla y
+    /// no cambia: el perfil de una conexión del bus es fijo mientras vive.
+    confined: bool,
 }
 
 #[derive(Default)]
 pub struct Conversations {
     open: HashMap<String, Conversation>,
-    /// Los chats en vuelo: id de la conversación → su dueño. Se anota en
-    /// `begin_turn` y se saca en `finish_turn` (que corre siempre, por el
+    /// Los chats en vuelo: id de la conversación → (dueño, confinado). Se anota
+    /// en `begin_turn` y se saca en `finish_turn` (que corre siempre, por el
     /// `Drop` del turno), exista o no la conversación: borrarla mientras espera
     /// al modelo no devuelve el lugar, porque el pedido sigue ocupando el
-    /// backend. Sólo tiene los que están en vuelo, así que no acumula nada.
-    in_flight: HashMap<String, String>,
+    /// backend. Sólo tiene los que están en vuelo, así que no acumula nada. El
+    /// flag confinado se guarda acá —y no se lee de `open`— porque la
+    /// conversación puede borrarse mientras su pedido sigue en vuelo.
+    in_flight: HashMap<String, (String, bool)>,
 }
 
 impl Conversations {
@@ -56,10 +64,25 @@ impl Conversations {
         self.open.values().filter(|c| c.owner == owner).count()
     }
 
-    /// Abre una conversación para `owner` y devuelve su id. Hay un tope por
-    /// dueño, para que un solo cliente no se quede con todas, además del total.
-    pub fn create(&mut self, owner: &str) -> Result<String, Error> {
-        if self.count_for(owner) >= MAX_CONVERSATIONS_PER_OWNER {
+    /// Cuántas conversaciones hay abiertas de aplicaciones confinadas, sumadas
+    /// sobre todas: es el bucket compartido, no por dueño.
+    fn confined_count(&self) -> usize {
+        self.open.values().filter(|c| c.confined).count()
+    }
+
+    /// Abre una conversación para `owner` y devuelve su id. Un llamador sin
+    /// confinar tiene un tope por dueño, para que un solo cliente no se quede
+    /// con todas; los confinados comparten un bucket chico entre todos
+    /// ([`MAX_CONVERSATIONS_CONFINED`]), sin importar cuántas conexiones abran.
+    /// El total ([`MAX_CONVERSATIONS`]) rige en los dos casos.
+    pub fn create(&mut self, owner: &str, confined: bool) -> Result<String, Error> {
+        if confined {
+            if self.confined_count() >= MAX_CONVERSATIONS_CONFINED {
+                return Err(Error::LimitExceeded(format!(
+                    "las aplicaciones confinadas ya tienen {MAX_CONVERSATIONS_CONFINED} conversaciones abiertas con el asistente; cerrá alguna"
+                )));
+            }
+        } else if self.count_for(owner) >= MAX_CONVERSATIONS_PER_OWNER {
             return Err(Error::LimitExceeded(format!(
                 "ya tenés {MAX_CONVERSATIONS_PER_OWNER} conversaciones abiertas; cerrá alguna"
             )));
@@ -76,6 +99,7 @@ impl Conversations {
                 owner: owner.to_owned(),
                 messages: Vec::new(),
                 busy: false,
+                confined,
             },
         );
         Ok(id)
@@ -114,7 +138,7 @@ impl Conversations {
         // La conexión ya no existe, y su nombre único no vuelve: no hay a
         // quién ponerle el tope.
         self.in_flight
-            .retain(|_, in_flight_owner| in_flight_owner != owner);
+            .retain(|_, (in_flight_owner, _)| in_flight_owner != owner);
         before - self.open.len()
     }
 
@@ -129,28 +153,44 @@ impl Conversations {
         content: &str,
     ) -> Result<Vec<Message>, Error> {
         validate_content(content)?;
-        if self.get(owner, id)?.busy {
+        let conversation = self.get(owner, id)?;
+        if conversation.busy {
             return Err(Error::Busy(
                 "la conversación todavía está esperando la respuesta anterior".into(),
             ));
         }
-        // El tope por dueño (#3): con los chats en vuelo de una conexión
-        // contados acá, bajo el mismo candado que los marca, un cliente no
-        // ocupa todo el cupo del backend. `Busy` y no `LimitExceeded`: es
-        // pasajero, alcanza con esperar a que llegue una respuesta, mientras
-        // que `LimitExceeded` es el tope de conversaciones abiertas, que no se
-        // libera solo.
-        let in_flight = self
-            .in_flight
-            .values()
-            .filter(|in_flight_owner| *in_flight_owner == owner)
-            .count();
-        if in_flight >= MAX_CHATS_IN_FLIGHT_PER_OWNER {
-            return Err(Error::Busy(format!(
-                "ya hay {in_flight} pedidos esperando respuesta del modelo; esperá a que termine uno"
-            )));
+        // El tope de chats en vuelo (#3): con los que están en vuelo contados
+        // acá, bajo el mismo candado que los marca, un cliente no ocupa todo el
+        // cupo del backend. `Busy` y no `LimitExceeded`: es pasajero, alcanza
+        // con esperar a que llegue una respuesta, mientras que `LimitExceeded`
+        // es el tope de conversaciones abiertas, que no se libera solo. El flag
+        // confinado sale de la conversación (lo fijó `create`): confinado cuenta
+        // contra el bucket compartido de todos los confinados; si no, por dueño.
+        let confined = conversation.confined;
+        let (in_flight, limit) = if confined {
+            let count = self.in_flight.values().filter(|(_, c)| *c).count();
+            (count, MAX_CHATS_IN_FLIGHT_CONFINED)
+        } else {
+            let count = self
+                .in_flight
+                .values()
+                .filter(|(in_flight_owner, _)| in_flight_owner == owner)
+                .count();
+            (count, MAX_CHATS_IN_FLIGHT_PER_OWNER)
+        };
+        if in_flight >= limit {
+            return Err(Error::Busy(if confined {
+                format!(
+                    "las aplicaciones confinadas ya tienen {in_flight} pedidos esperando respuesta del modelo; esperá a que termine uno"
+                )
+            } else {
+                format!(
+                    "ya hay {in_flight} pedidos esperando respuesta del modelo; esperá a que termine uno"
+                )
+            }));
         }
-        self.in_flight.insert(id.to_owned(), owner.to_owned());
+        self.in_flight
+            .insert(id.to_owned(), (owner.to_owned(), confined));
         let conversation = self.get_mut(owner, id)?;
         conversation.busy = true;
         let mut context = conversation.messages.clone();
@@ -265,7 +305,7 @@ mod tests {
     /// Una conversación con `n` intercambios de mensajes cortos y distintos.
     fn with_turns(n: usize) -> (Conversations, String) {
         let mut conversations = Conversations::default();
-        let id = conversations.create(OWNER).unwrap();
+        let id = conversations.create(OWNER, false).unwrap();
         for i in 0..n {
             let content = format!("pregunta {i}");
             conversations.begin_turn(OWNER, &id, &content).unwrap();
@@ -277,7 +317,7 @@ mod tests {
     #[test]
     fn un_id_valido_es_un_uuid_con_guiones() {
         let mut conversations = Conversations::default();
-        let id = conversations.create(OWNER).unwrap();
+        let id = conversations.create(OWNER, false).unwrap();
         assert!(validate_id(&id).is_ok());
     }
 
@@ -341,24 +381,24 @@ mod tests {
         let owner = |i: usize| format!(":1.{}", i / MAX_CONVERSATIONS_PER_OWNER);
         let mut conversations = Conversations::default();
         let ids: Vec<String> = (0..MAX_CONVERSATIONS)
-            .map(|i| conversations.create(&owner(i)).unwrap())
+            .map(|i| conversations.create(&owner(i), false).unwrap())
             .collect();
         assert_eq!(conversations.len(), MAX_CONVERSATIONS);
         assert!(matches!(
-            conversations.create(":1.999"),
+            conversations.create(":1.999", false),
             Err(Error::LimitExceeded(_))
         ));
         assert_eq!(conversations.len(), MAX_CONVERSATIONS);
 
         conversations.delete(&owner(0), &ids[0]).unwrap();
-        assert!(conversations.create(":1.999").is_ok());
+        assert!(conversations.create(":1.999", false).is_ok());
     }
 
     #[test]
     fn los_ids_salen_ordenados_y_sin_repetirse() {
         let mut conversations = Conversations::default();
         for _ in 0..5 {
-            conversations.create(OWNER).unwrap();
+            conversations.create(OWNER, false).unwrap();
         }
         let ids = conversations.ids(OWNER);
         let mut sorted = ids.clone();
@@ -371,7 +411,7 @@ mod tests {
     #[test]
     fn una_conversacion_nueva_no_tiene_mensajes() {
         let mut conversations = Conversations::default();
-        let id = conversations.create(OWNER).unwrap();
+        let id = conversations.create(OWNER, false).unwrap();
         assert!(conversations.history(OWNER, &id).unwrap().is_empty());
     }
 
@@ -452,8 +492,8 @@ mod tests {
     #[test]
     fn el_turno_de_una_conversacion_no_ocupa_a_las_otras() {
         let mut conversations = Conversations::default();
-        let a = conversations.create(OWNER).unwrap();
-        let b = conversations.create(OWNER).unwrap();
+        let a = conversations.create(OWNER, false).unwrap();
+        let b = conversations.create(OWNER, false).unwrap();
         conversations.begin_turn(OWNER, &a, "uno").unwrap();
         assert!(conversations.begin_turn(OWNER, &b, "dos").is_ok());
     }
@@ -615,9 +655,9 @@ mod tests {
     #[test]
     fn cada_dueno_lista_y_cuenta_solo_lo_suyo() {
         let mut conversations = Conversations::default();
-        let a = conversations.create(OWNER).unwrap();
-        let b1 = conversations.create(OTHER).unwrap();
-        let b2 = conversations.create(OTHER).unwrap();
+        let a = conversations.create(OWNER, false).unwrap();
+        let b1 = conversations.create(OTHER, false).unwrap();
+        let b2 = conversations.create(OTHER, false).unwrap();
 
         assert_eq!(conversations.ids(OWNER), [a]);
         let mut de_b = vec![b1, b2];
@@ -633,13 +673,13 @@ mod tests {
     fn el_tope_por_dueno_no_bloquea_a_otro_dueno() {
         let mut conversations = Conversations::default();
         for _ in 0..MAX_CONVERSATIONS_PER_OWNER {
-            conversations.create(OWNER).unwrap();
+            conversations.create(OWNER, false).unwrap();
         }
         assert!(matches!(
-            conversations.create(OWNER),
+            conversations.create(OWNER, false),
             Err(Error::LimitExceeded(_))
         ));
-        assert!(conversations.create(OTHER).is_ok());
+        assert!(conversations.create(OTHER, false).is_ok());
         assert_eq!(conversations.count_for(OWNER), MAX_CONVERSATIONS_PER_OWNER);
     }
 
@@ -647,19 +687,19 @@ mod tests {
     fn cerrar_una_propia_libera_cupo_del_dueno() {
         let mut conversations = Conversations::default();
         let ids: Vec<String> = (0..MAX_CONVERSATIONS_PER_OWNER)
-            .map(|_| conversations.create(OWNER).unwrap())
+            .map(|_| conversations.create(OWNER, false).unwrap())
             .collect();
         conversations.delete(OWNER, &ids[0]).unwrap();
-        assert!(conversations.create(OWNER).is_ok());
+        assert!(conversations.create(OWNER, false).is_ok());
     }
 
     #[test]
     fn al_irse_el_dueno_se_liberan_solo_sus_conversaciones() {
         let mut conversations = Conversations::default();
         for _ in 0..3 {
-            conversations.create(OWNER).unwrap();
+            conversations.create(OWNER, false).unwrap();
         }
-        let ajena = conversations.create(OTHER).unwrap();
+        let ajena = conversations.create(OTHER, false).unwrap();
 
         assert_eq!(conversations.release_owner(OWNER), 3);
 
@@ -667,7 +707,7 @@ mod tests {
         assert!(conversations.ids(OWNER).is_empty());
         assert!(conversations.history(OTHER, &ajena).is_ok());
         // Y su cupo queda libre.
-        assert!(conversations.create(OWNER).is_ok());
+        assert!(conversations.create(OWNER, false).is_ok());
         // Irse dos veces, o sin haber abierto nada, no libera nada más.
         assert_eq!(conversations.release_owner(":1.99"), 0);
     }
@@ -692,7 +732,7 @@ mod owner_limit_tests {
 
     fn open(conversations: &mut Conversations, owner: &str, n: usize) -> Vec<String> {
         (0..n)
-            .map(|_| conversations.create(owner).unwrap())
+            .map(|_| conversations.create(owner, false).unwrap())
             .collect()
     }
 
@@ -785,7 +825,7 @@ mod owner_limit_tests {
         conversations.release_owner(A);
 
         assert_eq!(busy_count(&conversations, A), 0);
-        let fresh = conversations.create(A).unwrap();
+        let fresh = conversations.create(A, false).unwrap();
         conversations.begin_turn(A, &fresh, "nuevo").unwrap();
     }
 
@@ -827,7 +867,7 @@ mod owner_limit_tests {
     fn un_mensaje_invalido_ni_una_conversacion_ajena_ocupan_ni_gastan_lugar() {
         let mut conversations = Conversations::default();
         let ids = open(&mut conversations, A, 2);
-        let theirs = conversations.create(B).unwrap();
+        let theirs = conversations.create(B, false).unwrap();
 
         assert!(conversations.begin_turn(A, &ids[0], "").is_err());
         assert!(conversations.begin_turn(A, &theirs, "hola").is_err());
@@ -839,7 +879,7 @@ mod owner_limit_tests {
         // ...y el dueño conserva sus dos lugares enteros.
         conversations.begin_turn(A, &ids[0], "uno").unwrap();
         conversations.begin_turn(A, &ids[1], "dos").unwrap();
-        let third = conversations.create(A).unwrap();
+        let third = conversations.create(A, false).unwrap();
         assert!(matches!(
             conversations.begin_turn(A, &third, "tres"),
             Err(Error::Busy(_))
@@ -861,7 +901,10 @@ mod owner_limit_tests {
         conversations.release_owner(A);
 
         assert_eq!(conversations.in_flight.len(), 1);
-        assert!(conversations.in_flight.values().all(|owner| owner == B));
+        assert!(conversations
+            .in_flight
+            .values()
+            .all(|(owner, _)| owner == B));
         // Otra conexión con el mismo nombre (aunque no debería repetirse) empieza de cero.
         let fresh = open(&mut conversations, A, 3);
         conversations.begin_turn(A, &fresh[0], "uno").unwrap();
@@ -903,5 +946,151 @@ mod owner_limit_tests {
         conversations.finish_turn("no-existe", "x", None);
         conversations.finish_turn(&ids[1], "x", None);
         assert!(conversations.in_flight.is_empty());
+    }
+}
+
+/// El cupo compartido de las aplicaciones confinadas (#32): se comparte el
+/// cupo, no la propiedad.
+#[cfg(test)]
+mod confined_quota_tests {
+    use super::*;
+
+    // Dos conexiones (dos nombres únicos) de un mismo proceso confinado.
+    const C1: &str = ":1.10";
+    const C2: &str = ":1.11";
+    const U1: &str = ":1.20";
+    const U2: &str = ":1.21";
+
+    fn texto(e: Error) -> String {
+        match e {
+            Error::NotFound(text) => text,
+            other => panic!("se esperaba NotFound, dio {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dos_conexiones_confinadas_no_abren_mas_del_maximo_confinado_entre_las_dos() {
+        let mut conversations = Conversations::default();
+        assert_eq!(MAX_CONVERSATIONS_CONFINED, 3);
+        conversations.create(C1, true).unwrap();
+        conversations.create(C2, true).unwrap();
+        conversations.create(C1, true).unwrap();
+
+        for owner in [C1, C2] {
+            assert!(
+                matches!(
+                    conversations.create(owner, true),
+                    Err(Error::LimitExceeded(_))
+                ),
+                "la cuarta de {owner} tenía que fallar"
+            );
+        }
+        assert_eq!(
+            conversations.count_for(C1) + conversations.count_for(C2),
+            MAX_CONVERSATIONS_CONFINED
+        );
+    }
+
+    #[test]
+    fn cerrar_una_confinada_devuelve_el_lugar_al_cupo_compartido() {
+        let mut conversations = Conversations::default();
+        let ids: Vec<String> = (0..MAX_CONVERSATIONS_CONFINED)
+            .map(|_| conversations.create(C1, true).unwrap())
+            .collect();
+        assert!(conversations.create(C2, true).is_err());
+
+        conversations.delete(C1, &ids[0]).unwrap();
+
+        assert!(conversations.create(C2, true).is_ok());
+    }
+
+    #[test]
+    fn dos_conexiones_confinadas_no_tienen_dos_chats_en_vuelo_a_la_vez() {
+        let mut conversations = Conversations::default();
+        let a = conversations.create(C1, true).unwrap();
+        let b = conversations.create(C2, true).unwrap();
+        assert_eq!(MAX_CHATS_IN_FLIGHT_CONFINED, 1);
+
+        conversations.begin_turn(C1, &a, "uno").unwrap();
+
+        assert!(matches!(
+            conversations.begin_turn(C2, &b, "dos"),
+            Err(Error::Busy(_))
+        ));
+        // Al terminar el primero, el lugar vuelve y el otro puede.
+        conversations.finish_turn(&a, "uno", Some("ok"));
+        assert!(conversations.begin_turn(C2, &b, "dos").is_ok());
+    }
+
+    #[test]
+    fn un_chat_sin_confinar_no_gasta_el_cupo_de_en_vuelo_de_los_confinados() {
+        let mut conversations = Conversations::default();
+        let libre = conversations.create(U1, false).unwrap();
+        let confinada = conversations.create(C1, true).unwrap();
+
+        conversations.begin_turn(U1, &libre, "uno").unwrap();
+
+        assert!(conversations.begin_turn(C1, &confinada, "dos").is_ok());
+    }
+
+    #[test]
+    fn sin_confinar_cada_dueno_conserva_su_tope_y_no_comparte_cupo() {
+        let mut conversations = Conversations::default();
+        let mut ids = Vec::new();
+        for owner in [U1, U2] {
+            for _ in 0..MAX_CONVERSATIONS_PER_OWNER {
+                ids.push((owner, conversations.create(owner, false).unwrap()));
+            }
+            assert!(matches!(
+                conversations.create(owner, false),
+                Err(Error::LimitExceeded(_))
+            ));
+        }
+        assert_eq!(MAX_CONVERSATIONS_PER_OWNER, 8);
+        // Dos chats en vuelo por dueño, el tercero da Busy; el otro dueño no se entera.
+        for owner in [U1, U2] {
+            let propias: Vec<&String> = ids
+                .iter()
+                .filter(|(o, _)| *o == owner)
+                .map(|(_, id)| id)
+                .collect();
+            assert_eq!(MAX_CHATS_IN_FLIGHT_PER_OWNER, 2);
+            conversations.begin_turn(owner, propias[0], "a").unwrap();
+            conversations.begin_turn(owner, propias[1], "b").unwrap();
+            assert!(matches!(
+                conversations.begin_turn(owner, propias[2], "c"),
+                Err(Error::Busy(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn compartir_el_cupo_no_comparte_la_propiedad_entre_confinados() {
+        let mut conversations = Conversations::default();
+        let id = conversations.create(C1, true).unwrap();
+        conversations.begin_turn(C1, &id, "secreto").unwrap();
+        conversations.finish_turn(&id, "secreto", Some("respuesta"));
+        let antes = conversations.history(C1, &id).unwrap();
+
+        // La otra conexión confinada no la lista, ni la lee, ni la cierra, ni chatea.
+        assert!(conversations.ids(C2).is_empty());
+        assert_eq!(conversations.count_for(C2), 0);
+        assert!(!conversations.contains(C2, &id));
+        let ajeno = texto(conversations.history(C2, &id).unwrap_err());
+        let inexistente = texto(
+            conversations
+                .history(C2, &Uuid::new_v4().to_string())
+                .unwrap_err(),
+        );
+        assert_eq!(ajeno, inexistente);
+        assert_eq!(texto(conversations.delete(C2, &id).unwrap_err()), ajeno);
+        assert_eq!(
+            texto(conversations.begin_turn(C2, &id, "intruso").unwrap_err()),
+            ajeno
+        );
+
+        // Y nada de eso la tocó ni la dejó ocupada.
+        assert_eq!(conversations.history(C1, &id).unwrap(), antes);
+        assert!(conversations.begin_turn(C1, &id, "yo").is_ok());
     }
 }
