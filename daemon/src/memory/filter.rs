@@ -691,6 +691,19 @@ mod hardening_tests {
     }
 
     #[test]
+    fn un_termino_sensible_disfrazado_de_ancho_completo_o_cirilico_se_detecta() {
+        for frase in [
+            "soy ｃａｔólico",
+            // «católico» con с, а y о cirílicas
+            "soy \u{441}\u{430}t\u{43e}lico",
+            // «peronista» con р, е y о cirílicas
+            "soy \u{440}\u{435}r\u{43e}nista",
+        ] {
+            assert!(mentions_sensitive(frase), "{frase}");
+        }
+    }
+
+    #[test]
     fn un_domicilio_se_detecta_y_la_nota_se_descarta() {
         for frase in [
             "vivo en Av. Corrientes 1234",

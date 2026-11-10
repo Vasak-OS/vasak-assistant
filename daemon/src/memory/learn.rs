@@ -735,6 +735,18 @@ mod hardening_tests {
     }
 
     #[test]
+    fn un_dato_sensible_disfrazado_tampoco_entra_a_la_ventana() {
+        for tainted in ["soy ｃａｔólico", "soy \u{440}\u{435}r\u{43e}nista"] {
+            let exchange = vec![user(tainted), assistant("ok"), user("prefiero el mate")];
+
+            let (window, gate) = extraction_window(&exchange, BOTH).unwrap();
+
+            assert!(!contents(&window).contains(&tainted), "{tainted}");
+            assert!(!gate.summary, "{tainted}");
+        }
+    }
+
+    #[test]
     fn la_respuesta_del_asistente_con_un_dato_se_descarta_pero_no_impide_aprender() {
         let exchange = vec![
             user("prefiero el mate"),
