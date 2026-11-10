@@ -652,6 +652,56 @@ mod hardening_tests {
     use super::*;
 
     #[test]
+    fn cada_categoria_sensible_se_detecta_y_la_nota_se_descarta() {
+        for frase in [
+            "tengo diabetes",
+            "estoy en tratamiento psiquiátrico",
+            "soy discapacitado",
+            "soy católico",
+            "soy gay",
+            "mi novia es bisexual",
+            "soy peronista",
+            "SOY CATÓLICO",
+        ] {
+            assert!(mentions_sensitive(frase), "{frase}");
+            assert!(!is_clean_note(frase), "{frase}");
+        }
+    }
+
+    #[test]
+    fn un_domicilio_se_detecta_y_la_nota_se_descarta() {
+        for frase in [
+            "vivo en Av. Corrientes 1234",
+            "mi casa es calle Falsa 123",
+            "Avenida Siempreviva 742",
+        ] {
+            assert!(mentions_sensitive(frase), "{frase}");
+            assert!(!is_clean_note(frase), "{frase}");
+        }
+    }
+
+    #[test]
+    fn lo_que_no_es_sensible_ni_domicilio_pasa() {
+        for frase in [
+            "prefiero que me hables de vos",
+            "me gusta el mate amargo",
+            "soy ingeniero",
+            "trabajo de noche",
+            "prefiere respuestas cortas",
+        ] {
+            assert!(!mentions_sensitive(frase), "{frase}");
+            assert!(is_clean_note(frase), "{frase}");
+        }
+    }
+
+    #[test]
+    fn el_dato_sensible_pegado_en_medio_de_otro_texto_se_detecta() {
+        let pegado = "Resumen del documento:\n- ítem uno\n- el autor es peronista\n- ítem tres";
+        assert!(mentions_sensitive(pegado));
+        assert!(!is_clean_note(pegado));
+    }
+
+    #[test]
     fn cada_clase_de_caracter_prohibido_se_detecta() {
         for (name, c) in [
             ("espacio de ancho cero (Cf)", '\u{200B}'),

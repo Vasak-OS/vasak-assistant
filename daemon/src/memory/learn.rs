@@ -713,6 +713,28 @@ mod hardening_tests {
     }
 
     #[test]
+    fn un_mensaje_con_un_dato_sensible_no_entra_a_la_ventana_ni_deja_resumir() {
+        for tainted in [
+            "tengo diabetes",
+            "soy peronista",
+            "vivo en Av. Corrientes 1234",
+        ] {
+            let exchange = vec![
+                user(tainted),
+                assistant("ok"),
+                user("prefiero el mate"),
+                assistant("anotado"),
+            ];
+
+            let (window, gate) = extraction_window(&exchange, BOTH).unwrap();
+
+            assert!(!contents(&window).contains(&tainted), "{tainted}");
+            assert_eq!(contents(&window), ["ok", "prefiero el mate", "anotado"]);
+            assert!(!gate.summary, "{tainted}");
+        }
+    }
+
+    #[test]
     fn la_respuesta_del_asistente_con_un_dato_se_descarta_pero_no_impide_aprender() {
         let exchange = vec![
             user("prefiero el mate"),
