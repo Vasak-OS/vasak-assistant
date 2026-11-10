@@ -155,6 +155,11 @@ pub struct Memory {
     /// Si ya se podó en el episodio actual sobre [`MAX_MEMORY_DISK_BYTES`].
     /// Se limpia cuando la base vuelve a estar dentro del tope.
     pruned_over_limit: Arc<AtomicBool>,
+    /// Si ya se compactó (se reescribió dejando sólo lo vivo) en el episodio
+    /// actual sobre [`MAX_MEMORY_DISK_BYTES`]: una sola vez por episodio, para
+    /// no reescribir la base en cada intento mientras siga pasada. Se limpia
+    /// cuando una escritura entra (la base volvió dentro del tope).
+    compacted_over_limit: Arc<AtomicBool>,
     /// El último motivo por el que no se pudo abrir la base, para registrarlo
     /// sólo cuando cambia.
     last_open_problem: parking_lot::Mutex<Option<&'static str>>,
@@ -220,6 +225,7 @@ impl Memory {
             epoch: AtomicU64::new(0),
             windows: parking_lot::Mutex::default(),
             pruned_over_limit: Arc::default(),
+            compacted_over_limit: Arc::default(),
             last_open_problem: parking_lot::Mutex::default(),
             forgotten: parking_lot::Mutex::default(),
             pending_deletes: parking_lot::Mutex::default(),
@@ -504,9 +510,89 @@ impl Memory {
         let db = self.usable(dir, &mut guard).await?;
         let (dir, conversation_id) = (dir.clone(), conversation_id.to_owned());
         let pruned = self.pruned_over_limit.clone();
-        blocking(move || write(&db, &dir, &extraction, &conversation_id, &pruned).map_err(db_error))
+        let extraction = Arc::new(extraction);
+        let wrote = {
+            let (db, dir, conversation_id, pruned, extraction) = (
+                db.clone(),
+                dir.clone(),
+                conversation_id.clone(),
+                pruned.clone(),
+                extraction.clone(),
+            );
+            blocking(move || {
+                write(&db, &dir, &extraction, &conversation_id, &pruned).map_err(db_error)
+            })
             .await
-            .inspect_err(|error| tracing::warn!("no se pudo escribir en la memoria: {error}"))
+            .inspect_err(|error| tracing::warn!("no se pudo escribir en la memoria: {error}"))?
+        };
+        if wrote {
+            // Entró: la base está dentro del tope, el episodio de pasada terminó.
+            self.compacted_over_limit.store(false, Ordering::SeqCst);
+            return Ok(true);
+        }
+        // No entró. `write` sólo devuelve `false` por espacio: podó y sigue
+        // pasada. `prune_tenth` no reescribe el archivo (sólo borra nodos y
+        // consolida el WAL), así que el espacio muerto no baja y la memoria se
+        // quedaría sin escribir para siempre. Se compacta —reescribir la base
+        // dejando sólo lo vivo ([`compact`])— una vez por episodio y se
+        // reintenta, todo bajo el candado (se reemplaza el handle del guard).
+        self.compact_and_retry(&dir, &mut guard, db, &conversation_id, &extraction, &pruned)
+            .await
+    }
+
+    /// Reescribe la base dejando sólo lo vivo y reintenta la escritura una vez,
+    /// bajo el candado. Se llama cuando [`write`] no escribió por espacio.
+    /// `Ok(false)` si ya se compactó en este episodio, si no hay llave para
+    /// reabrir la copia, o si tras compactar la base sigue pasada.
+    async fn compact_and_retry(
+        &self,
+        dir: &Path,
+        guard: &mut Option<Arc<GrafeoDB>>,
+        db: Arc<GrafeoDB>,
+        conversation_id: &str,
+        extraction: &Arc<Extraction>,
+        pruned: &Arc<AtomicBool>,
+    ) -> Result<bool, String> {
+        // Una sola compactación por episodio: si sigue pasada después, no se
+        // reescribe en cada intento.
+        if self.compacted_over_limit.swap(true, Ordering::SeqCst) {
+            return Ok(false);
+        }
+        // La llave para reabrir la copia (cifrada con la misma cadena de
+        // claves). Sin ella no se compacta ahora; se reintenta cuando haya.
+        let key = match self.secrets.memory_key().await {
+            Ok(MemoryKey::Found(key)) => key,
+            _ => {
+                self.compacted_over_limit.store(false, Ordering::SeqCst);
+                return Ok(false);
+            }
+        };
+        let (dir, conversation_id) = (dir.to_owned(), conversation_id.to_owned());
+        let extraction = extraction.clone();
+        let pruned = pruned.clone();
+        let result = blocking(move || {
+            let fresh = compact(&dir, &db, &key)?;
+            let wrote =
+                write(&fresh, &dir, &extraction, &conversation_id, &pruned).map_err(db_error)?;
+            Ok((wrote, Arc::new(fresh)))
+        })
+        .await;
+        match result {
+            Ok((wrote, fresh)) => {
+                *guard = Some(fresh);
+                if wrote {
+                    self.compacted_over_limit.store(false, Ordering::SeqCst);
+                }
+                Ok(wrote)
+            }
+            Err(error) => {
+                tracing::warn!("no se pudo compactar la memoria: {error}");
+                // La base vieja pudo quedar cerrada a mitad de la compactación:
+                // se fuerza la reapertura (el archivo en disco quedó usable).
+                *guard = None;
+                Ok(false)
+            }
+        }
     }
 
     /// Una conversación borrada (`DeleteConversation`): se descarta lo que
@@ -1269,6 +1355,43 @@ fn write(
     }
     db.wal_checkpoint()?;
     Ok(true)
+}
+
+/// El archivo temporal donde [`compact`] escribe la copia antes de reemplazar
+/// `DB_FILE`. No termina en `.grafeo`, así que no lo confunden ni el WAL
+/// (`lince.grafeo.wal/`) ni los restos de migración ([`migration_leftover`]).
+const COMPACT_TMP: &str = "lince.compacting";
+
+/// Reescribe la base dejando sólo el estado vivo, sin WAL ni espacio muerto, y
+/// la devuelve abierta. [`schema::prune_tenth`] borra nodos pero no encoge el
+/// archivo (consolida el WAL con checkpoints incrementales, no reescribe la
+/// imagen), así que una base inflada sigue pasada del tope y la memoria se
+/// bloquea. [`GrafeoDB::save`] escribe una imagen completa de sólo lo vivo a un
+/// archivo nuevo, cifrada con la misma cadena de claves —reabre con la misma
+/// `key` (verificado en #13)—, se reemplaza `DB_FILE` por ella y se reabre.
+///
+/// Orden a prueba de cortes: la copia se escribe aparte, se cierra la base
+/// vieja, se saca su WAL (para que ningún reinicio lo aplique sobre la imagen
+/// nueva) y recién entonces el `rename` atómico pone la copia en su lugar. Si
+/// algo falla antes del `rename`, el archivo en disco sigue abriéndose: la
+/// copia a medias es un temporal que la próxima compactación limpia.
+fn compact(dir: &Path, db: &GrafeoDB, key: &[u8; MEMORY_KEY_BYTES]) -> Result<GrafeoDB, String> {
+    let final_path = dir.join(DB_FILE);
+    let temp = dir.join(COMPACT_TMP);
+    let wal = final_path.with_extension("grafeo.wal");
+    // `save` falla si el destino existe: se limpia el de un corte anterior.
+    match std::fs::remove_file(&temp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error(&temp)(error)),
+    }
+    db.save(&temp).map_err(db_error)?;
+    // Cerrada la vieja, su WAL queda consolidado y la copia ya tiene todo lo
+    // vivo; a partir de acá el archivo nuevo no necesita WAL.
+    db.close().map_err(db_error)?;
+    remove_dir_if_exists(&wal).map_err(io_error(&wal))?;
+    std::fs::rename(&temp, &final_path).map_err(io_error(&temp))?;
+    open_existing(&final_path, key)
 }
 
 async fn close(db: Option<Arc<GrafeoDB>>) {
