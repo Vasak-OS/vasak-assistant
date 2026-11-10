@@ -693,6 +693,90 @@ mod tests {
         );
         assert_eq!(with_topics.items[0].topics, ["jardinería"]);
     }
+
+    const ESTILOS: [MemoryKind; 2] = [MemoryKind::Style, MemoryKind::Correction];
+
+    #[test]
+    fn un_estilo_o_correccion_dicho_por_la_persona_entra() {
+        for kind in ESTILOS {
+            assert!(item_is_grounded(
+                kind,
+                "Prefiere respuestas cortas",
+                "prefiero que me hables de vos y con respuestas cortas"
+            ));
+        }
+    }
+
+    #[test]
+    fn un_texto_pegado_grande_no_funda_un_estilo_aunque_las_palabras_coincidan() {
+        let texto = "Prefiere respuestas cortas";
+        let grande = format!("prefiero respuestas cortas {}", "relleno ".repeat(200));
+        assert!(grande.len() > 1024);
+        let multilinea = "prefiero\nrespuestas\ncortas\ny\nsimples";
+        assert_eq!(multilinea.lines().count(), 5);
+        for kind in ESTILOS {
+            assert!(!item_is_grounded(kind, texto, &grande));
+            assert!(!item_is_grounded(kind, texto, multilinea));
+        }
+    }
+
+    #[test]
+    fn un_estilo_sin_respaldo_en_lo_que_dijo_la_persona_no_entra() {
+        for kind in ESTILOS {
+            assert!(!item_is_grounded(
+                kind,
+                "Prefiere el modo oscuro y las tablas",
+                "¿qué hora es?"
+            ));
+        }
+    }
+
+    #[test]
+    fn el_umbral_es_mayoria_estricta_de_las_palabras_de_contenido() {
+        let user = "uso rojo verde azul";
+        // 3 de 4 palabras de contenido: entra.
+        assert!(item_is_grounded(
+            MemoryKind::Style,
+            "rojo verde azul negro",
+            user
+        ));
+        // 2 de 4 (justo el 50 %): no entra.
+        assert!(!item_is_grounded(
+            MemoryKind::Style,
+            "rojo verde gris negro",
+            user
+        ));
+    }
+
+    #[test]
+    fn las_palabras_vacias_no_cuentan_como_respaldo() {
+        // Comparten sólo palabras vacías: el contenido (gato, luna) no está.
+        assert!(!item_is_grounded(
+            MemoryKind::Correction,
+            "el gato de la luna",
+            "el vino de la casa"
+        ));
+        // Un texto que es sólo palabras vacías no tiene contenido que fundar.
+        assert!(!item_is_grounded(
+            MemoryKind::Style,
+            "de la que con",
+            "de la que con"
+        ));
+    }
+
+    #[test]
+    fn las_otras_clases_no_dependen_de_lo_que_dijo_la_persona() {
+        let enorme = "relleno ".repeat(500);
+        for kind in [
+            MemoryKind::Preference,
+            MemoryKind::Habit,
+            MemoryKind::Topic,
+            MemoryKind::Alias,
+        ] {
+            assert!(item_is_grounded(kind, "algo sin respaldo", ""));
+            assert!(item_is_grounded(kind, "algo sin respaldo", &enorme));
+        }
+    }
 }
 
 /// La ventana filtrada, el presupuesto de la extracción y las notas contra la
