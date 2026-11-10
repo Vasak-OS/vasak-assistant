@@ -671,13 +671,25 @@ impl Memory {
     /// base o no compartida con el remoto: lista vacía. Con el llavero
     /// bloqueado, el mismo error que las demás: no se puede abrir la base.
     pub async fn list_memories(&self) -> Result<Vec<MemoryRecord>, Error> {
-        if self.dir.is_none() {
+        let Some(dir) = &self.dir else {
             return Ok(Vec::new());
-        }
+        };
         if self.secrets.is_locked().await? {
             return Err(locked());
         }
-        let Ok(db) = self.database().await else {
+        // El candado se mantiene a través del `blocking`: `list_all` lee clase
+        // por clase, y sin el candado un borrado o un alta entre dos clases
+        // daría una lista con recuerdos que nunca coexistieron. Listar es local
+        // (la puerta del remoto no aplica, como en `forget_conversation`), así
+        // que va por `ensure_open`, no por `usable`.
+        let mut guard = self.db.lock().await;
+        if !is_file(&flag(dir)).await {
+            return Ok(Vec::new());
+        }
+        if self.ensure_open(dir, &mut guard).await.is_err() {
+            return Ok(Vec::new());
+        }
+        let Some(db) = guard.clone() else {
             return Ok(Vec::new());
         };
         let records = blocking(move || Ok(schema::list_all(&db)))
@@ -716,7 +728,17 @@ impl Memory {
         // en paralelo con una extracción que está guardando corrompería el
         // almacén cifrado.
         let mut guard = self.db.lock().await;
-        let Ok(db) = self.usable(dir, &mut guard).await else {
+        // Apagada: no hay nada que borrar. Borrar es local, así que la puerta
+        // del remoto no aplica (como en `forget_conversation`) y se va por
+        // `ensure_open`. Si la base no se puede abrir (llave ausente o dañada),
+        // el borrado no ocurrió: se informa, no se finge un `Ok`.
+        if !is_file(&flag(dir)).await {
+            return Ok(());
+        }
+        if let Err(reason) = self.ensure_open(dir, &mut guard).await {
+            return Err(Error::Unavailable(reason.to_owned()));
+        }
+        let Some(db) = guard.clone() else {
             return Ok(());
         };
         let id = id.to_owned();

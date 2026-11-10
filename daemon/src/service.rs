@@ -110,7 +110,8 @@ pub fn is_confined(label: Option<&[u8]>) -> bool {
 
 fn access_denied() -> Error {
     Error::AccessDenied(
-        "Una aplicación confinada no puede cambiar la memoria ni las claves del asistente.".into(),
+        "Una aplicación confinada no puede acceder a la memoria ni a las claves del asistente."
+            .into(),
     )
 }
 
