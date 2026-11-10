@@ -163,7 +163,19 @@ pub struct Memory {
     /// [`Self::store_at`], bajo el candado. Hace de época por conversación:
     /// los ids son uuid y no vuelven, así que basta con recordar que se borró.
     forgotten: parking_lot::Mutex<std::collections::VecDeque<String>>,
+    /// Conversaciones borradas (`DeleteConversation`) con la memoria apagada o
+    /// la base sin abrir: su borrado queda pendiente y se aplica en el próximo
+    /// open exitoso de la base ([`Self::flush_pending_deletes`]). Vive sólo
+    /// mientras corre el demonio (best-effort). Aparte de `forgotten`, que
+    /// bloquea el re-guardado de extracciones en vuelo y no debe perder un id
+    /// de borrado al evictarse.
+    pending_deletes: parking_lot::Mutex<std::collections::VecDeque<String>>,
 }
+
+/// Cuántos borrados pendientes se recuerdan. Al llegar al tope se descarta el
+/// más viejo (como `forgotten`): la cola es best-effort y sólo vive mientras
+/// corre el demonio, la salida para un borrado seguro es `ClearMemory`.
+const MAX_PENDING_DELETES: usize = 256;
 
 /// Cuántas conversaciones borradas se recuerdan en `forgotten`. Vaciarlo no
 /// deja pasar nada: la extracción en vuelo se cancela por `in_flight`, y el
@@ -210,6 +222,7 @@ impl Memory {
             pruned_over_limit: Arc::default(),
             last_open_problem: parking_lot::Mutex::default(),
             forgotten: parking_lot::Mutex::default(),
+            pending_deletes: parking_lot::Mutex::default(),
         }
     }
 
@@ -501,11 +514,12 @@ impl Memory {
     /// memoria no se puede usar, sólo queda la cancelación.
     ///
     /// Con la memoria apagada no se toca la base (apagar no lee ni escribe,
-    /// decisión 10), y el resumen de una conversación borrada mientras estaba
-    /// apagada queda: no se anota en ningún lado para borrarlo al encender,
-    /// porque eso sería escribir con la memoria apagada. La salida para eso es
-    /// `ClearMemory`. Lo mismo si la memoria no se pudo abrir (llavero
-    /// bloqueado, llave que falta): no se reintenta después.
+    /// decisión 10) y con el llavero bloqueado tampoco se puede abrir: en esos
+    /// casos el borrado queda pendiente en RAM ([`Self::enqueue_pending_delete`])
+    /// y se aplica en el próximo open exitoso de la base
+    /// ([`Self::flush_pending_deletes`]). Es best-effort: la cola vive sólo
+    /// mientras corre el demonio. No se escribe nada con la memoria apagada; la
+    /// salida para un borrado seguro sigue siendo `ClearMemory`.
     pub async fn forget_conversation(&self, conversation_id: &str) {
         if let Some((id, cancelled)) = &*self.in_flight.lock() {
             if id == conversation_id {
@@ -525,12 +539,20 @@ impl Memory {
         };
         let mut db = self.db.lock().await;
         if !is_file(&flag(dir)).await {
+            // Apagada: no se escribe (decisión 10). Queda pendiente para el
+            // próximo open.
+            self.enqueue_pending_delete(conversation_id);
             return;
         }
         // Borrar no le manda nada a ningún modelo: la puerta del remoto no
         // aplica, sólo que esté encendida y abierta.
         if let Err(reason) = self.ensure_open(dir, &mut db).await {
-            tracing::warn!("no se borraron los resúmenes de la conversación: {reason}");
+            // Base sin abrir (llavero bloqueado, llave que falta): queda
+            // pendiente para el próximo open exitoso.
+            self.enqueue_pending_delete(conversation_id);
+            tracing::warn!(
+                "los resúmenes de la conversación quedan pendientes de borrado: {reason}"
+            );
             return;
         }
         let Some(db) = db.clone() else { return };
@@ -544,6 +566,50 @@ impl Memory {
             ),
             Err(error) => {
                 tracing::warn!("no se borraron los resúmenes de la conversación: {error}")
+            }
+        }
+    }
+
+    /// Encola una conversación para borrar sus resúmenes en el próximo open de
+    /// la base. Dedup por id (no encola uno ya presente) y tope propio: al
+    /// llegar a [`MAX_PENDING_DELETES`] descarta el más viejo, como `forgotten`.
+    fn enqueue_pending_delete(&self, conversation_id: &str) {
+        let mut pending = self.pending_deletes.lock();
+        if pending.iter().any(|id| id == conversation_id) {
+            return;
+        }
+        if pending.len() >= MAX_PENDING_DELETES {
+            pending.pop_front();
+        }
+        pending.push_back(conversation_id.to_owned());
+    }
+
+    /// Drena los borrados pendientes contra la base recién abierta. Best-effort:
+    /// cada id sale de la cola sólo cuando su borrado terminó bien; si uno falla
+    /// se vuelve a poner y se corta, para reintentarlo en el próximo open. Corre
+    /// bajo el candado de la base que tiene el llamador de `open_now`, mismo
+    /// invariante de serialización que el resto de escritores.
+    async fn flush_pending_deletes(&self, db: &Arc<GrafeoDB>) {
+        loop {
+            let Some(id) = self.pending_deletes.lock().pop_front() else {
+                break;
+            };
+            let db = db.clone();
+            let for_delete = id.clone();
+            let short = short_id(&id);
+            match blocking(move || schema::delete_summaries(&db, &for_delete).map_err(db_error))
+                .await
+            {
+                Ok(deleted) => tracing::debug!(
+                    conversation = %short,
+                    deleted,
+                    "se borraron los resúmenes pendientes de la conversación"
+                ),
+                Err(error) => {
+                    tracing::warn!("no se borraron los resúmenes pendientes: {error}");
+                    self.pending_deletes.lock().push_front(id);
+                    break;
+                }
             }
         }
     }
@@ -793,7 +859,13 @@ impl Memory {
         let opened = blocking(move || open_existing(&path, &key)).await;
         match opened {
             Ok(opened) => {
-                *db = Some(Arc::new(opened));
+                // Transición cerrada→abierta: es el único punto por el que pasan
+                // los dos caminos de reapertura (desbloqueo del llavero vía la
+                // próxima op, y re-encendido vía `set_enabled`→`ensure_open`),
+                // así que acá se drenan los borrados que quedaron pendientes.
+                let opened = Arc::new(opened);
+                *db = Some(opened.clone());
+                self.flush_pending_deletes(&opened).await;
                 Ok(())
             }
             Err(error) if error == OLD_FORMAT => Err(REASON_OLD_FORMAT),
