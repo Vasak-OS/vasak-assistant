@@ -1373,8 +1373,10 @@ const COMPACT_TMP: &str = "lince.compacting";
 /// Orden a prueba de cortes: la copia se escribe aparte, se cierra la base
 /// vieja, se saca su WAL (para que ningún reinicio lo aplique sobre la imagen
 /// nueva) y recién entonces el `rename` atómico pone la copia en su lugar. Si
-/// algo falla antes del `rename`, el archivo en disco sigue abriéndose: la
-/// copia a medias es un temporal que la próxima compactación limpia.
+/// algo falla antes del `rename`, el archivo en disco sigue abriéndose y el
+/// temporal a medias se borra ahí mismo: dejarlo contaría en `dir_size` y, con
+/// el latch de una compactación por episodio ya puesto, bloquearía la escritura
+/// hasta reiniciar (un `save` sin espacio es el disparador probable).
 fn compact(dir: &Path, db: &GrafeoDB, key: &[u8; MEMORY_KEY_BYTES]) -> Result<GrafeoDB, String> {
     let final_path = dir.join(DB_FILE);
     let temp = dir.join(COMPACT_TMP);
@@ -1385,12 +1387,27 @@ fn compact(dir: &Path, db: &GrafeoDB, key: &[u8; MEMORY_KEY_BYTES]) -> Result<Gr
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(io_error(&temp)(error)),
     }
-    db.save(&temp).map_err(db_error)?;
-    // Cerrada la vieja, su WAL queda consolidado y la copia ya tiene todo lo
-    // vivo; a partir de acá el archivo nuevo no necesita WAL.
-    db.close().map_err(db_error)?;
-    remove_dir_if_exists(&wal).map_err(io_error(&wal))?;
-    std::fs::rename(&temp, &final_path).map_err(io_error(&temp))?;
+    let replaced = (|| {
+        db.save(&temp).map_err(db_error)?;
+        // Cerrada la vieja, su WAL queda consolidado y la copia ya tiene todo lo
+        // vivo; a partir de acá el archivo nuevo no necesita WAL.
+        db.close().map_err(db_error)?;
+        remove_dir_if_exists(&wal).map_err(io_error(&wal))?;
+        std::fs::rename(&temp, &final_path).map_err(io_error(&temp))?;
+        // `save` sincroniza el temporal, pero el `rename` en sí no es durable
+        // sin un fsync del directorio: un corte de luz justo después podría
+        // revertir a la entrada vieja y perder la copia nueva.
+        std::fs::File::open(dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(io_error(dir))
+    })();
+    if let Err(error) = replaced {
+        // Antes del `rename` el temporal a medias sigue acá; borrarlo evita que
+        // infle `dir_size` y trabe el próximo intento. Tras un `rename` exitoso
+        // ya no existe y esto es un no-op.
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
     open_existing(&final_path, key)
 }
 
