@@ -355,19 +355,14 @@ const MAX_GROUNDING_USER_LINES: usize = 5;
 const STOPWORDS: &[&str] = &[
     "el", "la", "los", "las", "un", "una", "unos", "unas", "lo", "al", "del", "de", "a", "ante",
     "con", "contra", "desde", "en", "entre", "hacia", "hasta", "para", "por", "segun", "sin", "so",
-    "sobre", "tras", "y", "e", "o", "u", "ni", "que", "qué", "como", "cuando", "donde", "porque",
-    "pues", "si", "no", "se", "me", "te", "nos", "os", "le", "les", "mi", "tu", "su", "mis", "tus",
-    "sus", "yo", "vos", "tú", "usted", "el", "ella", "ello", "ellos", "ellas", "este", "esta",
-    "esto", "estos", "estas", "ese", "esa", "eso", "esos", "esas", "es", "soy", "sos", "son",
-    "era", "fue", "ser", "estar", "esta", "estan", "muy", "mas", "pero", "ya", "tambien", "solo",
-    "cada", "todo", "toda", "todos", "todas", "me", "mio", "mia",
+    "sobre", "tras", "y", "e", "o", "u", "ni", "que", "como", "cuando", "donde", "porque", "pues",
+    "si", "no", "se", "me", "te", "nos", "os", "le", "les", "mi", "tu", "su", "mis", "tus", "sus",
+    "yo", "vos", "usted", "ella", "ello", "ellos", "ellas", "este", "esta", "esto", "estos",
+    "estas", "ese", "esa", "eso", "esos", "esas", "es", "soy", "sos", "son", "era", "fue", "ser",
+    "estar", "estan", "muy", "mas", "pero", "ya", "tambien", "solo", "cada", "todo", "toda",
+    "todos", "todas", "mio", "mia",
 ];
 
-/// Si el recuerdo nace de lo que dijo la persona: la mayoría de sus palabras de
-/// contenido (normalizadas, sin palabras vacías) aparece en el último mensaje,
-/// y ese mensaje es chico. Un `Style` o una `Correction` pesan más que nada y
-/// se inyectan en todos los turnos, así que un texto pegado no tiene que poder
-/// plantar uno con palabras que la persona nunca dijo.
 /// Si un recuerdo extraído entra en la memoria: un `Style` o una `Correction`
 /// sólo si nacen de lo que dijo la persona (#10); las demás clases, siempre.
 pub fn item_is_grounded(kind: MemoryKind, text: &str, last_user: &str) -> bool {
@@ -375,6 +370,17 @@ pub fn item_is_grounded(kind: MemoryKind, text: &str, last_user: &str) -> bool {
         || derives_from_user(text, last_user)
 }
 
+/// Si el recuerdo nace de lo que dijo la persona: la mayoría de sus palabras de
+/// contenido (normalizadas, sin palabras vacías) aparece en el último mensaje,
+/// y ese mensaje es chico. Un `Style` o una `Correction` pesan más que nada y
+/// se inyectan en todos los turnos, así que un texto pegado no tiene que poder
+/// plantar uno con palabras que la persona nunca dijo.
+///
+/// Límite conocido: si el propio último mensaje de la persona es un snippet
+/// corto que afirma la preferencia, se acepta —es casi indistinguible de que lo
+/// diga ella—. El THREAT-MODEL deja ese caso afuera; lo que esta puerta frena
+/// es el pegado grande (una página, un correo) y el texto que no echa raíz en
+/// lo que la persona dijo.
 fn derives_from_user(text: &str, last_user: &str) -> bool {
     if last_user.len() > MAX_GROUNDING_USER_BYTES
         || last_user.lines().count() >= MAX_GROUNDING_USER_LINES
