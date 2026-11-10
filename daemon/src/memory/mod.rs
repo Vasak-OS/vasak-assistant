@@ -2740,6 +2740,23 @@ mod forget_tests {
     }
 
     #[tokio::test]
+    async fn un_borrado_pendiente_se_reintenta_aunque_la_base_ya_este_abierta() {
+        let (_tmp, memory) = enabled().await;
+        memory.store(summary("Resumen de A"), "a").await.unwrap();
+        memory.store(summary("Resumen de B"), "b").await.unwrap();
+        // Estado «un borrado falló y la base siguió abierta»: sin transición
+        // cerrada→abierta de por medio.
+        memory.pending_deletes.lock().push_back("a".into());
+
+        // Una operación que no es un olvido pasa por `ensure_open` y drena.
+        let listed = memory.list_memories().await.unwrap();
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(summaries(&memory).await, ["Resumen de B"]);
+        assert!(memory.pending_deletes.lock().is_empty());
+    }
+
+    #[tokio::test]
     async fn encolar_el_mismo_borrado_dos_veces_no_lo_duplica_y_la_cola_tiene_tope() {
         let (_tmp, memory) = enabled().await;
         memory.set_enabled(false).await.unwrap();
