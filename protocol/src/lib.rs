@@ -70,6 +70,22 @@ pub const MAX_CONVERSATIONS_PER_OWNER: usize = 8;
 /// y los demás no esperan hasta el plazo de D-Bus.
 pub const MAX_CHATS_IN_FLIGHT_PER_OWNER: usize = 2;
 
+// El cupo de las aplicaciones confinadas (AppArmor) es **uno solo y compartido**
+// entre todas, cualquiera sea su perfil y cuántas conexiones al bus abran: el
+// cupo se cuenta por nombre único de conexión, y una app podría abrir varias
+// para multiplicarlo. Con un bucket común y chico, siempre queda lugar en el
+// total ([`MAX_CONVERSATIONS`]) para el chat de la persona, que corre sin
+// confinar. La **propiedad** de cada conversación sigue por conexión: una app
+// confinada no ve ni toca las de otra; lo único compartido es el conteo.
+
+/// Cuántas conversaciones pueden tener abiertas, entre **todas** las
+/// aplicaciones confinadas a la vez. Compartido, no por aplicación.
+pub const MAX_CONVERSATIONS_CONFINED: usize = 3;
+
+/// Cuántos `Chat` pueden tener en vuelo, entre **todas** las aplicaciones
+/// confinadas a la vez. Compartido, no por aplicación.
+pub const MAX_CHATS_IN_FLIGHT_CONFINED: usize = 1;
+
 /// Cuántos mensajes guarda una conversación. Pasado eso se olvidan los más
 /// viejos; el último intercambio se conserva siempre.
 pub const MAX_HISTORY_MESSAGES: usize = 100;

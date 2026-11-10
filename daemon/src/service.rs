@@ -370,7 +370,15 @@ impl AssistantService {
         let Some(sender) = header.sender() else {
             return Err(no_sender());
         };
-        let id = self.open(sender.as_str())?;
+        // El cupo de una app confinada sale del bucket compartido de los
+        // confinados, no del tope por dueño: se resuelve acá, con el bus, igual
+        // que la puerta de la memoria. Si el bus no contesta, cuenta como
+        // confinada (falla cerrado). La propiedad sigue siendo del `sender`.
+        let confined = self.confined(connection, header).await;
+        let id = self
+            .conversations
+            .lock()
+            .create(sender.as_str(), confined)?;
         // Punto a punto no hay demonio del bus a quien preguntar (el par no
         // contestaría y la llamada quedaría colgada), y el único par es el
         // que está llamando.
@@ -474,8 +482,12 @@ impl AssistantService {
         }
     }
 
+    /// Abre una conversación sin confinar (el tope por dueño). El camino del
+    /// bus (`NewConversation`) resuelve el confinamiento y llama a `create`
+    /// directo, así que esto queda sólo para las pruebas.
+    #[cfg(test)]
     pub fn open(&self, owner: &str) -> Result<String, Error> {
-        self.conversations.lock().create(owner)
+        self.conversations.lock().create(owner, false)
     }
 
     pub fn list(&self, owner: &str) -> Vec<String> {
@@ -1307,7 +1319,7 @@ mod tests {
         conversations: &Mutex<Conversations>,
         still_connected: zbus::Result<bool>,
     ) -> (String, Result<String, Error>) {
-        let id = conversations.lock().create(":1.7").unwrap();
+        let id = conversations.lock().create(":1.7", false).unwrap();
         let result = settle_new_conversation(conversations, ":1.7", id.clone(), still_connected);
         (id, result)
     }
@@ -1323,8 +1335,8 @@ mod tests {
     #[test]
     fn si_el_dueno_ya_se_fue_se_liberan_sus_conversaciones_y_se_contesta_not_found() {
         let conversations = Mutex::new(Conversations::default());
-        let ajena = conversations.lock().create(":1.8").unwrap();
-        conversations.lock().create(":1.7").unwrap();
+        let ajena = conversations.lock().create(":1.8", false).unwrap();
+        conversations.lock().create(":1.7", false).unwrap();
 
         let (_, result) = settle(&conversations, Ok(false));
 
@@ -1340,12 +1352,12 @@ mod tests {
         let conversations = Mutex::new(Conversations::default());
         for i in 0..MAX_CONVERSATIONS * 3 {
             let owner = format!(":1.{}", 100 + i);
-            let id = conversations.lock().create(&owner).unwrap();
+            let id = conversations.lock().create(&owner, false).unwrap();
             let result = settle_new_conversation(&conversations, &owner, id, Ok(false));
             assert!(matches!(result, Err(Error::NotFound(_))));
         }
         assert_eq!(conversations.lock().len(), 0);
-        assert!(conversations.lock().create(":1.1").is_ok());
+        assert!(conversations.lock().create(":1.1", false).is_ok());
     }
 
     #[test]
