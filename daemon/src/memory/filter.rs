@@ -670,9 +670,11 @@ mod hardening_tests {
             "estoy en tratamiento psiquiátrico",
             "soy discapacitado",
             "soy católico",
+            "voy a misa los domingos",
             "soy gay",
             "mi novia es bisexual",
             "soy peronista",
+            "milito en el socialismo",
             "SOY CATÓLICO",
         ] {
             assert!(mentions_sensitive(frase), "{frase}");
