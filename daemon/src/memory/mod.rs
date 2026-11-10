@@ -1708,6 +1708,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn borrar_un_recuerdo_con_la_memoria_encendida_y_la_base_borrada_da_no_disponible() {
+        let fixture = Fixture::enabled().await;
+        fixture.memory.close().await;
+        // Corrupción externa: el indicador y la llave siguen, la base no.
+        std::fs::remove_file(fixture.files().join(DB_FILE)).unwrap();
+        let restarted = fixture.restarted();
+
+        let result = restarted.delete_memory("x").await;
+
+        assert!(matches!(result, Err(Error::Unavailable(text)) if text == REASON_NOT_OPENED));
+        assert!(fixture.tmp.path().join("enabled").is_file());
+        assert!(fixture.key_is_stored());
+    }
+
+    #[tokio::test]
     async fn listar_y_borrar_con_la_memoria_apagada_no_dan_nada_ni_fallan() {
         let fixture = Fixture::new();
 
