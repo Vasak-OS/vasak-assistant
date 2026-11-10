@@ -487,7 +487,15 @@ static ADDRESS: LazyLock<Regex> = LazyLock::new(|| {
 /// sexual, afiliación política) o un domicilio. Como [`is_user_data`], son
 /// datos de la persona que la memoria descarta.
 pub fn mentions_sensitive(text: &str) -> bool {
-    normalize_terms(text)
+    // Mismo plegado que `contains_secret`/`is_user_data` (NFKC + sin tildes +
+    // homoglifos cirílicos a latín): en `extraction_window`, que no pasa por la
+    // lista blanca de `is_clean_note`, un término en ancho completo o escrito
+    // con letras cirílicas no tiene que esquivar el filtro.
+    let folded: String = normalize_terms(&nfkc(text))
+        .chars()
+        .map(cyrillic_to_latin)
+        .collect();
+    folded
         .split(|c: char| !c.is_alphanumeric())
         .any(|word| SENSITIVE_WORDS.contains(&word))
         || ADDRESS.is_match(&nfkc(text))
