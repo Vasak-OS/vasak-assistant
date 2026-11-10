@@ -367,8 +367,10 @@ pub trait Assistant {
 
     /// Borra un recuerdo por su `id` (el de [`Self::list_memories`]). Sólo ese:
     /// no toca el resto de la memoria ni el aprendizaje en curso. Borrar uno
-    /// que ya no existe no es error, termina en `Ok`. Apagada o sin base, `Ok`
-    /// sin hacer nada; `Unavailable` si el llavero está bloqueado.
+    /// que ya no existe no es error, termina en `Ok`. Apagada, `Ok` sin hacer
+    /// nada (encender crea la base, así que encendida siempre la hay);
+    /// `Unavailable` si el llavero está bloqueado o la base no abre (la llave
+    /// falta o está dañada): el borrado no ocurrió y no se finge un `Ok`.
     /// `AccessDenied` si quien llama es una aplicación confinada (AppArmor).
     fn delete_memory(&self, id: &str) -> Result<(), Error>;
 }
