@@ -2715,6 +2715,50 @@ mod review_tests {
             1
         );
     }
+
+    /// Invariante estructural: con topes por clase (`max_nodes`) y por texto
+    /// (`max_text`), y el checkpoint que devuelve el espacio muerto, la base
+    /// llena en el peor caso queda muy por debajo de [`MAX_MEMORY_DISK_BYTES`].
+    /// Por eso `write` no puede quedar bloqueado por espacio en el uso normal.
+    /// Si alguien sube un tope de forma peligrosa, esta prueba salta.
+    #[test]
+    fn la_base_llena_a_los_topes_queda_muy_por_debajo_del_tope_de_espacio() {
+        let tmp = TempDir::new();
+        let dir = tmp.memory_dir();
+        let db = create_files(&dir, &[7u8; MEMORY_KEY_BYTES]).unwrap();
+        for kind in schema::MemoryKind::ALL {
+            for n in 0..kind.max_nodes() {
+                // Texto único del largo máximo: el peor caso de datos vivos.
+                let head = format!("{n:04} ");
+                let text = format!("{head}{}", "x".repeat(kind.max_text() - head.len()));
+                assert_eq!(text.len(), kind.max_text());
+                let (phrase, conversation) = match kind {
+                    schema::MemoryKind::Alias => (Some("f".repeat(kind.max_text())), None),
+                    schema::MemoryKind::ConversationSummary => (None, Some(format!("c{n}"))),
+                    _ => (None, None),
+                };
+                schema::upsert(
+                    &db,
+                    &schema::NewMemory {
+                        kind,
+                        text: &text,
+                        phrase: phrase.as_deref(),
+                        conversation: conversation.as_deref(),
+                    },
+                    1_800_000_000 + n as i64,
+                )
+                .unwrap();
+            }
+        }
+        db.wal_checkpoint().unwrap();
+
+        let size = dir_size(&dir);
+        eprintln!("base llena a topes: {size} bytes de {MAX_MEMORY_DISK_BYTES}");
+        assert!(
+            size < MAX_MEMORY_DISK_BYTES / 2,
+            "la base llena a sus topes ocupa {size} bytes: se acerca a {MAX_MEMORY_DISK_BYTES}"
+        );
+    }
 }
 
 /// Olvidar una conversación borrada.
