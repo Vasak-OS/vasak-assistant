@@ -683,4 +683,87 @@ mod tests {
             assert!(MAX_CONVERSATIONS > 0);
         }
     }
+
+    mod dueno_del_nombre {
+        use super::*;
+
+        const UNIT: &str = "vasak-assistant.service";
+        const V2: &str =
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/vasak-assistant.service";
+
+        #[test]
+        fn el_unit_del_contrato_es_el_del_demonio() {
+            assert_eq!(SERVICE_UNIT, UNIT);
+        }
+
+        #[test]
+        fn cgroup_v2_real_es_el_servicio_con_y_sin_salto_final() {
+            assert!(cgroup_is_service(&format!("{V2}\n"), UNIT));
+            assert!(cgroup_is_service(V2, UNIT));
+        }
+
+        #[test]
+        fn cgroup_v1_con_varias_lineas_acepta_si_una_termina_en_el_unit() {
+            let v1 = "12:pids:/user.slice/user@1000.service/app.slice/vasak-assistant.service\n\
+                      4:cpu:/user.slice\n\
+                      0::/user.slice/user@1000.service/app.slice/vasak-assistant.service\n";
+            assert!(cgroup_is_service(v1, UNIT));
+            // Basta una línea buena aunque las otras no lo sean.
+            assert!(cgroup_is_service(
+                "4:cpu:/user.slice\n0::/x/vasak-assistant.service",
+                UNIT
+            ));
+        }
+
+        #[test]
+        fn un_sufijo_pegado_al_unit_no_pasa() {
+            for evil in [
+                "0::/user.slice/vasak-assistant.service.evil",
+                "0::/user.slice/vasak-assistant.service-evil",
+                "0::/user.slice/xvasak-assistant.service",
+                "0::/user.slice/evil-vasak-assistant.service",
+            ] {
+                assert!(!cgroup_is_service(evil, UNIT), "{evil}");
+            }
+        }
+
+        #[test]
+        fn el_unit_en_un_segmento_intermedio_no_pasa() {
+            // Anidamiento: el unit no es el último segmento, falla cerrado.
+            assert!(!cgroup_is_service(
+                "0::/a/vasak-assistant.service/algo",
+                UNIT
+            ));
+            assert!(!cgroup_is_service("0::/a/vasak-assistant.service/", UNIT));
+        }
+
+        #[test]
+        fn otro_unit_no_pasa() {
+            assert!(!cgroup_is_service("0::/user.slice/otra-cosa.service", UNIT));
+        }
+
+        #[test]
+        fn entrada_vacia_o_malformada_no_pasa() {
+            assert!(!cgroup_is_service("", UNIT));
+            assert!(!cgroup_is_service("\n\n", UNIT));
+            assert!(!cgroup_is_service("vasak-assistant.service", UNIT));
+            assert!(!cgroup_is_service("0:/vasak-assistant.service", UNIT));
+            assert!(!cgroup_is_service("basura sin dos puntos", UNIT));
+        }
+
+        #[test]
+        fn un_unit_vacio_no_pasa_contra_ningun_cgroup() {
+            assert!(!cgroup_is_service(V2, ""));
+            assert!(!cgroup_is_service("0::/", ""));
+            assert!(!cgroup_is_service("0::", ""));
+            assert!(!cgroup_is_service("", ""));
+        }
+
+        #[test]
+        fn una_ruta_sin_segmentos_no_pasa() {
+            assert!(!cgroup_is_service("0::/", UNIT));
+            assert!(!cgroup_is_service("0::", UNIT));
+            assert!(!cgroup_is_service("0::///", UNIT));
+        }
+    }
 }
