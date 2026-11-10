@@ -2,6 +2,21 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-assistant 0.3.15
+
+La poda por espacio de la memoria compacta la base si borrar no alcanza, para
+no quedar bloqueada sin escribir (#13).
+
+- **`daemon`** — si la base pasa `MAX_MEMORY_DISK_BYTES` (4 MiB) y `prune_tenth`
+  no la baja (borrar en Grafeo no encoge el archivo), `store_at` compacta: copia
+  el estado vivo con `GrafeoDB::save` (cifrada con la misma llave, sin WAL),
+  reemplaza el archivo con un `rename` atómico y la reabre, y reintenta la
+  escritura; una compactación por episodio. Antes devolvía `Ok(false)` y la
+  memoria dejaba de escribir sin avisar. Es defensa en profundidad: los topes
+  por clase y por texto más el checkpoint que recupera el espacio muerto mantienen
+  la base muy por debajo del tope (una prueba fija que llena a topes queda en
+  ~356 KiB), así que el camino no se dispara por uso normal.
+
 ## vasak-assistant 0.3.14
 
 El borrado de una conversación ya no se olvida en silencio si la memoria está
