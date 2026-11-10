@@ -61,7 +61,7 @@ use std::sync::Arc;
 use grafeo::{Config, EncryptionConfig, GrafeoDB, KeyChain, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Semaphore};
-use vasak_assistant_protocol::{Error, MemoryStatus, Message, Role};
+use vasak_assistant_protocol::{Error, Memory as MemoryRecord, MemoryStatus, Message, Role};
 use zeroize::Zeroizing;
 
 use crate::backend::ModelBackend;
@@ -665,6 +665,86 @@ impl Memory {
         }
         tracing::info!(recreated, "memoria borrada");
         Ok(())
+    }
+
+    /// Los recuerdos guardados, para mostrárselos a la persona. Apagada, sin
+    /// base o no compartida con el remoto: lista vacía. Con el llavero
+    /// bloqueado, el mismo error que las demás: no se puede abrir la base.
+    pub async fn list_memories(&self) -> Result<Vec<MemoryRecord>, Error> {
+        let Some(dir) = &self.dir else {
+            return Ok(Vec::new());
+        };
+        if self.secrets.is_locked().await? {
+            return Err(locked());
+        }
+        // El candado se mantiene a través del `blocking`: `list_all` lee clase
+        // por clase, y sin el candado un borrado o un alta entre dos clases
+        // daría una lista con recuerdos que nunca coexistieron. Listar es local
+        // (la puerta del remoto no aplica, como en `forget_conversation`), así
+        // que va por `ensure_open`, no por `usable`.
+        let mut guard = self.db.lock().await;
+        if !is_file(&flag(dir)).await {
+            return Ok(Vec::new());
+        }
+        if self.ensure_open(dir, &mut guard).await.is_err() {
+            return Ok(Vec::new());
+        }
+        let Some(db) = guard.clone() else {
+            return Ok(Vec::new());
+        };
+        let records = blocking(move || Ok(schema::list_all(&db)))
+            .await
+            .map_err(Error::Unavailable)?;
+        Ok(records
+            .into_iter()
+            .map(|(id, found)| MemoryRecord {
+                id,
+                kind: found.kind.label().to_owned(),
+                text: found.text,
+                weight: found.weight,
+            })
+            .collect())
+    }
+
+    /// Borra un recuerdo por su `id`. Apagada o sin base: no hay nada que
+    /// borrar, `Ok`. Con el llavero bloqueado, el mismo error que `clear`.
+    ///
+    /// Idempotente a propósito: un `id` que no existe termina en `Ok`, como
+    /// apagar lo ya apagado, y así no es una carrera que la interfaz borre uno
+    /// que la poda acaba de sacar. Una baja puntual **no** sube la época: a
+    /// diferencia de `clear`, no invalida las extracciones en curso ni
+    /// reinicia las ventanas de aprendizaje; sólo saca ese nodo.
+    pub async fn delete_memory(&self, id: &str) -> Result<(), Error> {
+        let Some(dir) = &self.dir else {
+            return Ok(());
+        };
+        if self.secrets.is_locked().await? {
+            return Err(locked());
+        }
+        // El candado se toma acá y vive a través del `blocking`, como el resto
+        // de los escritores (`store_at`, `forget_conversation`, `clear`): el
+        // módulo serializa las escrituras con `self.db.lock()`. `database()` lo
+        // soltaría al retornar, y borrar (`delete` + `gc` + `wal_checkpoint`)
+        // en paralelo con una extracción que está guardando corrompería el
+        // almacén cifrado.
+        let mut guard = self.db.lock().await;
+        // Apagada: no hay nada que borrar. Borrar es local, así que la puerta
+        // del remoto no aplica (como en `forget_conversation`) y se va por
+        // `ensure_open`. Si la base no se puede abrir (llave ausente o dañada),
+        // el borrado no ocurrió: se informa, no se finge un `Ok`.
+        if !is_file(&flag(dir)).await {
+            return Ok(());
+        }
+        if let Err(reason) = self.ensure_open(dir, &mut guard).await {
+            return Err(Error::Unavailable(reason.to_owned()));
+        }
+        let Some(db) = guard.clone() else {
+            return Ok(());
+        };
+        let id = id.to_owned();
+        blocking(move || schema::delete_by_id(&db, &id).map(drop).map_err(db_error))
+            .await
+            .map_err(Error::Unavailable)
     }
 
     /// Abre la base si no lo está. Nunca crea ni borra nada.
@@ -1590,6 +1670,79 @@ mod tests {
         // Desbloqueado, el recuerdo sigue ahí.
         *fixture.keys.locked.lock() = false;
         assert!(fixture.restarted().recall("mate", false).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn listar_trae_los_recuerdos_con_el_nombre_de_su_clase_y_el_peso() {
+        let fixture = Fixture::enabled().await;
+        fixture
+            .memory
+            .store(preference("Prefiere el mate"), "c")
+            .await
+            .unwrap();
+
+        let all = fixture.memory.list_memories().await.unwrap();
+
+        assert_eq!(all.len(), 1);
+        assert!(!all[0].id.is_empty());
+        assert_eq!(all[0].kind, MemoryKind::Preference.label());
+        assert_eq!(all[0].text, "Prefiere el mate");
+        assert_eq!(all[0].weight, MemoryKind::Preference.initial_weight());
+    }
+
+    #[tokio::test]
+    async fn borrar_un_recuerdo_deja_los_otros_y_un_id_inexistente_da_ok() {
+        let fixture = Fixture::enabled().await;
+        for text in ["Prefiere el mate", "Prefiere respuestas cortas"] {
+            fixture.memory.store(preference(text), "c").await.unwrap();
+        }
+        let all = fixture.memory.list_memories().await.unwrap();
+        let gone = all.iter().find(|m| m.text == "Prefiere el mate").unwrap();
+
+        fixture.memory.delete_memory(&gone.id).await.unwrap();
+        fixture.memory.delete_memory("no-existe").await.unwrap();
+
+        let left = fixture.memory.list_memories().await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].text, "Prefiere respuestas cortas");
+    }
+
+    #[tokio::test]
+    async fn borrar_un_recuerdo_con_la_memoria_encendida_y_la_base_borrada_da_no_disponible() {
+        let fixture = Fixture::enabled().await;
+        fixture.memory.close().await;
+        // Corrupción externa: el indicador y la llave siguen, la base no.
+        std::fs::remove_file(fixture.files().join(DB_FILE)).unwrap();
+        let restarted = fixture.restarted();
+
+        let result = restarted.delete_memory("x").await;
+
+        assert!(matches!(result, Err(Error::Unavailable(text)) if text == REASON_NOT_OPENED));
+        assert!(fixture.tmp.path().join("enabled").is_file());
+        assert!(fixture.key_is_stored());
+    }
+
+    #[tokio::test]
+    async fn listar_y_borrar_con_la_memoria_apagada_no_dan_nada_ni_fallan() {
+        let fixture = Fixture::new();
+
+        assert!(fixture.memory.list_memories().await.unwrap().is_empty());
+        fixture.memory.delete_memory("x").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn listar_y_borrar_con_el_llavero_bloqueado_fallan_como_borrar_todo() {
+        let fixture = Fixture::enabled().await;
+        *fixture.keys.locked.lock() = true;
+
+        assert!(matches!(
+            fixture.memory.list_memories().await,
+            Err(Error::Unavailable(text)) if text.contains("bloqueado")
+        ));
+        assert!(matches!(
+            fixture.memory.delete_memory("x").await,
+            Err(Error::Unavailable(text)) if text.contains("bloqueado")
+        ));
     }
 
     #[tokio::test]

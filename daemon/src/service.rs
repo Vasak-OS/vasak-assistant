@@ -26,8 +26,8 @@ use zbus::names::BusName;
 use zbus::{interface, Connection};
 
 use vasak_assistant_protocol::{
-    Capability, Error, MemoryStatus, Message, Role, ServiceStatus, DOMAINS, DOMAIN_MEMORY,
-    DOMAIN_REMOTE_BACKENDS,
+    Capability, Error, Memory as MemoryRecord, MemoryStatus, Message, Role, ServiceStatus, DOMAINS,
+    DOMAIN_MEMORY, DOMAIN_REMOTE_BACKENDS,
 };
 
 use crate::backend::{BackendError, BoxFuture, ModelBackend};
@@ -110,7 +110,8 @@ pub fn is_confined(label: Option<&[u8]>) -> bool {
 
 fn access_denied() -> Error {
     Error::AccessDenied(
-        "Una aplicación confinada no puede cambiar la memoria ni las claves del asistente.".into(),
+        "Una aplicación confinada no puede acceder a la memoria ni a las claves del asistente."
+            .into(),
     )
 }
 
@@ -318,6 +319,40 @@ impl AssistantService {
         let result = async {
             self.deny_confined(connection, &header).await?;
             self.memory.clear().await
+        }
+        .await;
+        call.finish(result)
+    }
+
+    /// Los recuerdos que guarda, para que la persona vea qué recuerda el
+    /// asistente. Restringido igual que `SetMemoryEnabled`: `AccessDenied`
+    /// para un llamador confinado.
+    async fn list_memories(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> Result<Vec<MemoryRecord>, Error> {
+        let call = Call::new("ListMemories", &header);
+        let result = async {
+            self.deny_confined(connection, &header).await?;
+            self.memory.list_memories().await
+        }
+        .await;
+        call.finish(result)
+    }
+
+    /// Borra un recuerdo por su `id`, sin tocar el resto. Restringido igual que
+    /// `SetMemoryEnabled`: `AccessDenied` para un llamador confinado.
+    async fn delete_memory(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        id: String,
+    ) -> Result<(), Error> {
+        let call = Call::new("DeleteMemory", &header);
+        let result = async {
+            self.deny_confined(connection, &header).await?;
+            self.memory.delete_memory(&id).await
         }
         .await;
         call.finish(result)
@@ -2011,6 +2046,8 @@ mod gate_tests {
 
             denied(gate.proxy.set_memory_enabled(false).await);
             denied(gate.proxy.clear_memory().await);
+            denied(gate.proxy.list_memories().await);
+            denied(gate.proxy.delete_memory("cualquiera").await);
 
             let status = gate.memory.status().await;
             assert!(status.enabled && status.available, "{name}");
@@ -2061,7 +2098,7 @@ mod gate_tests {
     }
 
     #[tokio::test]
-    async fn sin_etiqueta_o_unconfined_los_cinco_metodos_funcionan() {
+    async fn sin_etiqueta_o_unconfined_los_metodos_restringidos_funcionan() {
         for (name, label) in [
             ("sin AppArmor", FixedLabel::none()),
             ("unconfined", FixedLabel::of(b"unconfined\0")),
@@ -2081,10 +2118,12 @@ mod gate_tests {
                 .unwrap());
             let status = gate.proxy.memory_status().await.unwrap();
             assert!(status.enabled && status.available, "{name}");
+            gate.proxy.list_memories().await.unwrap();
+            gate.proxy.delete_memory("no-existe").await.unwrap();
             gate.proxy.clear_memory().await.unwrap();
             gate.proxy.set_memory_enabled(false).await.unwrap();
             assert!(!gate.memory.status().await.enabled, "{name}");
-            assert!(*gate.label.asked.lock() >= 6, "se pregunta en cada pedido");
+            assert!(*gate.label.asked.lock() >= 8, "se pregunta en cada pedido");
         }
     }
 
@@ -3107,6 +3146,12 @@ mod no_sender_tests {
             rig.proxy.set_memory_enabled(true).await,
         );
         denied_with("ClearMemory", "", rig.proxy.clear_memory().await);
+        denied_with("ListMemories", "", rig.proxy.list_memories().await);
+        denied_with(
+            "DeleteMemory",
+            "",
+            rig.proxy.delete_memory("cualquiera").await,
+        );
         denied_with(
             "SetProviderKey",
             "",
@@ -3659,6 +3704,8 @@ mod log_tests {
 
         let _ = rig.proxy.set_memory_enabled(true).await;
         let _ = rig.proxy.clear_memory().await;
+        let _ = rig.proxy.list_memories().await;
+        let _ = rig.proxy.delete_memory("cualquiera").await;
         let _ = rig
             .proxy
             .set_provider_key("https://api.openai.com/v1", "sk-canario")
@@ -3671,6 +3718,8 @@ mod log_tests {
         for method in [
             "SetMemoryEnabled",
             "ClearMemory",
+            "ListMemories",
+            "DeleteMemory",
             "SetProviderKey",
             "HasProviderKey",
         ] {
