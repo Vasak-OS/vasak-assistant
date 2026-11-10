@@ -345,6 +345,58 @@ pub fn truncate(text: &str, max: usize) -> &str {
     &text[..end]
 }
 
+/// Un último mensaje más grande que esto no funda un `Style`/`Correction`: es
+/// un texto pegado (una página, un correo), no algo que la persona dijo.
+const MAX_GROUNDING_USER_BYTES: usize = 1024;
+const MAX_GROUNDING_USER_LINES: usize = 5;
+
+/// Palabras vacías del español (normalizadas, sin tildes): no cuentan como
+/// contenido al comparar un recuerdo contra lo que dijo la persona.
+const STOPWORDS: &[&str] = &[
+    "el", "la", "los", "las", "un", "una", "unos", "unas", "lo", "al", "del", "de", "a", "ante",
+    "con", "contra", "desde", "en", "entre", "hacia", "hasta", "para", "por", "segun", "sin", "so",
+    "sobre", "tras", "y", "e", "o", "u", "ni", "que", "qué", "como", "cuando", "donde", "porque",
+    "pues", "si", "no", "se", "me", "te", "nos", "os", "le", "les", "mi", "tu", "su", "mis", "tus",
+    "sus", "yo", "vos", "tú", "usted", "el", "ella", "ello", "ellos", "ellas", "este", "esta",
+    "esto", "estos", "estas", "ese", "esa", "eso", "esos", "esas", "es", "soy", "sos", "son",
+    "era", "fue", "ser", "estar", "esta", "estan", "muy", "mas", "pero", "ya", "tambien", "solo",
+    "cada", "todo", "toda", "todos", "todas", "me", "mio", "mia",
+];
+
+/// Si el recuerdo nace de lo que dijo la persona: la mayoría de sus palabras de
+/// contenido (normalizadas, sin palabras vacías) aparece en el último mensaje,
+/// y ese mensaje es chico. Un `Style` o una `Correction` pesan más que nada y
+/// se inyectan en todos los turnos, así que un texto pegado no tiene que poder
+/// plantar uno con palabras que la persona nunca dijo.
+pub fn derives_from_user(text: &str, last_user: &str) -> bool {
+    if last_user.len() > MAX_GROUNDING_USER_BYTES
+        || last_user.lines().count() >= MAX_GROUNDING_USER_LINES
+    {
+        return false;
+    }
+    let user_words: std::collections::HashSet<String> =
+        content_words(last_user).into_iter().collect();
+    let content = content_words(text);
+    if content.is_empty() || user_words.is_empty() {
+        return false;
+    }
+    let present = content
+        .iter()
+        .filter(|word| user_words.contains(*word))
+        .count();
+    present * 2 > content.len()
+}
+
+/// Las palabras de contenido de un texto: normalizadas (sin tildes, minúsculas)
+/// y sin las palabras vacías.
+fn content_words(text: &str) -> Vec<String> {
+    normalize_terms(text)
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty() && !STOPWORDS.contains(word))
+        .map(str::to_owned)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -355,6 +355,8 @@ impl Memory {
         ) else {
             return;
         };
+        // El último mensaje de la persona, para fundar Style/Correction (#10).
+        let last_user = user.content.clone();
         let Some(gate) = learn::worth_learning(&user.content, &reply.content, user_turns) else {
             return;
         };
@@ -416,7 +418,15 @@ impl Memory {
                     return;
                 }
             };
-            let extraction = learn::parse_extraction(&reply);
+            let mut extraction = learn::parse_extraction(&reply);
+            // #10: un Style/Correction se inyecta en todos los turnos y con el
+            // peso más alto, así que sólo se acepta si nace de lo que dijo la
+            // persona —no de un texto pegado que el modelo haya convertido en
+            // «preferencia»—.
+            extraction.items.retain(|item| {
+                !matches!(item.kind, MemoryKind::Style | MemoryKind::Correction)
+                    || learn::derives_from_user(&item.text, &last_user)
+            });
             if extraction.items.is_empty() && extraction.summary.is_none() {
                 tracing::debug!(
                     conversation = %short_id(&conversation_id),
