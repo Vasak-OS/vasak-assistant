@@ -703,13 +703,20 @@ impl Memory {
     /// diferencia de `clear`, no invalida las extracciones en curso ni
     /// reinicia las ventanas de aprendizaje; sólo saca ese nodo.
     pub async fn delete_memory(&self, id: &str) -> Result<(), Error> {
-        if self.dir.is_none() {
+        let Some(dir) = &self.dir else {
             return Ok(());
-        }
+        };
         if self.secrets.is_locked().await? {
             return Err(locked());
         }
-        let Ok(db) = self.database().await else {
+        // El candado se toma acá y vive a través del `blocking`, como el resto
+        // de los escritores (`store_at`, `forget_conversation`, `clear`): el
+        // módulo serializa las escrituras con `self.db.lock()`. `database()` lo
+        // soltaría al retornar, y borrar (`delete` + `gc` + `wal_checkpoint`)
+        // en paralelo con una extracción que está guardando corrompería el
+        // almacén cifrado.
+        let mut guard = self.db.lock().await;
+        let Ok(db) = self.usable(dir, &mut guard).await else {
             return Ok(());
         };
         let id = id.to_owned();
