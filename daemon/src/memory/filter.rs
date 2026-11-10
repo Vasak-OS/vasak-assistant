@@ -434,6 +434,7 @@ const SENSITIVE_WORDS: &[&str] = &[
     "religion",
     "religioso",
     "religiosa",
+    "misa",
     // Orientación sexual
     "gay",
     "lesbiana",
@@ -452,13 +453,24 @@ const SENSITIVE_WORDS: &[&str] = &[
     "kirchnerista",
     "kirchnerismo",
     "macrista",
+    "macrismo",
     "socialista",
+    "socialismo",
     "comunista",
+    "comunismo",
     "troskista",
     "trotskista",
+    "trotskismo",
     "anarquista",
+    "anarquismo",
     "libertario",
     "militante",
+    "militancia",
+    "milito",
+    "milita",
+    "militamos",
+    "militan",
+    "militas",
 ];
 
 /// Un domicilio: un tipo de vía, el nombre y la altura («Av. Corrientes 1234»).
