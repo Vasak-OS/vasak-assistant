@@ -823,17 +823,29 @@ impl Memory {
         // Una línea la primera vez y cada vez que cambia el motivo: el estado y
         // cada `recall` vuelven a intentarlo, y no hace falta repetirla. El
         // motivo es un texto fijo, sin la llave.
-        let mut last = self.last_open_problem.lock();
-        match result {
-            Err(reason) if *last != Some(reason) => {
-                tracing::warn!("la memoria no se puede abrir: {reason}");
-                *last = Some(reason);
+        {
+            let mut last = self.last_open_problem.lock();
+            match result {
+                Err(reason) if *last != Some(reason) => {
+                    tracing::warn!("la memoria no se puede abrir: {reason}");
+                    *last = Some(reason);
+                }
+                Ok(()) if last.is_some() => {
+                    tracing::info!("la memoria se abrió");
+                    *last = None;
+                }
+                _ => {}
             }
-            Ok(()) if last.is_some() => {
-                tracing::info!("la memoria se abrió");
-                *last = None;
+        }
+        // Con la base abierta se drenan los borrados pendientes, en CADA
+        // apertura, no sólo en la transición cerrada→abierta: si un borrado
+        // falló antes y dejó la base abierta, la próxima operación lo reintenta
+        // (la cola vacía sale enseguida). Cubre el desbloqueo del llavero y el
+        // re-encendido, que pasan por acá vía `set_enabled`.
+        if result.is_ok() {
+            if let Some(db) = db.clone() {
+                self.flush_pending_deletes(&db).await;
             }
-            _ => {}
         }
         result
     }
@@ -859,13 +871,7 @@ impl Memory {
         let opened = blocking(move || open_existing(&path, &key)).await;
         match opened {
             Ok(opened) => {
-                // Transición cerrada→abierta: es el único punto por el que pasan
-                // los dos caminos de reapertura (desbloqueo del llavero vía la
-                // próxima op, y re-encendido vía `set_enabled`→`ensure_open`),
-                // así que acá se drenan los borrados que quedaron pendientes.
-                let opened = Arc::new(opened);
-                *db = Some(opened.clone());
-                self.flush_pending_deletes(&opened).await;
+                *db = Some(Arc::new(opened));
                 Ok(())
             }
             Err(error) if error == OLD_FORMAT => Err(REASON_OLD_FORMAT),
