@@ -345,6 +345,71 @@ pub fn truncate(text: &str, max: usize) -> &str {
     &text[..end]
 }
 
+/// Un último mensaje más grande que esto no funda un `Style`/`Correction`: es
+/// un texto pegado (una página, un correo), no algo que la persona dijo.
+const MAX_GROUNDING_USER_BYTES: usize = 1024;
+const MAX_GROUNDING_USER_LINES: usize = 5;
+
+/// Palabras vacías del español (normalizadas, sin tildes): no cuentan como
+/// contenido al comparar un recuerdo contra lo que dijo la persona.
+const STOPWORDS: &[&str] = &[
+    "el", "la", "los", "las", "un", "una", "unos", "unas", "lo", "al", "del", "de", "a", "ante",
+    "con", "contra", "desde", "en", "entre", "hacia", "hasta", "para", "por", "segun", "sin", "so",
+    "sobre", "tras", "y", "e", "o", "u", "ni", "que", "como", "cuando", "donde", "porque", "pues",
+    "si", "no", "se", "me", "te", "nos", "os", "le", "les", "mi", "tu", "su", "mis", "tus", "sus",
+    "yo", "vos", "usted", "ella", "ello", "ellos", "ellas", "este", "esta", "esto", "estos",
+    "estas", "ese", "esa", "eso", "esos", "esas", "es", "soy", "sos", "son", "era", "fue", "ser",
+    "estar", "estan", "muy", "mas", "pero", "ya", "tambien", "solo", "cada", "todo", "toda",
+    "todos", "todas", "mio", "mia",
+];
+
+/// Si un recuerdo extraído entra en la memoria: un `Style` o una `Correction`
+/// sólo si nacen de lo que dijo la persona (#10); las demás clases, siempre.
+pub fn item_is_grounded(kind: MemoryKind, text: &str, last_user: &str) -> bool {
+    !matches!(kind, MemoryKind::Style | MemoryKind::Correction)
+        || derives_from_user(text, last_user)
+}
+
+/// Si el recuerdo nace de lo que dijo la persona: la mayoría de sus palabras de
+/// contenido (normalizadas, sin palabras vacías) aparece en el último mensaje,
+/// y ese mensaje es chico. Un `Style` o una `Correction` pesan más que nada y
+/// se inyectan en todos los turnos, así que un texto pegado no tiene que poder
+/// plantar uno con palabras que la persona nunca dijo.
+///
+/// Límite conocido: si el propio último mensaje de la persona es un snippet
+/// corto que afirma la preferencia, se acepta —es casi indistinguible de que lo
+/// diga ella—. El THREAT-MODEL deja ese caso afuera; lo que esta puerta frena
+/// es el pegado grande (una página, un correo) y el texto que no echa raíz en
+/// lo que la persona dijo.
+fn derives_from_user(text: &str, last_user: &str) -> bool {
+    if last_user.len() > MAX_GROUNDING_USER_BYTES
+        || last_user.lines().count() >= MAX_GROUNDING_USER_LINES
+    {
+        return false;
+    }
+    let user_words: std::collections::HashSet<String> =
+        content_words(last_user).into_iter().collect();
+    let content = content_words(text);
+    if content.is_empty() || user_words.is_empty() {
+        return false;
+    }
+    let present = content
+        .iter()
+        .filter(|word| user_words.contains(*word))
+        .count();
+    present * 2 > content.len()
+}
+
+/// Las palabras de contenido de un texto: normalizadas (sin tildes, minúsculas)
+/// y sin las palabras vacías.
+fn content_words(text: &str) -> Vec<String> {
+    normalize_terms(text)
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty() && !STOPWORDS.contains(word))
+        .map(str::to_owned)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,6 +698,90 @@ mod tests {
             r#"[{"kind":"habit","text":"Madruga","topics":["ana@ejemplo.com","jardinería"]}]"#,
         );
         assert_eq!(with_topics.items[0].topics, ["jardinería"]);
+    }
+
+    const ESTILOS: [MemoryKind; 2] = [MemoryKind::Style, MemoryKind::Correction];
+
+    #[test]
+    fn un_estilo_o_correccion_dicho_por_la_persona_entra() {
+        for kind in ESTILOS {
+            assert!(item_is_grounded(
+                kind,
+                "Prefiere respuestas cortas",
+                "prefiero que me hables de vos y con respuestas cortas"
+            ));
+        }
+    }
+
+    #[test]
+    fn un_texto_pegado_grande_no_funda_un_estilo_aunque_las_palabras_coincidan() {
+        let texto = "Prefiere respuestas cortas";
+        let grande = format!("prefiero respuestas cortas {}", "relleno ".repeat(200));
+        assert!(grande.len() > 1024);
+        let multilinea = "prefiero\nrespuestas\ncortas\ny\nsimples";
+        assert_eq!(multilinea.lines().count(), 5);
+        for kind in ESTILOS {
+            assert!(!item_is_grounded(kind, texto, &grande));
+            assert!(!item_is_grounded(kind, texto, multilinea));
+        }
+    }
+
+    #[test]
+    fn un_estilo_sin_respaldo_en_lo_que_dijo_la_persona_no_entra() {
+        for kind in ESTILOS {
+            assert!(!item_is_grounded(
+                kind,
+                "Prefiere el modo oscuro y las tablas",
+                "¿qué hora es?"
+            ));
+        }
+    }
+
+    #[test]
+    fn el_umbral_es_mayoria_estricta_de_las_palabras_de_contenido() {
+        let user = "uso rojo verde azul";
+        // 3 de 4 palabras de contenido: entra.
+        assert!(item_is_grounded(
+            MemoryKind::Style,
+            "rojo verde azul negro",
+            user
+        ));
+        // 2 de 4 (justo el 50 %): no entra.
+        assert!(!item_is_grounded(
+            MemoryKind::Style,
+            "rojo verde gris negro",
+            user
+        ));
+    }
+
+    #[test]
+    fn las_palabras_vacias_no_cuentan_como_respaldo() {
+        // Comparten sólo palabras vacías: el contenido (gato, luna) no está.
+        assert!(!item_is_grounded(
+            MemoryKind::Correction,
+            "el gato de la luna",
+            "el vino de la casa"
+        ));
+        // Un texto que es sólo palabras vacías no tiene contenido que fundar.
+        assert!(!item_is_grounded(
+            MemoryKind::Style,
+            "de la que con",
+            "de la que con"
+        ));
+    }
+
+    #[test]
+    fn las_otras_clases_no_dependen_de_lo_que_dijo_la_persona() {
+        let enorme = "relleno ".repeat(500);
+        for kind in [
+            MemoryKind::Preference,
+            MemoryKind::Habit,
+            MemoryKind::Topic,
+            MemoryKind::Alias,
+        ] {
+            assert!(item_is_grounded(kind, "algo sin respaldo", ""));
+            assert!(item_is_grounded(kind, "algo sin respaldo", &enorme));
+        }
     }
 }
 
