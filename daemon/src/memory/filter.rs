@@ -727,6 +727,45 @@ mod hardening_tests {
     }
 
     #[test]
+    fn los_plurales_de_un_termino_sensible_se_detectan() {
+        for frase in [
+            "somos peronistas",
+            "vamos a la iglesia los católicos",
+            "hay muchos musulmanes",
+        ] {
+            assert!(mentions_sensitive(frase), "{frase}");
+            assert!(!is_clean_note(frase), "{frase}");
+        }
+    }
+
+    #[test]
+    fn las_frases_de_creencia_se_detectan() {
+        for frase in ["creo en dios", "mi viejo cree en dios", "soy creyente"] {
+            assert!(mentions_sensitive(frase), "{frase}");
+            assert!(!is_clean_note(frase), "{frase}");
+        }
+    }
+
+    #[test]
+    fn un_domicilio_con_el_tipo_de_via_en_cirilico_se_detecta() {
+        // «Аv.» con А cirílica
+        let frase = "vivo en \u{410}v. Corrientes 1234";
+        assert!(mentions_sensitive(frase), "{frase}");
+    }
+
+    #[test]
+    fn la_de_pluralizacion_no_rompe_notas_legitimas() {
+        for frase in [
+            "me gustan los lunes",
+            "prefiero los mensajes cortos",
+            "usa los atajos de teclado",
+        ] {
+            assert!(!mentions_sensitive(frase), "{frase}");
+            assert!(is_clean_note(frase), "{frase}");
+        }
+    }
+
+    #[test]
     fn un_domicilio_se_detecta_y_la_nota_se_descarta() {
         for frase in [
             "vivo en Av. Corrientes 1234",

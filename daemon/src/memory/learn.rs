@@ -747,6 +747,22 @@ mod hardening_tests {
     }
 
     #[test]
+    fn un_domicilio_en_cirilico_o_un_plural_sensible_no_entra_a_la_ventana() {
+        for tainted in [
+            "vivo en \u{410}v. Corrientes 1234",
+            "somos peronistas",
+            "creo en dios",
+        ] {
+            let exchange = vec![user(tainted), assistant("ok"), user("prefiero el mate")];
+
+            let (window, gate) = extraction_window(&exchange, BOTH).unwrap();
+
+            assert!(!contents(&window).contains(&tainted), "{tainted}");
+            assert!(!gate.summary, "{tainted}");
+        }
+    }
+
+    #[test]
     fn la_respuesta_del_asistente_con_un_dato_se_descarta_pero_no_impide_aprender() {
         let exchange = vec![
             user("prefiero el mate"),
