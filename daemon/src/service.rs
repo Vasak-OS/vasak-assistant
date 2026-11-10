@@ -2046,6 +2046,8 @@ mod gate_tests {
 
             denied(gate.proxy.set_memory_enabled(false).await);
             denied(gate.proxy.clear_memory().await);
+            denied(gate.proxy.list_memories().await);
+            denied(gate.proxy.delete_memory("cualquiera").await);
 
             let status = gate.memory.status().await;
             assert!(status.enabled && status.available, "{name}");
@@ -2096,7 +2098,7 @@ mod gate_tests {
     }
 
     #[tokio::test]
-    async fn sin_etiqueta_o_unconfined_los_cinco_metodos_funcionan() {
+    async fn sin_etiqueta_o_unconfined_los_metodos_restringidos_funcionan() {
         for (name, label) in [
             ("sin AppArmor", FixedLabel::none()),
             ("unconfined", FixedLabel::of(b"unconfined\0")),
@@ -2116,10 +2118,12 @@ mod gate_tests {
                 .unwrap());
             let status = gate.proxy.memory_status().await.unwrap();
             assert!(status.enabled && status.available, "{name}");
+            gate.proxy.list_memories().await.unwrap();
+            gate.proxy.delete_memory("no-existe").await.unwrap();
             gate.proxy.clear_memory().await.unwrap();
             gate.proxy.set_memory_enabled(false).await.unwrap();
             assert!(!gate.memory.status().await.enabled, "{name}");
-            assert!(*gate.label.asked.lock() >= 6, "se pregunta en cada pedido");
+            assert!(*gate.label.asked.lock() >= 8, "se pregunta en cada pedido");
         }
     }
 
@@ -3142,6 +3146,12 @@ mod no_sender_tests {
             rig.proxy.set_memory_enabled(true).await,
         );
         denied_with("ClearMemory", "", rig.proxy.clear_memory().await);
+        denied_with("ListMemories", "", rig.proxy.list_memories().await);
+        denied_with(
+            "DeleteMemory",
+            "",
+            rig.proxy.delete_memory("cualquiera").await,
+        );
         denied_with(
             "SetProviderKey",
             "",
@@ -3694,6 +3704,8 @@ mod log_tests {
 
         let _ = rig.proxy.set_memory_enabled(true).await;
         let _ = rig.proxy.clear_memory().await;
+        let _ = rig.proxy.list_memories().await;
+        let _ = rig.proxy.delete_memory("cualquiera").await;
         let _ = rig
             .proxy
             .set_provider_key("https://api.openai.com/v1", "sk-canario")
@@ -3706,6 +3718,8 @@ mod log_tests {
         for method in [
             "SetMemoryEnabled",
             "ClearMemory",
+            "ListMemories",
+            "DeleteMemory",
             "SetProviderKey",
             "HasProviderKey",
         ] {
