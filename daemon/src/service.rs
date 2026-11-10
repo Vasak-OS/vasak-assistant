@@ -26,8 +26,8 @@ use zbus::names::BusName;
 use zbus::{interface, Connection};
 
 use vasak_assistant_protocol::{
-    Capability, Error, MemoryStatus, Message, Role, ServiceStatus, DOMAINS, DOMAIN_MEMORY,
-    DOMAIN_REMOTE_BACKENDS,
+    Capability, Error, Memory as MemoryRecord, MemoryStatus, Message, Role, ServiceStatus, DOMAINS,
+    DOMAIN_MEMORY, DOMAIN_REMOTE_BACKENDS,
 };
 
 use crate::backend::{BackendError, BoxFuture, ModelBackend};
@@ -318,6 +318,40 @@ impl AssistantService {
         let result = async {
             self.deny_confined(connection, &header).await?;
             self.memory.clear().await
+        }
+        .await;
+        call.finish(result)
+    }
+
+    /// Los recuerdos que guarda, para que la persona vea qué recuerda el
+    /// asistente. Restringido igual que `SetMemoryEnabled`: `AccessDenied`
+    /// para un llamador confinado.
+    async fn list_memories(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> Result<Vec<MemoryRecord>, Error> {
+        let call = Call::new("ListMemories", &header);
+        let result = async {
+            self.deny_confined(connection, &header).await?;
+            self.memory.list_memories().await
+        }
+        .await;
+        call.finish(result)
+    }
+
+    /// Borra un recuerdo por su `id`, sin tocar el resto. Restringido igual que
+    /// `SetMemoryEnabled`: `AccessDenied` para un llamador confinado.
+    async fn delete_memory(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        id: String,
+    ) -> Result<(), Error> {
+        let call = Call::new("DeleteMemory", &header);
+        let result = async {
+            self.deny_confined(connection, &header).await?;
+            self.memory.delete_memory(&id).await
         }
         .await;
         call.finish(result)

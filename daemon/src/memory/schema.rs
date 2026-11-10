@@ -390,6 +390,40 @@ pub fn delete_summaries(db: &GrafeoDB, conversation: &str) -> grafeo::Result<usi
     Ok(summaries.len())
 }
 
+/// El `id` estable de un nodo de memoria, si lo tiene.
+pub fn node_id(db: &GrafeoDB, node: NodeId) -> Option<String> {
+    db.get_node(node)?
+        .get_property("id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Todos los recuerdos, de todas las clases, con su `id`, para mostrárselos a
+/// la persona. Sin orden garantizado.
+pub fn list_all(db: &GrafeoDB) -> Vec<(String, Entry)> {
+    MemoryKind::ALL
+        .into_iter()
+        .flat_map(|kind| entries(db, kind))
+        .filter_map(|found| node_id(db, found.node).map(|id| (id, found)))
+        .collect()
+}
+
+/// Borra el recuerdo con ese `id`, con sus aristas, y corre `gc` y
+/// `wal_checkpoint` como las demás bajas. `true` si había uno, `false` si no.
+pub fn delete_by_id(db: &GrafeoDB, id: &str) -> grafeo::Result<bool> {
+    let Some(node) = db
+        .find_nodes_by_property("id", &Value::from(id))
+        .into_iter()
+        .find(|node| entry(db, *node).is_some())
+    else {
+        return Ok(false);
+    };
+    delete(db, node)?;
+    db.gc();
+    db.wal_checkpoint()?;
+    Ok(true)
+}
+
 /// Deja como mucho `keep` nodos de la clase, sacando los de menor puntaje.
 pub fn prune_kind(db: &GrafeoDB, kind: MemoryKind, keep: usize, now: i64) -> grafeo::Result<usize> {
     let mut all = entries(db, kind);

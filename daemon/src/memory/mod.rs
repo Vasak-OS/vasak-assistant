@@ -61,7 +61,7 @@ use std::sync::Arc;
 use grafeo::{Config, EncryptionConfig, GrafeoDB, KeyChain, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Semaphore};
-use vasak_assistant_protocol::{Error, MemoryStatus, Message, Role};
+use vasak_assistant_protocol::{Error, Memory as MemoryRecord, MemoryStatus, Message, Role};
 use zeroize::Zeroizing;
 
 use crate::backend::ModelBackend;
@@ -665,6 +665,57 @@ impl Memory {
         }
         tracing::info!(recreated, "memoria borrada");
         Ok(())
+    }
+
+    /// Los recuerdos guardados, para mostrárselos a la persona. Apagada, sin
+    /// base o no compartida con el remoto: lista vacía. Con el llavero
+    /// bloqueado, el mismo error que las demás: no se puede abrir la base.
+    pub async fn list_memories(&self) -> Result<Vec<MemoryRecord>, Error> {
+        if self.dir.is_none() {
+            return Ok(Vec::new());
+        }
+        if self.secrets.is_locked().await? {
+            return Err(locked());
+        }
+        let Ok(db) = self.database().await else {
+            return Ok(Vec::new());
+        };
+        let records = blocking(move || Ok(schema::list_all(&db)))
+            .await
+            .map_err(Error::Unavailable)?;
+        Ok(records
+            .into_iter()
+            .map(|(id, found)| MemoryRecord {
+                id,
+                kind: found.kind.label().to_owned(),
+                text: found.text,
+                weight: found.weight,
+            })
+            .collect())
+    }
+
+    /// Borra un recuerdo por su `id`. Apagada o sin base: no hay nada que
+    /// borrar, `Ok`. Con el llavero bloqueado, el mismo error que `clear`.
+    ///
+    /// Idempotente a propósito: un `id` que no existe termina en `Ok`, como
+    /// apagar lo ya apagado, y así no es una carrera que la interfaz borre uno
+    /// que la poda acaba de sacar. Una baja puntual **no** sube la época: a
+    /// diferencia de `clear`, no invalida las extracciones en curso ni
+    /// reinicia las ventanas de aprendizaje; sólo saca ese nodo.
+    pub async fn delete_memory(&self, id: &str) -> Result<(), Error> {
+        if self.dir.is_none() {
+            return Ok(());
+        }
+        if self.secrets.is_locked().await? {
+            return Err(locked());
+        }
+        let Ok(db) = self.database().await else {
+            return Ok(());
+        };
+        let id = id.to_owned();
+        blocking(move || schema::delete_by_id(&db, &id).map(drop).map_err(db_error))
+            .await
+            .map_err(Error::Unavailable)
     }
 
     /// Abre la base si no lo está. Nunca crea ni borra nada.

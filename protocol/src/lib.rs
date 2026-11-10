@@ -33,8 +33,10 @@
 //! un proveedor remoto, la memoria no se lee ni se escribe salvo que la
 //! persona lo permita (`share_memory_with_remote` en `vasak.conf`); si no,
 //! `MemoryStatus` y `Capabilities` dicen «La memoria no se comparte con un
-//! proveedor remoto». No hay métodos para leer o editar recuerdos sueltos:
-//! sólo encender, apagar y borrar.
+//! proveedor remoto». La persona puede ver qué recuerda
+//! ([`Assistant::list_memories`]) y borrar un recuerdo equivocado por su id
+//! ([`Assistant::delete_memory`]), pero no editarlo: para cambiarlo se borra
+//! y el asistente lo vuelve a aprender.
 
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::Type;
@@ -191,6 +193,23 @@ pub struct MemoryStatus {
     pub bytes: u64,
 }
 
+/// Un recuerdo suelto, para mostrárselo a la persona y que pueda borrar el que
+/// esté equivocado. Firma `(sssd)`. No lleva `Eq` porque `weight` es `f64`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct Memory {
+    /// El identificador estable del recuerdo, el que toma
+    /// [`Assistant::delete_memory`].
+    pub id: String,
+    /// La clase del recuerdo (`Preference`, `Habit`, `Correction`, …), para
+    /// agrupar o filtrar en la interfaz.
+    pub kind: String,
+    /// El texto del recuerdo, tal como lo guardó el asistente.
+    pub text: String,
+    /// El peso con el que pesa al elegir qué recordar: entre 0 y 1, más alto
+    /// cuanto más se reforzó. Es la relevancia que puede ver la persona.
+    pub weight: f64,
+}
+
 // ── Los errores ───────────────────────────────────────────────────────────────
 
 /// Los errores que devuelve el servicio, con nombre propio en el bus
@@ -338,6 +357,20 @@ pub trait Assistant {
     /// Es la salida cuando la llave falta o no abre la base.
     /// `AccessDenied` si quien llama es una aplicación confinada (AppArmor).
     fn clear_memory(&self) -> Result<(), Error>;
+
+    /// Los recuerdos que guarda, para que la persona vea qué recuerda el
+    /// asistente y pueda borrar el que esté equivocado. Lista vacía si la
+    /// memoria está apagada, no hay base o no se comparte con el remoto;
+    /// `Unavailable` si el llavero está bloqueado (no se puede abrir la base).
+    /// `AccessDenied` si quien llama es una aplicación confinada (AppArmor).
+    fn list_memories(&self) -> Result<Vec<Memory>, Error>;
+
+    /// Borra un recuerdo por su `id` (el de [`Self::list_memories`]). Sólo ese:
+    /// no toca el resto de la memoria ni el aprendizaje en curso. Borrar uno
+    /// que ya no existe no es error, termina en `Ok`. Apagada o sin base, `Ok`
+    /// sin hacer nada; `Unavailable` si el llavero está bloqueado.
+    /// `AccessDenied` si quien llama es una aplicación confinada (AppArmor).
+    fn delete_memory(&self, id: &str) -> Result<(), Error>;
 }
 
 #[cfg(test)]
