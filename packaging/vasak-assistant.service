@@ -4,12 +4,15 @@ Documentation=https://github.com/Vasak-OS/vasak-assistant
 PartOf=graphical-session.target
 After=graphical-session.target
 # Si otro proceso ya tiene el nombre del bus, el demonio aborta el arranque
-# (#47) y `Restart=on-failure` lo reintenta cada `RestartSec`. systemd ya acota
-# eso con un default (`DefaultStartLimitBurst`/`IntervalSec`), pero depende del
-# host; se fija acá para que la unidad sea autocontenida como el resto: cinco
-# intentos en diez segundos y systemd deja la unidad en `failed`, sin churn.
+# (#47) y `Restart=on-failure` lo reintenta cada `RestartSec`. El tope de
+# arranques de systemd cuenta en una ventana: con el default (10s) y
+# `RestartSec=3` los cinco reintentos se reparten en 12s y no entran los cinco
+# en la ventana, así que el límite nunca se dispara y el demonio reintenta sin
+# fin (el default del host no alcanza). La ventana tiene que cubrir
+# `StartLimitBurst * RestartSec`; con 20s los cinco entran y systemd deja la
+# unidad en `failed`.
 # (StartLimit* van en `[Unit]`, no en `[Service]`: systemd los ignora ahí.)
-StartLimitIntervalSec=10s
+StartLimitIntervalSec=20s
 StartLimitBurst=5
 
 [Service]

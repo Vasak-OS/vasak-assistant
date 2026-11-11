@@ -49,3 +49,28 @@ fn la_unidad_acota_los_reintentos_de_arranque_en_la_seccion_unit() {
         );
     }
 }
+
+/// Segundos de un valor como `20s` o `3`.
+// shortcut: sólo segundos (sufijo `s` opcional); no cubre `min`, `ms` ni valores compuestos, ampliar si la unidad los usa.
+fn seconds(section: &str, key: &str) -> u64 {
+    let raw =
+        value_in_section(section, key).unwrap_or_else(|| panic!("{key} debe estar en [{section}]"));
+    raw.strip_suffix('s')
+        .unwrap_or(&raw)
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("{key}={raw} debe ser un entero de segundos"))
+}
+
+#[test]
+fn el_tope_de_reintentos_es_alcanzable_dentro_de_la_ventana() {
+    let interval = seconds("Unit", "StartLimitIntervalSec");
+    let burst = seconds("Unit", "StartLimitBurst");
+    let restart = seconds("Service", "RestartSec");
+    assert!(
+        interval >= burst * restart,
+        "la ventana StartLimitIntervalSec={interval}s no cubre StartLimitBurst*RestartSec={}s: \
+         los reintentos nunca llegan al tope, no se dispara y el demonio reintenta sin fin",
+        burst * restart
+    );
+}
