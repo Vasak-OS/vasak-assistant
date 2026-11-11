@@ -31,7 +31,8 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use parking_lot::Mutex;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+use zbus::fdo::{RequestNameFlags, RequestNameReply};
 use zbus::names::BusName;
 use zbus::{connection, Connection};
 
@@ -44,6 +45,28 @@ use ollama::OllamaBackend;
 use openai::OpenAiBackend;
 use service::AssistantService;
 use vasak_assistant_protocol::{SERVICE_NAME, SERVICE_PATH};
+
+/// El nombre tiene que quedar en nuestras manos. Con `DO_NOT_QUEUE` sólo somos
+/// dueños si la respuesta es `PrimaryOwner` (o `AlreadyOwner`, que también somos
+/// nosotros); `Exists` o `InQueue` significan que otro proceso lo tiene, y
+/// seguir deja a un impostor recibiendo a los clientes —sobre todo la clave del
+/// proveedor que manda Configuración—, así que se aborta el arranque (#47).
+fn primary_owner_or_abort(reply: RequestNameReply) -> Result<(), String> {
+    match reply {
+        RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner => Ok(()),
+        other => Err(format!(
+            "el nombre {SERVICE_NAME} ya lo tiene otro proceso (respuesta {other}): \
+             no se arranca para no dejar que un impostor reciba a los clientes"
+        )),
+    }
+}
+
+/// Sin cola, sin ofrecerse a reemplazo y sin reemplazar a nadie: las banderas
+/// por omisión de zbus (`AllowReplacement | ReplaceExisting | DoNotQueue`)
+/// dejan que un proceso posterior nos eche del nombre.
+fn name_flags() -> zbus::fdo::RequestNameFlags {
+    RequestNameFlags::DoNotQueue
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -115,7 +138,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?
         .receive_name_owner_changed()
         .await?;
-    connection.request_name(SERVICE_NAME).await?;
+    // `DO_NOT_QUEUE` y sin `AllowReplacement`: si otro proceso de la sesión ya
+    // tiene el nombre no nos encolamos, y una vez que es nuestro nadie nos lo
+    // puede quitar con `ReplaceExisting`. zbus devuelve el `Exists` del bus
+    // (nombre ya tomado) como `NameTaken`; lo encaminamos al mismo chequeo para
+    // abortar en un solo lugar y con un log claro.
+    let reply = match connection
+        .request_name_with_flags(SERVICE_NAME, name_flags().into())
+        .await
+    {
+        Ok(reply) => reply,
+        Err(zbus::Error::NameTaken) => RequestNameReply::Exists,
+        Err(error) => return Err(error.into()),
+    };
+    if let Err(message) = primary_owner_or_abort(reply) {
+        error!("{message}");
+        return Err(message.into());
+    }
     info!(name = SERVICE_NAME, "servicio en el bus de sesión");
 
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -142,4 +181,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     info!("saliendo");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::PrivateBus;
+
+    #[test]
+    fn dueno_primario_o_ya_dueno_dejan_arrancar() {
+        assert_eq!(
+            primary_owner_or_abort(RequestNameReply::PrimaryOwner),
+            Ok(())
+        );
+        assert_eq!(
+            primary_owner_or_abort(RequestNameReply::AlreadyOwner),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn nombre_ocupado_o_en_cola_abortan_nombrando_el_servicio() {
+        for reply in [RequestNameReply::Exists, RequestNameReply::InQueue] {
+            let message = primary_owner_or_abort(reply).unwrap_err();
+            assert!(message.contains(SERVICE_NAME), "{message}");
+        }
+    }
+
+    /// Lo que cierra el squat: con las banderas del demonio, otro proceso no
+    /// puede echarlo del nombre pidiéndolo con `ReplaceExisting`, y quien llega
+    /// segundo no se encola.
+    #[tokio::test]
+    async fn por_un_bus_real_nadie_le_quita_el_nombre_al_demonio_ni_se_encola() {
+        let Some(bus) = PrivateBus::start_or_skip() else {
+            return;
+        };
+        let daemon = bus.connect().await;
+        let first = daemon
+            .request_name_with_flags(SERVICE_NAME, name_flags().into())
+            .await
+            .unwrap();
+        assert_eq!(primary_owner_or_abort(first), Ok(()));
+
+        // Con `ReplaceExisting` y sin `DoNotQueue` el que llega queda en la cola
+        // (no es dueño); con `DoNotQueue` zbus traduce `Exists` en `NameTaken`.
+        let squatter = bus.connect().await;
+        let replace = squatter
+            .request_name_with_flags(SERVICE_NAME, RequestNameFlags::ReplaceExisting.into())
+            .await;
+        assert!(
+            matches!(replace, Ok(RequestNameReply::InQueue)),
+            "{replace:?}"
+        );
+        let second = bus
+            .connect()
+            .await
+            .request_name_with_flags(SERVICE_NAME, name_flags().into())
+            .await;
+        assert!(matches!(second, Err(zbus::Error::NameTaken)), "{second:?}");
+
+        let dbus = zbus::fdo::DBusProxy::new(&squatter).await.unwrap();
+        let owner = dbus
+            .get_name_owner(SERVICE_NAME.try_into().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(owner.as_str(), daemon.unique_name().unwrap().as_str());
+    }
 }

@@ -2,6 +2,23 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-assistant 0.3.18
+
+El demonio reclama el nombre del bus sin ofrecerse a reemplazo, así que un
+proceso posterior ya no puede quitarle el nombre a un demonio corriendo (#47).
+
+- **`daemon`** — el nombre `ar.net.vasak.os.Assistant` se pedía con
+  `request_name`, que en zbus usa las banderas por omisión
+  (`AllowReplacement | ReplaceExisting | DoNotQueue`): un impostor posterior con
+  `ReplaceExisting` desalojaba al demonio legítimo y pasaba a dueño, y los
+  clientes terminaban hablándole a él —incluida la clave del proveedor que manda
+  Configuración—. Ahora se reclama con sólo `DoNotQueue`: una vez que el demonio
+  es dueño nadie se lo quita, y si el nombre ya está tomado al arrancar aborta
+  con un log claro en vez de quedar en segundo plano. Es el cierre del
+  lado-demonio del squat del nombre (N8); la verificación del lado cliente (#5)
+  queda como respaldo para el caso «impostor antes del arranque». Sale de la
+  revisión de seguridad del #2.
+
 ## vasak-assistant 0.3.17
 
 Una ayuda para que los clientes verifiquen que el dueño del nombre del bus es el
