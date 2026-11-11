@@ -68,6 +68,10 @@ fn el_tope_de_reintentos_es_alcanzable_dentro_de_la_ventana() {
     let burst = seconds("Unit", "StartLimitBurst");
     let restart = seconds("Service", "RestartSec");
     assert!(
+        interval > 0,
+        "StartLimitIntervalSec debe ser mayor que cero; en 0 systemd desactiva el tope"
+    );
+    assert!(
         interval >= burst * restart,
         "la ventana StartLimitIntervalSec={interval}s no cubre StartLimitBurst*RestartSec={}s: \
          los reintentos nunca llegan al tope, no se dispara y el demonio reintenta sin fin",
