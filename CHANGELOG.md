@@ -2,6 +2,21 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-assistant 0.3.19
+
+La unidad de systemd corta sus propios reintentos de arranque en vez de
+reintentar sin fin.
+
+- **`packaging`** — cuando el demonio aborta el arranque porque otro proceso ya
+  tiene el nombre del bus (#47), `Restart=on-failure` lo reintenta cada
+  `RestartSec=3`. El tope de arranques de systemd cuenta en una ventana, y con
+  el default (10s) los cinco reintentos se reparten en 12s: no entran los cinco
+  en la ventana, el límite nunca se dispara y el demonio reintenta sin fin —el
+  default del host no alcanza—. Ahora la unidad fija en `[Unit]`
+  `StartLimitIntervalSec=20s` (≥ `StartLimitBurst * RestartSec`) y
+  `StartLimitBurst=5`, así que la ventana cubre los cinco intentos y systemd
+  deja la unidad en `failed`. No cambia ningún comportamiento visible.
+
 ## vasak-assistant 0.3.18
 
 El demonio reclama el nombre del bus sin ofrecerse a reemplazo, así que un
