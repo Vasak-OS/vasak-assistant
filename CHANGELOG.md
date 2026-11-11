@@ -2,6 +2,19 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-assistant 0.3.19
+
+La unidad de systemd acota sus propios reintentos de arranque, sin depender de
+la configuración del host.
+
+- **`packaging`** — cuando el demonio aborta el arranque porque otro proceso ya
+  tiene el nombre del bus (#47), `Restart=on-failure` lo reintenta cada
+  `RestartSec`. systemd ya corta ese churn con un default
+  (`DefaultStartLimitBurst`/`IntervalSec`), pero depende de `user.conf` del host;
+  ahora la unidad lo fija en `[Unit]` (`StartLimitIntervalSec=10s`,
+  `StartLimitBurst=5`) para ser autocontenida como el resto del endurecimiento.
+  No cambia ningún comportamiento visible.
+
 ## vasak-assistant 0.3.18
 
 El demonio reclama el nombre del bus sin ofrecerse a reemplazo, así que un
