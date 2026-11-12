@@ -1,0 +1,18 @@
+# Publica `vasak-assistant-protocol` a crates.io cuando su versión del manifiesto
+# no está en el registro. El gesto que lo dispara es el de siempre —subir la
+# versión al mergear—; la lógica vive en el workflow compartido de Vasak-OS/.github.
+name: Publicar el protocolo
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  publicar:
+    permissions:
+      contents: read
+    uses: Vasak-OS/.github/.github/workflows/publicar-protocolo.yml@main
+    secrets:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    with:
+      crate: vasak-assistant-protocol

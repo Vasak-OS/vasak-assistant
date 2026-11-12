@@ -7,10 +7,11 @@ resolver = "2"
 members = ["protocol", "daemon"]
 
 [workspace.package]
-version = "0.3.19"
+version = "0.3.20"
 edition = "2021"
 authors = ["Vasak Group", "Joaquin (Pato) Decima"]
 license = "GPL-3.0-or-later"
+repository = "https://github.com/Vasak-OS/vasak-assistant"
 
 [workspace.dependencies]
 vasak-assistant-protocol = { path = "protocol" }
