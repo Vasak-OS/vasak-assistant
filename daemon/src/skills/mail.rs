@@ -222,7 +222,9 @@ impl MailSkill {
 }
 
 /// Un verificador de permisos que le pregunta a `vasak-permissions` como Lince.
-/// Pregunta la primera vez y recuerda la respuesta.
+/// Consulta `CheckPermission` en cada llamada: quien recuerda la decisión de la
+/// persona es el servicio de permisos, no esto. Re-preguntar siempre es lo más
+/// seguro; si alguna vez pesa, se le pone una caché corta como la de `access.rs`.
 pub struct DbusPermission {
     connection: Connection,
 }
