@@ -8,24 +8,8 @@ use parking_lot::Mutex;
 use serde_json::json;
 
 use super::*;
+use crate::skills::dbus::STORE_PATH;
 use crate::test_support::p2p_pair_as;
-
-#[test]
-fn los_argumentos_faltantes_o_mal_tipados_son_invalid_args() {
-    let args = json!({"s": "x", "n": 5, "txt": "no"});
-    assert_eq!(string_arg(&args, "s").unwrap(), "x");
-    assert!(matches!(
-        string_arg(&args, "falta"),
-        Err(Error::InvalidArgs(_))
-    ));
-    assert!(matches!(string_arg(&args, "n"), Err(Error::InvalidArgs(_))));
-    assert_eq!(int_arg(&args, "n").unwrap(), 5);
-    assert!(matches!(int_arg(&args, "txt"), Err(Error::InvalidArgs(_))));
-    assert!(matches!(
-        int_arg(&args, "falta"),
-        Err(Error::InvalidArgs(_))
-    ));
-}
 
 #[test]
 fn el_recorte_del_cuerpo_respeta_el_limite_y_los_caracteres() {
@@ -46,31 +30,6 @@ fn un_caracter_de_dos_bytes_que_cruza_el_limite_se_descarta_entero() {
     let cuerpo = format!("{}é y mucho más texto", "a".repeat(BODY_PREVIEW_BYTES - 1));
     let recorte = preview(&cuerpo);
     assert_eq!(recorte, format!("{}…", "a".repeat(BODY_PREVIEW_BYTES - 1)));
-}
-
-#[tokio::test]
-async fn una_llamada_que_no_responde_a_tiempo_da_error_de_backend_en_vez_de_colgarse() {
-    let colgada = std::future::pending::<zbus::Result<String>>();
-    // El plazo externo hace que, sin el timeout, el test falle en vez de colgarse.
-    let result = tokio::time::timeout(
-        Duration::from_secs(5),
-        call_with_timeout(Duration::from_millis(20), colgada),
-    )
-    .await
-    .expect("la llamada no puede quedarse esperando para siempre");
-    assert!(
-        matches!(&result, Err(Error::Backend(m)) if m.contains("a tiempo")),
-        "{result:?}"
-    );
-    // Una respuesta a tiempo pasa tal cual.
-    let ok = call_with_timeout(Duration::from_secs(5), async { Ok::<_, zbus::Error>(7) }).await;
-    assert_eq!(ok.unwrap(), 7);
-}
-
-#[test]
-fn el_error_del_bus_dice_que_el_servicio_de_cuentas_no_respondio() {
-    let error = backend_error("boom");
-    assert!(matches!(&error, Error::Backend(m) if m.contains("boom") && m.contains("cuentas")));
 }
 
 // ── Servicios de mentira ────────────────────────────────────────────────────────
@@ -124,12 +83,15 @@ impl FakeSync {
 struct FakePermissions {
     grant: bool,
     log: Log,
+    /// Cuánto tarda en contestar: la persona decide en un diálogo.
+    delay: Duration,
 }
 
 #[zbus::interface(name = "ar.net.vasak.os.Permissions")]
 impl FakePermissions {
     async fn check_permission(&self, resource: &str, detail: &str) -> bool {
         self.log.lock().push(format!("perm {resource} {detail}"));
+        tokio::time::sleep(self.delay).await;
         self.grant
     }
 }
@@ -156,6 +118,7 @@ async fn silent_peer(sender: &str) -> (zbus::Connection, zbus::Connection) {
     let service = FakePermissions {
         grant: false,
         log: Log::default(),
+        delay: Duration::ZERO,
     };
     p2p_pair_as(sender, |builder| builder.serve_at("/otro/objeto", service))
         .await
@@ -343,10 +306,15 @@ async fn si_el_servicio_de_cuentas_no_esta_ejecutar_la_accion_falla_con_backend(
 }
 
 async fn permissions(grant: bool) -> (DbusPermission, Log, zbus::Connection) {
+    slow_permissions(grant, Duration::ZERO).await
+}
+
+async fn slow_permissions(grant: bool, delay: Duration) -> (DbusPermission, Log, zbus::Connection) {
     let log = Log::default();
     let service = FakePermissions {
         grant,
         log: log.clone(),
+        delay,
     };
     let (server, client) = p2p_pair_as(":1.6", |builder| {
         builder.serve_at("/ar/net/vasak/os/Permissions", service)
@@ -371,4 +339,13 @@ async fn si_vasak_permissions_no_responde_el_verificador_da_error_y_no_concede()
     let result = DbusPermission::new(client).check("store.email", "").await;
     assert!(matches!(result, Err(Error::Backend(_))), "{result:?}");
     drop(server);
+}
+
+#[tokio::test(start_paused = true)]
+async fn el_permiso_que_tarda_en_contestar_no_se_toma_por_una_negativa() {
+    // `CheckPermission` abre un diálogo: la persona puede tardar minutos, mucho
+    // más que el plazo de las lecturas.
+    let (check, _log, _server) = slow_permissions(true, CALL_TIMEOUT * 6).await;
+    let result = check.check("store.email", "a1").await;
+    assert!(matches!(result, Ok(true)), "{result:?}");
 }

@@ -56,9 +56,18 @@ pub struct Settings {
     pub share_memory_with_remote: bool,
     /// Si el correo (lo que leen las herramientas) se comparte con un backend
     /// remoto. Es una decisión propia, aparte de la de la memoria: la de la
-    /// memoria NO la satisface. Por omisión no: con un remoto, el correo no se
-    /// le manda ni se ofrecen sus herramientas.
+    /// memoria NO la satisface. Por omisión no: en operación normal, con un
+    /// remoto no se ofrecen sus herramientas ni le llega su contenido. Queda un
+    /// caso de borde: si un modelo local reapunta a un runner remoto a mitad de
+    /// pedido, un resultado de correo ya pudo haber salido en esa consulta; el
+    /// servicio lo avisa después de hecho (`UNSAFE_REMOTE_AFTER_SEND`). No es,
+    /// entonces, una garantía dura.
     pub share_mail_with_remote: bool,
+    /// Si el calendario (lo que leen sus herramientas) se comparte con un backend
+    /// remoto. Decisión propia, aparte de la del correo y la de la memoria:
+    /// ninguna la satisface. Por omisión no, con el mismo alcance y el mismo caso
+    /// de borde que [`Settings::share_mail_with_remote`].
+    pub share_calendar_with_remote: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,6 +352,7 @@ mod tests {
             allow_remote,
             share_memory_with_remote: false,
             share_mail_with_remote: false,
+            share_calendar_with_remote: false,
         }
     }
 

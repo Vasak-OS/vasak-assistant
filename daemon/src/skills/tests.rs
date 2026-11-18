@@ -44,6 +44,7 @@ struct ToolBackend {
     threads: Mutex<Vec<Vec<ChatMessage>>>,
     offered_tools: Mutex<Vec<usize>>,
     plain_chats: AtomicUsize,
+    active_model_calls: AtomicUsize,
     tools_chats: AtomicUsize,
     local_only_chats: AtomicUsize,
 }
@@ -60,6 +61,7 @@ impl ToolBackend {
             threads: Mutex::default(),
             offered_tools: Mutex::default(),
             plain_chats: AtomicUsize::new(0),
+            active_model_calls: AtomicUsize::new(0),
             tools_chats: AtomicUsize::new(0),
             local_only_chats: AtomicUsize::new(0),
         })
@@ -91,6 +93,7 @@ impl ModelBackend for ToolBackend {
     }
 
     fn active_model(&self) -> crate::backend::BoxFuture<'_, Result<ModelInfo, BackendError>> {
+        self.active_model_calls.fetch_add(1, Ordering::SeqCst);
         let info = self.info();
         let error = self.active_model_error.lock().clone();
         Box::pin(async move { error.map_or(Ok(info), Err) })
@@ -299,7 +302,8 @@ fn mail_chat(skill: Option<Arc<FakeSkill>>, perm: Arc<FakePerm>, share: bool) ->
         ),
         permission: perm,
         pending: Mutex::new(PendingActions::default()),
-        share_with_remote: share,
+        share_mail_with_remote: share,
+        share_calendar_with_remote: share,
     })
 }
 
@@ -504,6 +508,66 @@ async fn un_turno_sin_datos_de_correo_conserva_su_historial_normal() {
         .history()
         .iter()
         .all(|m| !m.content.contains("asunto")));
+}
+
+#[tokio::test]
+async fn una_accion_pendiente_tras_leer_correo_no_deja_su_resumen_en_el_historial() {
+    let r = rig(
+        vec![
+            call("search_mail", json!({"account_id": "a1"})),
+            call("send_mail", send_args()),
+        ],
+        true,
+    );
+    let reply = r.turn("respondele a Ana").await.unwrap();
+    assert_eq!(reply.pending.len(), 1);
+    // El resumen puede venir de datos del correo leído: no se reenvía en un
+    // turno posterior.
+    assert!(
+        r.history().iter().all(|m| !m.content.contains(&reply.text)),
+        "{:?}",
+        r.history()
+    );
+}
+
+#[tokio::test]
+async fn una_accion_pendiente_sin_datos_de_usuario_conserva_su_historial() {
+    let r = rig(vec![call("send_mail", send_args())], true);
+    let reply = r.turn("mandale un correo a Ana").await.unwrap();
+    assert_eq!(reply.pending.len(), 1);
+    let history = r.history();
+    assert_eq!(history.len(), 2, "{history:?}");
+    assert_eq!(history[1].content, reply.text);
+}
+
+#[tokio::test]
+async fn un_chat_en_texto_plano_no_espera_al_modelo_activo() {
+    // Sin habilidades, confinado y sin soporte de herramientas: ninguno
+    // resuelve `active_model`.
+    let sin_habilidades = ToolBackend::new(vec![]);
+    let service = build(
+        sin_habilidades.clone(),
+        mail_chat(None, FakePerm::new(true), false),
+        false,
+    );
+    let id = service.conversations.lock().create(OWNER, false).unwrap();
+    service
+        .chat_turn_with(OWNER, &id, "hola", true)
+        .await
+        .unwrap();
+    assert_eq!(sin_habilidades.active_model_calls.load(Ordering::SeqCst), 0);
+
+    let r = rig(vec![], true);
+    r.service
+        .chat_turn_with(OWNER, &r.conversation, "hola", false)
+        .await
+        .unwrap();
+    assert_eq!(r.backend.active_model_calls.load(Ordering::SeqCst), 0);
+
+    let r = rig_with(ToolBackend::without_tools(), FakeSkill::new(), true, false);
+    r.turn("hola").await.unwrap();
+    assert_eq!(r.backend.active_model_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(r.backend.plain_chats.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -831,11 +895,7 @@ async fn si_el_modelo_pasa_a_remoto_en_el_medio_la_respuesta_es_segura_y_no_sale
         let r = rig_with(backend, FakeSkill::new(), true, false);
         let reply = r.turn("¿qué correos tengo?").await.unwrap();
         assert!(reply.pending.is_empty());
-        assert!(
-            reply.text.contains("No pude usar el correo"),
-            "{}",
-            reply.text
-        );
+        assert!(reply.text.contains("No pude"), "{}", reply.text);
         assert!(r.skill.calls.lock().is_empty());
         assert_eq!(r.backend.local_only_chats.load(Ordering::SeqCst), 1);
         assert_eq!(r.backend.tools_chats.load(Ordering::SeqCst), 0);
@@ -856,9 +916,12 @@ async fn el_cambio_a_remoto_antes_de_mandar_dice_que_nada_salio_y_despues_de_man
     let (before, after) = (&texts[0], &texts[1]);
     assert_ne!(before, after, "los dos casos no pueden decir lo mismo");
     // Antes de mandar: nada salió, y lo dice.
-    assert!(before.contains("tus datos no se comparten"), "{before}");
+    assert!(before.contains("no se comparten"), "{before}");
     // Después de mandar: pudo haber salido; no afirma lo contrario.
     assert!(after.contains("pudo haber salido"), "{after}");
+    // El aviso cubre también el calendario, no sólo el correo.
+    assert!(after.contains("calendario"), "{after}");
+    assert!(before.contains("tus datos"), "{before}");
     assert!(!after.contains("no se comparten"), "{after}");
 }
 
@@ -942,7 +1005,8 @@ async fn la_capacidad_de_correo_no_esta_disponible_si_el_modelo_efectivo_no_admi
 #[test]
 fn el_correo_no_se_comparte_con_un_remoto_por_omision() {
     assert!(!crate::config::Settings::default().share_mail_with_remote);
-    assert!(!MailChat::default().share_with_remote);
+    assert!(!MailChat::default().share_mail_with_remote);
+    assert!(!MailChat::default().share_calendar_with_remote);
     let leida =
         crate::config::settings_from_json(r#"{"assistant":{"share_memory_with_remote":true}}"#)
             .unwrap();
@@ -1328,7 +1392,7 @@ async fn sin_permiso_de_mentira_el_verificador_por_omision_niega() {
 fn el_registro_de_habilidades_encuentra_por_herramienta_y_por_dominio() {
     let registry = SkillRegistry::new(vec![FakeSkill::new()]);
     assert!(!registry.is_empty());
-    assert_eq!(registry.tools().len(), 3);
+    assert_eq!(registry.tools_for(|_| true).len(), 3);
     assert!(registry.find("send_mail").is_some());
     assert!(registry.find("nada").is_none());
     assert!(registry.for_domain(DOMAIN_MAIL).is_some());
@@ -1418,4 +1482,395 @@ mod por_el_bus {
             .unwrap();
         assert!(mail.available, "{}", mail.reason);
     }
+}
+
+// ── 11. Calendario: puerta por dominio y capacidad ──────────────────────────────
+
+/// Una habilidad de calendario de mentira: anota lo que se ejecutó.
+struct FakeCalendar {
+    calls: Mutex<Vec<String>>,
+    alive: bool,
+}
+
+impl FakeCalendar {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            calls: Mutex::default(),
+            alive: true,
+        })
+    }
+}
+
+impl Skill for FakeCalendar {
+    fn domain(&self) -> &'static str {
+        DOMAIN_CALENDAR
+    }
+
+    fn permission(&self) -> &'static str {
+        PERMISSION_CALENDAR
+    }
+
+    fn tools(&self) -> Vec<ToolDef> {
+        vec![tool("list_events")]
+    }
+
+    fn call<'a>(
+        &'a self,
+        name: &'a str,
+        _args: &'a Value,
+        _ctx: &'a SkillCtx,
+    ) -> BoxFuture<'a, Result<ToolOutcome, Error>> {
+        self.calls.lock().push(name.to_owned());
+        Box::pin(async { Ok(ToolOutcome::Result("[{\"evento\":1}]".into())) })
+    }
+
+    fn probe(&self) -> BoxFuture<'_, bool> {
+        let alive = self.alive;
+        Box::pin(async move { alive })
+    }
+}
+
+/// Un servicio con correo y calendario, cada uno con su propio consentimiento.
+struct Duo {
+    service: AssistantService,
+    backend: Arc<ToolBackend>,
+    mail: Arc<FakeSkill>,
+    calendar: Arc<FakeCalendar>,
+    perm: Arc<FakePerm>,
+    conversation: String,
+}
+
+fn duo(
+    backend: Arc<ToolBackend>,
+    grant: bool,
+    share_mail: bool,
+    share_calendar: bool,
+    calendar: Arc<FakeCalendar>,
+) -> Duo {
+    let mail = FakeSkill::new();
+    let perm = FakePerm::new(grant);
+    let chat = Arc::new(MailChat {
+        skills: SkillRegistry::new(vec![mail.clone(), calendar.clone()]),
+        permission: perm.clone(),
+        pending: Mutex::new(PendingActions::default()),
+        share_mail_with_remote: share_mail,
+        share_calendar_with_remote: share_calendar,
+    });
+    let service = build(backend.clone(), chat, false);
+    let conversation = service.conversations.lock().create(OWNER, false).unwrap();
+    Duo {
+        service,
+        backend,
+        mail,
+        calendar,
+        perm,
+        conversation,
+    }
+}
+
+impl Duo {
+    async fn turn(&self) {
+        self.service
+            .chat_turn_with(OWNER, &self.conversation, "hola", true)
+            .await
+            .unwrap();
+    }
+
+    /// Lo que el modelo vio como resultado de sus herramientas.
+    fn tool_results(&self) -> String {
+        format!("{:?}", self.backend.threads.lock())
+    }
+}
+
+#[test]
+fn cada_dominio_decide_por_separado_si_se_comparte_con_un_remoto() {
+    let chat = |mail, calendar| MailChat {
+        share_mail_with_remote: mail,
+        share_calendar_with_remote: calendar,
+        ..MailChat::default()
+    };
+    assert!(chat(true, false).shares_with_remote(DOMAIN_MAIL));
+    assert!(!chat(true, false).shares_with_remote(DOMAIN_CALENDAR));
+    assert!(chat(false, true).shares_with_remote(DOMAIN_CALENDAR));
+    assert!(!chat(false, true).shares_with_remote(DOMAIN_MAIL));
+    // Un dominio desconocido nunca se comparte.
+    assert!(!chat(true, true).shares_with_remote("contactos"));
+}
+
+#[test]
+fn el_registro_filtra_las_herramientas_por_dominio() {
+    let registry = SkillRegistry::new(vec![FakeSkill::new(), FakeCalendar::new()]);
+    let names = |allow: &dyn Fn(&str) -> bool| -> Vec<String> {
+        registry
+            .tools_for(|domain| allow(domain))
+            .into_iter()
+            .map(|t| t.name)
+            .collect()
+    };
+    assert_eq!(names(&|_| true).len(), 4);
+    assert_eq!(names(&|d| d == DOMAIN_CALENDAR), ["list_events"]);
+    assert_eq!(names(&|d| d == DOMAIN_MAIL).len(), 3);
+    assert!(names(&|_| false).is_empty());
+}
+
+#[tokio::test]
+async fn con_el_modelo_local_se_ofrecen_las_herramientas_de_los_dos_dominios() {
+    let d = duo(
+        ToolBackend::new(vec![
+            call("list_events", json!({"from": "a", "to": "b"})),
+            call("search_mail", json!({"account_id": "a1"})),
+            text("listo"),
+        ]),
+        true,
+        false,
+        false,
+        FakeCalendar::new(),
+    );
+    d.turn().await;
+    assert_eq!(d.backend.offered_tools.lock()[0], 4);
+    assert_eq!(d.calendar.calls.lock().as_slice(), ["list_events"]);
+    assert_eq!(d.mail.calls_named("search_mail"), 1);
+    let asked: Vec<_> = d.perm.asked.lock().iter().map(|(r, _)| r.clone()).collect();
+    assert_eq!(asked, [PERMISSION_CALENDAR, PERMISSION_EMAIL]);
+}
+
+#[tokio::test]
+async fn con_un_remoto_y_solo_el_correo_compartido_el_calendario_no_se_ofrece_ni_se_ejecuta() {
+    let d = duo(
+        ToolBackend::remote(vec![
+            call("list_events", json!({"from": "a", "to": "b"})),
+            call("search_mail", json!({"account_id": "a1"})),
+            text("listo"),
+        ]),
+        true,
+        true,
+        false,
+        FakeCalendar::new(),
+    );
+    d.turn().await;
+    // Sólo las 3 de correo se le ofrecieron al modelo remoto.
+    assert_eq!(d.backend.offered_tools.lock()[0], 3);
+    // Aunque el modelo pida el calendario igual, no corre ni pide permiso.
+    assert!(d.calendar.calls.lock().is_empty());
+    assert!(d
+        .tool_results()
+        .contains("no está disponible con un modelo remoto"));
+    assert!(d
+        .perm
+        .asked
+        .lock()
+        .iter()
+        .all(|(r, _)| r != PERMISSION_CALENDAR));
+    // El correo, compartido, sigue funcionando.
+    assert_eq!(d.mail.calls_named("search_mail"), 1);
+}
+
+#[tokio::test]
+async fn con_un_remoto_y_solo_el_calendario_compartido_el_correo_no_se_ofrece_ni_se_ejecuta() {
+    let d = duo(
+        ToolBackend::remote(vec![
+            call("search_mail", json!({"account_id": "a1"})),
+            call("list_events", json!({"from": "a", "to": "b"})),
+            text("listo"),
+        ]),
+        true,
+        false,
+        true,
+        FakeCalendar::new(),
+    );
+    d.turn().await;
+    assert_eq!(d.backend.offered_tools.lock()[0], 1);
+    assert!(d.mail.calls.lock().is_empty());
+    assert!(d
+        .tool_results()
+        .contains("no está disponible con un modelo remoto"));
+    assert!(d
+        .perm
+        .asked
+        .lock()
+        .iter()
+        .all(|(r, _)| r != PERMISSION_EMAIL));
+    assert_eq!(d.calendar.calls.lock().as_slice(), ["list_events"]);
+}
+
+#[tokio::test]
+async fn con_un_remoto_sin_compartir_nada_el_turno_es_texto_plano() {
+    let d = duo(
+        ToolBackend::remote(vec![call("list_events", json!({"from": "a", "to": "b"}))]),
+        true,
+        false,
+        false,
+        FakeCalendar::new(),
+    );
+    d.turn().await;
+    assert_eq!(d.backend.tools_chats.load(Ordering::SeqCst), 0);
+    assert_eq!(d.backend.plain_chats.load(Ordering::SeqCst), 1);
+    assert!(d.calendar.calls.lock().is_empty());
+}
+
+#[tokio::test]
+async fn con_store_calendar_negado_ninguna_herramienta_de_calendario_se_ejecuta() {
+    let d = duo(
+        ToolBackend::new(vec![
+            call("list_events", json!({"from": "a", "to": "b"})),
+            text("listo"),
+        ]),
+        false,
+        false,
+        false,
+        FakeCalendar::new(),
+    );
+    d.turn().await;
+    assert!(d.calendar.calls.lock().is_empty());
+    assert_eq!(
+        d.perm.asked.lock().as_slice(),
+        [(PERMISSION_CALENDAR.to_owned(), String::new())]
+    );
+    assert!(d
+        .tool_results()
+        .contains("no concedió el permiso «store.calendar»"));
+}
+
+async fn calendar_capability(
+    backend: Arc<ToolBackend>,
+    calendar: Option<Arc<FakeCalendar>>,
+    (share_mail, share_calendar): (bool, bool),
+    confined: bool,
+) -> vasak_assistant_protocol::Capability {
+    let skills: Vec<Arc<dyn Skill>> = [Some(FakeSkill::new() as Arc<dyn Skill>)]
+        .into_iter()
+        .chain([calendar.map(|c| c as Arc<dyn Skill>)])
+        .flatten()
+        .collect();
+    let chat = Arc::new(MailChat {
+        skills: SkillRegistry::new(skills),
+        permission: FakePerm::new(true),
+        pending: Mutex::new(PendingActions::default()),
+        share_mail_with_remote: share_mail,
+        share_calendar_with_remote: share_calendar,
+    });
+    build(backend, chat, false)
+        .calendar_capability(confined)
+        .await
+}
+
+#[tokio::test]
+async fn la_capacidad_de_calendario_esta_disponible_en_el_caso_bueno() {
+    let local = calendar_capability(
+        ToolBackend::new(vec![]),
+        Some(FakeCalendar::new()),
+        (false, false),
+        false,
+    )
+    .await;
+    assert_eq!(local.domain, DOMAIN_CALENDAR);
+    assert!(
+        local.available && local.reason.is_empty(),
+        "{}",
+        local.reason
+    );
+    let remote = calendar_capability(
+        ToolBackend::remote(vec![]),
+        Some(FakeCalendar::new()),
+        (false, true),
+        false,
+    )
+    .await;
+    assert!(remote.available, "{}", remote.reason);
+}
+
+#[tokio::test]
+async fn la_capacidad_de_calendario_no_esta_disponible_con_motivo_en_cada_caso_que_falta() {
+    let mut dead = Arc::try_unwrap(FakeCalendar::new()).ok().unwrap();
+    dead.alive = false;
+    let none = (false, false);
+    let cases = [
+        (
+            "confinado",
+            calendar_capability(
+                ToolBackend::new(vec![]),
+                Some(FakeCalendar::new()),
+                none,
+                true,
+            )
+            .await,
+        ),
+        (
+            "sin habilidad",
+            calendar_capability(ToolBackend::new(vec![]), None, none, false).await,
+        ),
+        (
+            "sin herramientas",
+            calendar_capability(
+                ToolBackend::without_tools(),
+                Some(FakeCalendar::new()),
+                none,
+                false,
+            )
+            .await,
+        ),
+        (
+            "remoto sin compartir",
+            calendar_capability(
+                ToolBackend::remote(vec![]),
+                Some(FakeCalendar::new()),
+                // Compartir el correo no comparte el calendario.
+                (true, false),
+                false,
+            )
+            .await,
+        ),
+        (
+            "almacén caído",
+            calendar_capability(ToolBackend::new(vec![]), Some(Arc::new(dead)), none, false).await,
+        ),
+    ];
+    let mut reasons = std::collections::HashSet::new();
+    for (name, cap) in cases {
+        assert_eq!(cap.domain, DOMAIN_CALENDAR, "{name}");
+        assert!(!cap.available, "{name}");
+        assert!(!cap.reason.is_empty(), "{name}");
+        reasons.insert(cap.reason);
+    }
+    assert_eq!(reasons.len(), 5, "cada caso explica su propio motivo");
+
+    let unreachable = ToolBackend::new(vec![]);
+    *unreachable.active_model_error.lock() = Some(BackendError::Unavailable("caído".into()));
+    let down =
+        calendar_capability(unreachable, Some(FakeCalendar::new()), (true, true), false).await;
+    assert!(down.reason.contains("no responde"), "{}", down.reason);
+    let denied = ToolBackend::new(vec![]);
+    *denied.active_model_error.lock() = Some(BackendError::NotAllowed("nube".into()));
+    let cap = calendar_capability(denied, Some(FakeCalendar::new()), none, false).await;
+    assert!(cap.reason.contains("allow_remote"), "{}", cap.reason);
+}
+
+#[tokio::test]
+async fn las_capacidades_de_correo_y_calendario_se_deciden_por_separado() {
+    // Remoto con sólo el correo compartido: el correo sí, el calendario no.
+    let d = duo(
+        ToolBackend::remote(vec![]),
+        true,
+        true,
+        false,
+        FakeCalendar::new(),
+    );
+    assert!(d.service.mail_capability(false).await.available);
+    let calendar = d.service.calendar_capability(false).await;
+    assert!(!calendar.available);
+    assert!(
+        calendar.reason.contains("calendario"),
+        "{}",
+        calendar.reason
+    );
+    // Y al revés.
+    let d = duo(
+        ToolBackend::remote(vec![]),
+        true,
+        false,
+        true,
+        FakeCalendar::new(),
+    );
+    assert!(!d.service.mail_capability(false).await.available);
+    assert!(d.service.calendar_capability(false).await.available);
 }
