@@ -344,6 +344,79 @@ async fn read_file_no_confunde_un_caracter_partido_por_el_tope_con_un_binario() 
     assert_eq!(result["content"].as_str().unwrap().len(), 64 * 1024 - 1);
 }
 
+async fn read_path(skill: &FilesSkill, path: &Path) -> Result<Value, Error> {
+    run(
+        skill,
+        "read_file",
+        json!({ "path": path.to_str().unwrap() }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn read_file_acotado_devuelve_el_tope_de_un_archivo_de_un_mib() {
+    // Refuerzo: la salida es la misma que con una lectura entera. La cota de
+    // memoria (take) no se afirma por salida, sólo que el contenido sale cortado.
+    let t = tree();
+    let file = t.write("root/mib.txt", "x".repeat(1024 * 1024));
+    let result = read_path(&skill(&t.root), &file).await.unwrap();
+    assert_eq!(result["truncated"], true);
+    assert_eq!(result["content"].as_str().unwrap().len(), MAX_READ_BYTES);
+}
+
+#[tokio::test]
+async fn read_file_rechaza_una_entrada_de_la_denylist_que_es_un_symlink() {
+    let t = tree();
+    let key = t.write("root/keys/id_ed25519", "llave");
+    std::os::unix::fs::symlink(t.root.join("keys"), t.root.join(".ssh")).unwrap();
+    let skill = FilesSkill {
+        roots: vec![t.root.clone()],
+        deny: vec![t.root.join(".ssh")],
+    };
+    // Se pide por la ruta canónica (la de «keys»), no por el nombre del symlink.
+    assert!(is_invalid(read_path(&skill, &key).await));
+}
+
+#[tokio::test]
+async fn read_file_rechaza_una_entrada_de_la_denylist_que_es_un_archivo() {
+    let t = tree();
+    let history = t.write("root/.bash_history", "ls -la");
+    let skill = FilesSkill {
+        roots: vec![t.root.clone()],
+        deny: vec![history.clone()],
+    };
+    assert!(is_invalid(read_path(&skill, &history).await));
+}
+
+#[tokio::test]
+async fn read_file_rechaza_un_byte_invalido_en_el_medio_aunque_haya_prefijo_valido() {
+    let t = tree();
+    let mut bytes = vec![b'A', 0xff];
+    bytes.resize(MAX_READ_BYTES + 100, b'b');
+    let file = t.write("root/mixto.bin", bytes);
+    assert!(is_invalid(read_path(&skill(&t.root), &file).await));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn la_busqueda_marca_truncated_si_una_carpeta_no_se_puede_leer() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tree();
+    t.write("root/visible.txt", "x");
+    let closed = t.root.join("cerrada");
+    std::fs::create_dir_all(&closed).unwrap();
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Como root los permisos no se aplican: no es determinista, se omite.
+    let readable = std::fs::read_dir(&closed).is_ok();
+    let result = search(&skill(&t.root), "visible").await;
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if readable {
+        return;
+    }
+    assert_eq!(names(&result), vec!["visible.txt"]);
+    assert_eq!(result["truncated"], true);
+}
+
 // ── argumentos y herramientas ───────────────────────────────────────────────────
 
 #[tokio::test]
