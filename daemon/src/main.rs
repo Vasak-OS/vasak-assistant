@@ -132,12 +132,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mail = Arc::new(skills::MailChat {
         skills: skills::SkillRegistry::new(vec![
             Arc::new(skills::mail::MailSkill::new(skills_bus.clone())),
-            Arc::new(skills::calendar::CalendarSkill::new(skills_bus)),
+            Arc::new(skills::calendar::CalendarSkill::new(skills_bus.clone())),
+            Arc::new(skills::contacts::ContactsSkill::new(skills_bus)),
         ]),
         permission: Arc::new(skills::mail::DbusPermission::new(permissions_bus)),
         pending: parking_lot::Mutex::new(skills::PendingActions::default()),
         share_mail_with_remote: settings.share_mail_with_remote,
         share_calendar_with_remote: settings.share_calendar_with_remote,
+        share_contacts_with_remote: settings.share_contacts_with_remote,
     });
     let service = AssistantService {
         backend,

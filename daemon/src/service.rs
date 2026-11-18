@@ -27,8 +27,8 @@ use zbus::{interface, Connection};
 
 use vasak_assistant_protocol::{
     Capability, ChatReply, Error, Memory as MemoryRecord, MemoryStatus, Message, Role,
-    ServiceStatus, DOMAINS, DOMAIN_CALENDAR, DOMAIN_MAIL, DOMAIN_MEMORY, DOMAIN_REMOTE_BACKENDS,
-    MAX_TOOL_ITERATIONS,
+    ServiceStatus, DOMAINS, DOMAIN_CALENDAR, DOMAIN_CONTACTS, DOMAIN_MAIL, DOMAIN_MEMORY,
+    DOMAIN_REMOTE_BACKENDS, MAX_TOOL_ITERATIONS,
 };
 
 use crate::backend::{BackendError, BoxFuture, ChatMessage, ModelBackend, ModelTurn};
@@ -167,6 +167,13 @@ impl AssistantService {
             .find(|capability| capability.domain == DOMAIN_CALENDAR)
         {
             *slot = calendar;
+        }
+        let contacts = self.contacts_capability(confined).await;
+        if let Some(slot) = all
+            .iter_mut()
+            .find(|capability| capability.domain == DOMAIN_CONTACTS)
+        {
+            *slot = contacts;
         }
         call.done();
         all
@@ -1244,6 +1251,50 @@ impl AssistantService {
         }
         Capability {
             domain: DOMAIN_CALENDAR.to_owned(),
+            available: true,
+            reason: String::new(),
+        }
+    }
+
+    /// La capacidad de los contactos, resuelta de verdad: la habilidad, el
+    /// modelo (local o remoto consentido, con soporte de herramientas) y el
+    /// almacén en pie. No disponible, nunca rota.
+    pub async fn contacts_capability(&self, confined: bool) -> Capability {
+        let unavailable = |reason: &str| Capability {
+            domain: DOMAIN_CONTACTS.to_owned(),
+            available: false,
+            reason: reason.to_owned(),
+        };
+        if confined {
+            return unavailable("No disponible para aplicaciones confinadas.");
+        }
+        let Some(skill) = self.mail.skills.for_domain(DOMAIN_CONTACTS) else {
+            return unavailable("Todavía no está disponible en esta versión del asistente.");
+        };
+        match self.backend.active_model().await {
+            Ok(model) if model.local || self.mail.shares_with_remote(DOMAIN_CONTACTS) => {}
+            Ok(_) => {
+                return unavailable(
+                    "El modelo es remoto y tus contactos no se comparten con un proveedor remoto.",
+                )
+            }
+            Err(BackendError::NotAllowed(_)) => {
+                return unavailable(
+                    "El modelo no está permitido: corre en la nube y falta «allow_remote».",
+                )
+            }
+            Err(_) => return unavailable("El modelo no responde."),
+        }
+        if !self.backend.active_supports_tools().await.unwrap_or(false) {
+            return unavailable(
+                "El modelo actual no admite herramientas: no puede leer los contactos.",
+            );
+        }
+        if !skill.probe().await {
+            return unavailable("El servicio de cuentas no responde.");
+        }
+        Capability {
+            domain: DOMAIN_CONTACTS.to_owned(),
             available: true,
             reason: String::new(),
         }
