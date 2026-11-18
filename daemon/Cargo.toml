@@ -54,3 +54,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `bus-impl` deja que el cliente de prueba lleve su propio nombre único, así
 # las llamadas punto a punto traen remitente como en el bus (#4).
 zbus = { workspace = true, features = ["p2p", "bus-impl"] }
+# Reloj pausado: probar un plazo de 10 s sin esperarlo.
+tokio = { workspace = true, features = ["test-util"] }

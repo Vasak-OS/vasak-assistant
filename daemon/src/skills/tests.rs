@@ -44,6 +44,7 @@ struct ToolBackend {
     threads: Mutex<Vec<Vec<ChatMessage>>>,
     offered_tools: Mutex<Vec<usize>>,
     plain_chats: AtomicUsize,
+    active_model_calls: AtomicUsize,
     tools_chats: AtomicUsize,
     local_only_chats: AtomicUsize,
 }
@@ -60,6 +61,7 @@ impl ToolBackend {
             threads: Mutex::default(),
             offered_tools: Mutex::default(),
             plain_chats: AtomicUsize::new(0),
+            active_model_calls: AtomicUsize::new(0),
             tools_chats: AtomicUsize::new(0),
             local_only_chats: AtomicUsize::new(0),
         })
@@ -91,6 +93,7 @@ impl ModelBackend for ToolBackend {
     }
 
     fn active_model(&self) -> crate::backend::BoxFuture<'_, Result<ModelInfo, BackendError>> {
+        self.active_model_calls.fetch_add(1, Ordering::SeqCst);
         let info = self.info();
         let error = self.active_model_error.lock().clone();
         Box::pin(async move { error.map_or(Ok(info), Err) })
@@ -508,6 +511,66 @@ async fn un_turno_sin_datos_de_correo_conserva_su_historial_normal() {
 }
 
 #[tokio::test]
+async fn una_accion_pendiente_tras_leer_correo_no_deja_su_resumen_en_el_historial() {
+    let r = rig(
+        vec![
+            call("search_mail", json!({"account_id": "a1"})),
+            call("send_mail", send_args()),
+        ],
+        true,
+    );
+    let reply = r.turn("respondele a Ana").await.unwrap();
+    assert_eq!(reply.pending.len(), 1);
+    // El resumen puede venir de datos del correo leído: no se reenvía en un
+    // turno posterior.
+    assert!(
+        r.history().iter().all(|m| !m.content.contains(&reply.text)),
+        "{:?}",
+        r.history()
+    );
+}
+
+#[tokio::test]
+async fn una_accion_pendiente_sin_datos_de_usuario_conserva_su_historial() {
+    let r = rig(vec![call("send_mail", send_args())], true);
+    let reply = r.turn("mandale un correo a Ana").await.unwrap();
+    assert_eq!(reply.pending.len(), 1);
+    let history = r.history();
+    assert_eq!(history.len(), 2, "{history:?}");
+    assert_eq!(history[1].content, reply.text);
+}
+
+#[tokio::test]
+async fn un_chat_en_texto_plano_no_espera_al_modelo_activo() {
+    // Sin habilidades, confinado y sin soporte de herramientas: ninguno
+    // resuelve `active_model`.
+    let sin_habilidades = ToolBackend::new(vec![]);
+    let service = build(
+        sin_habilidades.clone(),
+        mail_chat(None, FakePerm::new(true), false),
+        false,
+    );
+    let id = service.conversations.lock().create(OWNER, false).unwrap();
+    service
+        .chat_turn_with(OWNER, &id, "hola", true)
+        .await
+        .unwrap();
+    assert_eq!(sin_habilidades.active_model_calls.load(Ordering::SeqCst), 0);
+
+    let r = rig(vec![], true);
+    r.service
+        .chat_turn_with(OWNER, &r.conversation, "hola", false)
+        .await
+        .unwrap();
+    assert_eq!(r.backend.active_model_calls.load(Ordering::SeqCst), 0);
+
+    let r = rig_with(ToolBackend::without_tools(), FakeSkill::new(), true, false);
+    r.turn("hola").await.unwrap();
+    assert_eq!(r.backend.active_model_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(r.backend.plain_chats.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn con_el_permiso_negado_la_herramienta_no_se_ejecuta_y_el_modelo_lo_sabe() {
     let r = rig(
         vec![
@@ -832,11 +895,7 @@ async fn si_el_modelo_pasa_a_remoto_en_el_medio_la_respuesta_es_segura_y_no_sale
         let r = rig_with(backend, FakeSkill::new(), true, false);
         let reply = r.turn("¿qué correos tengo?").await.unwrap();
         assert!(reply.pending.is_empty());
-        assert!(
-            reply.text.contains("No pude usar el correo"),
-            "{}",
-            reply.text
-        );
+        assert!(reply.text.contains("No pude"), "{}", reply.text);
         assert!(r.skill.calls.lock().is_empty());
         assert_eq!(r.backend.local_only_chats.load(Ordering::SeqCst), 1);
         assert_eq!(r.backend.tools_chats.load(Ordering::SeqCst), 0);
@@ -857,9 +916,12 @@ async fn el_cambio_a_remoto_antes_de_mandar_dice_que_nada_salio_y_despues_de_man
     let (before, after) = (&texts[0], &texts[1]);
     assert_ne!(before, after, "los dos casos no pueden decir lo mismo");
     // Antes de mandar: nada salió, y lo dice.
-    assert!(before.contains("tus datos no se comparten"), "{before}");
+    assert!(before.contains("no se comparten"), "{before}");
     // Después de mandar: pudo haber salido; no afirma lo contrario.
     assert!(after.contains("pudo haber salido"), "{after}");
+    // El aviso cubre también el calendario, no sólo el correo.
+    assert!(after.contains("calendario"), "{after}");
+    assert!(before.contains("tus datos"), "{before}");
     assert!(!after.contains("no se comparten"), "{after}");
 }
 

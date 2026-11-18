@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 use serde_json::json;
 
 use super::*;
+use crate::skills::dbus::STORE_PATH;
 use crate::test_support::p2p_pair_as;
 
 type Log = Arc<Mutex<Vec<String>>>;
@@ -77,57 +78,6 @@ async fn run(skill: &CalendarSkill, name: &str, args: Value) -> Result<String, E
         ToolOutcome::Result(text) => Ok(text),
         ToolOutcome::Pending { .. } => panic!("el calendario no deja acciones pendientes"),
     }
-}
-
-#[test]
-fn los_argumentos_faltantes_o_mal_tipados_son_invalid_args() {
-    let args = json!({"s": "x", "n": 5, "ids": ["a", "b"], "mal": [1], "no_lista": "a", "nulo": null, "b": true});
-    assert_eq!(string_arg(&args, "s").unwrap(), "x");
-    assert!(matches!(
-        string_arg(&args, "falta"),
-        Err(Error::InvalidArgs(_))
-    ));
-    assert!(matches!(string_arg(&args, "n"), Err(Error::InvalidArgs(_))));
-    assert_eq!(opt_string_arg(&args, "s"), "x");
-    assert_eq!(opt_string_arg(&args, "n"), "");
-    assert_eq!(opt_string_arg(&args, "falta"), "");
-    assert!(bool_arg(&args, "b", false));
-    assert!(bool_arg(&args, "falta", true));
-    assert!(!bool_arg(&args, "s", false));
-    assert_eq!(string_array_arg(&args, "ids").unwrap(), ["a", "b"]);
-    assert!(string_array_arg(&args, "falta").unwrap().is_empty());
-    assert!(string_array_arg(&args, "nulo").unwrap().is_empty());
-    assert!(matches!(
-        string_array_arg(&args, "mal"),
-        Err(Error::InvalidArgs(m)) if m.contains("elemento")
-    ));
-    assert!(matches!(
-        string_array_arg(&args, "no_lista"),
-        Err(Error::InvalidArgs(m)) if m.contains("lista")
-    ));
-}
-
-#[tokio::test]
-async fn una_llamada_que_no_responde_a_tiempo_da_error_de_backend_en_vez_de_colgarse() {
-    let colgada = std::future::pending::<zbus::Result<String>>();
-    let result = tokio::time::timeout(
-        Duration::from_secs(5),
-        call_with_timeout(Duration::from_millis(20), colgada),
-    )
-    .await
-    .expect("la llamada no puede quedarse esperando para siempre");
-    assert!(
-        matches!(&result, Err(Error::Backend(m)) if m.contains("a tiempo")),
-        "{result:?}"
-    );
-    let ok = call_with_timeout(Duration::from_secs(5), async { Ok::<_, zbus::Error>(7) }).await;
-    assert_eq!(ok.unwrap(), 7);
-}
-
-#[test]
-fn el_error_del_bus_dice_que_el_servicio_de_cuentas_no_respondio() {
-    let error = backend_error("boom");
-    assert!(matches!(&error, Error::Backend(m) if m.contains("boom") && m.contains("cuentas")));
 }
 
 #[tokio::test]
@@ -236,6 +186,10 @@ async fn los_argumentos_invalidos_dan_invalid_args_y_no_tocan_el_almacen() {
             json!({"from": "a", "to": "b", "calendar_ids": "c1"}),
         ),
         ("read_event", json!({})),
+        // Un número no es «el evento entero»: no se lee la serie.
+        ("read_event", json!({"event_id": "e1", "occurrence_id": 5})),
+        // El texto «true» no es el booleano: no se lista sin las hechas.
+        ("list_tasks", json!({"include_completed": "true"})),
         ("list_tasks", json!({"calendar_ids": [1]})),
     ] {
         let result = run(&skill, name, args.clone()).await;
