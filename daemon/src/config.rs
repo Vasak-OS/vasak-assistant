@@ -68,6 +68,11 @@ pub struct Settings {
     /// ninguna la satisface. Por omisión no, con el mismo alcance y el mismo caso
     /// de borde que [`Settings::share_mail_with_remote`].
     pub share_calendar_with_remote: bool,
+    /// Si los contactos (lo que leen sus herramientas) se comparten con un backend
+    /// remoto. Decisión propia, aparte de las demás: ninguna la satisface. Por
+    /// omisión no, con el mismo alcance que [`Settings::share_mail_with_remote`]
+    /// (los contactos son sólo lectura, así que no tienen el caso del envío).
+    pub share_contacts_with_remote: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,6 +358,7 @@ mod tests {
             share_memory_with_remote: false,
             share_mail_with_remote: false,
             share_calendar_with_remote: false,
+            share_contacts_with_remote: false,
         }
     }
 

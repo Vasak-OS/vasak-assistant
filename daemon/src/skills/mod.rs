@@ -19,9 +19,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::backend::{BoxFuture, ToolDef};
-use vasak_assistant_protocol::{Error, PendingAction, DOMAIN_CALENDAR, DOMAIN_MAIL};
+use vasak_assistant_protocol::{
+    Error, PendingAction, DOMAIN_CALENDAR, DOMAIN_CONTACTS, DOMAIN_MAIL,
+};
 
 pub mod calendar;
+pub mod contacts;
 pub mod dbus;
 pub mod mail;
 
@@ -30,6 +33,9 @@ pub const PERMISSION_EMAIL: &str = "store.email";
 
 /// El recurso de permiso del calendario, el mismo que exige `AccountsStore`.
 pub const PERMISSION_CALENDAR: &str = "store.calendar";
+
+/// El recurso de permiso de los contactos, el mismo que exige `AccountsStore`.
+pub const PERMISSION_CONTACTS: &str = "store.contacts";
 
 /// Cuánto vive una acción pendiente antes de vencer. Pasado eso, confirmarla da
 /// `NotFound`: un borrador viejo no se manda por una confirmación tardía.
@@ -246,6 +252,8 @@ pub struct MailChat {
     /// calendario. Por omisión `false`: con un remoto, el dominio no sale ni se
     /// ofrecen sus herramientas.
     pub share_calendar_with_remote: bool,
+    /// `share_contacts_with_remote` de `vasak.conf`: lo mismo para los contactos.
+    pub share_contacts_with_remote: bool,
 }
 
 impl MailChat {
@@ -255,6 +263,7 @@ impl MailChat {
         match domain {
             DOMAIN_MAIL => self.share_mail_with_remote,
             DOMAIN_CALENDAR => self.share_calendar_with_remote,
+            DOMAIN_CONTACTS => self.share_contacts_with_remote,
             _ => false,
         }
     }
@@ -268,6 +277,7 @@ impl Default for MailChat {
             pending: parking_lot::Mutex::new(PendingActions::default()),
             share_mail_with_remote: false,
             share_calendar_with_remote: false,
+            share_contacts_with_remote: false,
         }
     }
 }

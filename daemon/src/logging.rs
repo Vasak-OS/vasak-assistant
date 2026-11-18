@@ -436,6 +436,7 @@ mod startup_tests {
             share_memory_with_remote: share,
             share_mail_with_remote: false,
             share_calendar_with_remote: false,
+            share_contacts_with_remote: false,
         }
     }
 

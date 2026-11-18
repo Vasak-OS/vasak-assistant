@@ -304,6 +304,7 @@ fn mail_chat(skill: Option<Arc<FakeSkill>>, perm: Arc<FakePerm>, share: bool) ->
         pending: Mutex::new(PendingActions::default()),
         share_mail_with_remote: share,
         share_calendar_with_remote: share,
+        share_contacts_with_remote: share,
     })
 }
 
@@ -1472,6 +1473,35 @@ mod por_el_bus {
     }
 
     #[tokio::test]
+    async fn las_capacidades_por_el_bus_informan_los_contactos_disponibles() {
+        let d = pair(
+            ToolBackend::new(vec![]),
+            true,
+            false,
+            false,
+            FakeContacts::new(),
+        );
+        let (server, client) = crate::test_support::p2p_pair_as(OWNER, |builder| {
+            builder.serve_at(SERVICE_PATH, d.service)
+        })
+        .await
+        .unwrap();
+        let proxy = AssistantProxy::builder(&client)
+            .path(SERVICE_PATH)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let capabilities = proxy.capabilities().await.unwrap();
+        let contacts = capabilities
+            .iter()
+            .find(|c| c.domain == DOMAIN_CONTACTS)
+            .unwrap();
+        assert!(contacts.available, "{}", contacts.reason);
+        drop(server);
+    }
+
+    #[tokio::test]
     async fn las_capacidades_por_el_bus_informan_el_correo_disponible() {
         let r = rig(vec![], true);
         let (proxy, _server, _skill) = connected(r).await;
@@ -1555,6 +1585,7 @@ fn duo(
         pending: Mutex::new(PendingActions::default()),
         share_mail_with_remote: share_mail,
         share_calendar_with_remote: share_calendar,
+        share_contacts_with_remote: false,
     });
     let service = build(backend.clone(), chat, false);
     let conversation = service.conversations.lock().create(OWNER, false).unwrap();
@@ -1748,6 +1779,7 @@ async fn calendar_capability(
         pending: Mutex::new(PendingActions::default()),
         share_mail_with_remote: share_mail,
         share_calendar_with_remote: share_calendar,
+        share_contacts_with_remote: false,
     });
     build(backend, chat, false)
         .calendar_capability(confined)
@@ -1873,4 +1905,367 @@ async fn las_capacidades_de_correo_y_calendario_se_deciden_por_separado() {
     );
     assert!(!d.service.mail_capability(false).await.available);
     assert!(d.service.calendar_capability(false).await.available);
+}
+
+// ── 12. Contactos: puerta por dominio y capacidad ───────────────────────────────
+
+/// Una habilidad de contactos de mentira: anota lo que se ejecutó.
+struct FakeContacts {
+    calls: Mutex<Vec<String>>,
+    alive: bool,
+}
+
+impl FakeContacts {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            calls: Mutex::default(),
+            alive: true,
+        })
+    }
+}
+
+impl Skill for FakeContacts {
+    fn domain(&self) -> &'static str {
+        DOMAIN_CONTACTS
+    }
+
+    fn permission(&self) -> &'static str {
+        PERMISSION_CONTACTS
+    }
+
+    fn tools(&self) -> Vec<ToolDef> {
+        vec![tool("search_contacts")]
+    }
+
+    fn call<'a>(
+        &'a self,
+        name: &'a str,
+        _args: &'a Value,
+        _ctx: &'a SkillCtx,
+    ) -> BoxFuture<'a, Result<ToolOutcome, Error>> {
+        self.calls.lock().push(name.to_owned());
+        Box::pin(async { Ok(ToolOutcome::Result("[{\"contacto\":1}]".into())) })
+    }
+
+    fn probe(&self) -> BoxFuture<'_, bool> {
+        let alive = self.alive;
+        Box::pin(async move { alive })
+    }
+}
+
+/// Un servicio con correo y contactos, cada uno con su propio consentimiento.
+struct Pair {
+    service: AssistantService,
+    backend: Arc<ToolBackend>,
+    mail: Arc<FakeSkill>,
+    contacts: Arc<FakeContacts>,
+    perm: Arc<FakePerm>,
+    conversation: String,
+}
+
+fn pair(
+    backend: Arc<ToolBackend>,
+    grant: bool,
+    share_mail: bool,
+    share_contacts: bool,
+    contacts: Arc<FakeContacts>,
+) -> Pair {
+    let mail = FakeSkill::new();
+    let perm = FakePerm::new(grant);
+    let chat = Arc::new(MailChat {
+        skills: SkillRegistry::new(vec![mail.clone(), contacts.clone()]),
+        permission: perm.clone(),
+        pending: Mutex::new(PendingActions::default()),
+        share_mail_with_remote: share_mail,
+        share_calendar_with_remote: false,
+        share_contacts_with_remote: share_contacts,
+    });
+    let service = build(backend.clone(), chat, false);
+    let conversation = service.conversations.lock().create(OWNER, false).unwrap();
+    Pair {
+        service,
+        backend,
+        mail,
+        contacts,
+        perm,
+        conversation,
+    }
+}
+
+impl Pair {
+    async fn turn(&self) {
+        self.service
+            .chat_turn_with(OWNER, &self.conversation, "hola", true)
+            .await
+            .unwrap();
+    }
+
+    fn tool_results(&self) -> String {
+        format!("{:?}", self.backend.threads.lock())
+    }
+}
+
+#[test]
+fn los_contactos_se_comparten_con_un_remoto_solo_si_se_consintio_ese_dominio() {
+    let chat = |mail, contacts| MailChat {
+        share_mail_with_remote: mail,
+        share_contacts_with_remote: contacts,
+        ..MailChat::default()
+    };
+    assert!(!MailChat::default().shares_with_remote(DOMAIN_CONTACTS));
+    assert!(!chat(true, false).shares_with_remote(DOMAIN_CONTACTS));
+    assert!(chat(false, true).shares_with_remote(DOMAIN_CONTACTS));
+    assert!(!chat(false, true).shares_with_remote(DOMAIN_MAIL));
+    assert!(!MailChat::default().share_contacts_with_remote);
+}
+
+#[test]
+fn el_registro_ofrece_las_herramientas_de_contactos_solo_con_su_dominio() {
+    let registry = SkillRegistry::new(vec![FakeSkill::new(), FakeContacts::new()]);
+    let names: Vec<String> = registry
+        .tools_for(|d| d == DOMAIN_CONTACTS)
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(names, ["search_contacts"]);
+}
+
+#[tokio::test]
+async fn con_el_modelo_local_se_ejecutan_los_contactos_y_su_resultado_llega_al_modelo() {
+    let d = pair(
+        ToolBackend::new(vec![
+            call("search_contacts", json!({"account_id": "a", "query": "q"})),
+            text("listo"),
+        ]),
+        true,
+        false,
+        false,
+        FakeContacts::new(),
+    );
+    d.turn().await;
+    assert_eq!(d.backend.offered_tools.lock()[0], 4);
+    assert_eq!(d.contacts.calls.lock().as_slice(), ["search_contacts"]);
+    assert!(d.tool_results().contains("contacto"));
+    let asked: Vec<_> = d.perm.asked.lock().iter().map(|(r, _)| r.clone()).collect();
+    assert_eq!(asked, [PERMISSION_CONTACTS]);
+}
+
+#[tokio::test]
+async fn con_un_remoto_y_solo_el_correo_compartido_los_contactos_no_se_ofrecen_ni_se_ejecutan() {
+    let d = pair(
+        ToolBackend::remote(vec![
+            call("search_contacts", json!({"account_id": "a", "query": "q"})),
+            call("search_mail", json!({"account_id": "a1"})),
+            text("listo"),
+        ]),
+        true,
+        true,
+        false,
+        FakeContacts::new(),
+    );
+    d.turn().await;
+    assert_eq!(d.backend.offered_tools.lock()[0], 3);
+    assert!(d.contacts.calls.lock().is_empty());
+    let results = d.tool_results();
+    assert!(results.contains("no está disponible con un modelo remoto"));
+    // Su resultado nunca entró al contexto del modelo remoto.
+    assert!(!results.contains("contacto\\\":1"), "{results}");
+    assert!(d
+        .perm
+        .asked
+        .lock()
+        .iter()
+        .all(|(r, _)| r != PERMISSION_CONTACTS));
+    // El correo, compartido, sigue funcionando.
+    assert_eq!(d.mail.calls_named("search_mail"), 1);
+}
+
+#[tokio::test]
+async fn con_un_remoto_y_solo_los_contactos_compartidos_el_correo_se_rechaza_y_los_contactos_corren(
+) {
+    let d = pair(
+        ToolBackend::remote(vec![
+            call("search_mail", json!({"account_id": "a1"})),
+            call("search_contacts", json!({"account_id": "a", "query": "q"})),
+            text("listo"),
+        ]),
+        true,
+        false,
+        true,
+        FakeContacts::new(),
+    );
+    d.turn().await;
+    assert_eq!(d.backend.offered_tools.lock()[0], 1);
+    assert!(d.mail.calls.lock().is_empty());
+    assert_eq!(d.contacts.calls.lock().as_slice(), ["search_contacts"]);
+}
+
+#[tokio::test]
+async fn con_un_remoto_sin_compartir_nada_los_contactos_no_arrancan_un_turno_con_herramientas() {
+    let d = pair(
+        ToolBackend::remote(vec![call(
+            "search_contacts",
+            json!({"account_id": "a", "query": "q"}),
+        )]),
+        true,
+        false,
+        false,
+        FakeContacts::new(),
+    );
+    d.turn().await;
+    assert_eq!(d.backend.tools_chats.load(Ordering::SeqCst), 0);
+    assert!(d.contacts.calls.lock().is_empty());
+}
+
+#[tokio::test]
+async fn con_store_contacts_negado_ninguna_herramienta_de_contactos_se_ejecuta() {
+    let d = pair(
+        ToolBackend::new(vec![
+            call("search_contacts", json!({"account_id": "a", "query": "q"})),
+            text("listo"),
+        ]),
+        false,
+        false,
+        false,
+        FakeContacts::new(),
+    );
+    d.turn().await;
+    assert!(d.contacts.calls.lock().is_empty());
+    assert_eq!(
+        d.perm.asked.lock().as_slice(),
+        [(PERMISSION_CONTACTS.to_owned(), "a".to_owned())]
+    );
+    assert!(d
+        .tool_results()
+        .contains("no concedió el permiso «store.contacts»"));
+}
+
+async fn contacts_capability(
+    backend: Arc<ToolBackend>,
+    contacts: Option<Arc<FakeContacts>>,
+    (share_mail, share_contacts): (bool, bool),
+    confined: bool,
+) -> vasak_assistant_protocol::Capability {
+    let skills: Vec<Arc<dyn Skill>> = [Some(FakeSkill::new() as Arc<dyn Skill>)]
+        .into_iter()
+        .chain([contacts.map(|c| c as Arc<dyn Skill>)])
+        .flatten()
+        .collect();
+    let chat = Arc::new(MailChat {
+        skills: SkillRegistry::new(skills),
+        permission: FakePerm::new(true),
+        pending: Mutex::new(PendingActions::default()),
+        share_mail_with_remote: share_mail,
+        share_calendar_with_remote: false,
+        share_contacts_with_remote: share_contacts,
+    });
+    build(backend, chat, false)
+        .contacts_capability(confined)
+        .await
+}
+
+#[tokio::test]
+async fn la_capacidad_de_contactos_esta_disponible_en_el_caso_bueno() {
+    let local = contacts_capability(
+        ToolBackend::new(vec![]),
+        Some(FakeContacts::new()),
+        (false, false),
+        false,
+    )
+    .await;
+    assert_eq!(local.domain, DOMAIN_CONTACTS);
+    assert!(
+        local.available && local.reason.is_empty(),
+        "{}",
+        local.reason
+    );
+    let remote = contacts_capability(
+        ToolBackend::remote(vec![]),
+        Some(FakeContacts::new()),
+        (false, true),
+        false,
+    )
+    .await;
+    assert!(remote.available, "{}", remote.reason);
+}
+
+#[tokio::test]
+async fn la_capacidad_de_contactos_no_esta_disponible_con_motivo_en_cada_caso_que_falta() {
+    let mut dead = Arc::try_unwrap(FakeContacts::new()).ok().unwrap();
+    dead.alive = false;
+    let none = (false, false);
+    let cases = [
+        (
+            "confinado",
+            contacts_capability(
+                ToolBackend::new(vec![]),
+                Some(FakeContacts::new()),
+                none,
+                true,
+            )
+            .await,
+        ),
+        (
+            "sin habilidad",
+            contacts_capability(ToolBackend::new(vec![]), None, none, false).await,
+        ),
+        (
+            "sin herramientas",
+            contacts_capability(
+                ToolBackend::without_tools(),
+                Some(FakeContacts::new()),
+                none,
+                false,
+            )
+            .await,
+        ),
+        (
+            "remoto sin compartir",
+            contacts_capability(
+                ToolBackend::remote(vec![]),
+                Some(FakeContacts::new()),
+                // Compartir el correo no comparte los contactos.
+                (true, false),
+                false,
+            )
+            .await,
+        ),
+        (
+            "almacén caído",
+            contacts_capability(ToolBackend::new(vec![]), Some(Arc::new(dead)), none, false).await,
+        ),
+    ];
+    let mut reasons = std::collections::HashSet::new();
+    for (name, cap) in cases {
+        assert_eq!(cap.domain, DOMAIN_CONTACTS, "{name}");
+        assert!(!cap.available, "{name}");
+        assert!(!cap.reason.is_empty(), "{name}");
+        reasons.insert(cap.reason);
+    }
+    assert_eq!(reasons.len(), 5, "cada caso explica su propio motivo");
+
+    let unreachable = ToolBackend::new(vec![]);
+    *unreachable.active_model_error.lock() = Some(BackendError::Unavailable("caído".into()));
+    let down =
+        contacts_capability(unreachable, Some(FakeContacts::new()), (true, true), false).await;
+    assert!(down.reason.contains("no responde"), "{}", down.reason);
+    let denied = ToolBackend::new(vec![]);
+    *denied.active_model_error.lock() = Some(BackendError::NotAllowed("nube".into()));
+    let cap = contacts_capability(denied, Some(FakeContacts::new()), none, false).await;
+    assert!(cap.reason.contains("allow_remote"), "{}", cap.reason);
+}
+
+#[tokio::test]
+async fn la_capacidad_de_contactos_se_decide_aparte_de_la_del_correo() {
+    let d = pair(
+        ToolBackend::remote(vec![]),
+        true,
+        true,
+        false,
+        FakeContacts::new(),
+    );
+    assert!(d.service.mail_capability(false).await.available);
+    let contacts = d.service.contacts_capability(false).await;
+    assert!(!contacts.available);
+    assert!(contacts.reason.contains("contactos"), "{}", contacts.reason);
 }
