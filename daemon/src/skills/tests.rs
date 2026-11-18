@@ -36,6 +36,11 @@ struct ToolBackend {
     supports: bool,
     /// Si está, `chat_tools_local_only` contesta este error sin consumir turnos.
     reject_local_only: Mutex<Option<BackendError>>,
+    /// Si está, lo que contesta `active_supports_tools` (el modelo efectivo);
+    /// si no, lo que dice `supports_tools`.
+    active_tools: Mutex<Option<Result<bool, BackendError>>>,
+    /// Si está, `active_model` falla con este error (modelo inalcanzable).
+    active_model_error: Mutex<Option<BackendError>>,
     threads: Mutex<Vec<Vec<ChatMessage>>>,
     offered_tools: Mutex<Vec<usize>>,
     plain_chats: AtomicUsize,
@@ -50,6 +55,8 @@ impl ToolBackend {
             local: true,
             supports: true,
             reject_local_only: Mutex::default(),
+            active_tools: Mutex::default(),
+            active_model_error: Mutex::default(),
             threads: Mutex::default(),
             offered_tools: Mutex::default(),
             plain_chats: AtomicUsize::new(0),
@@ -85,7 +92,17 @@ impl ModelBackend for ToolBackend {
 
     fn active_model(&self) -> crate::backend::BoxFuture<'_, Result<ModelInfo, BackendError>> {
         let info = self.info();
-        Box::pin(async move { Ok(info) })
+        let error = self.active_model_error.lock().clone();
+        Box::pin(async move { error.map_or(Ok(info), Err) })
+    }
+
+    fn active_supports_tools(&self) -> crate::backend::BoxFuture<'_, Result<bool, BackendError>> {
+        let answer = self
+            .active_tools
+            .lock()
+            .clone()
+            .unwrap_or(Ok(self.supports));
+        Box::pin(async move { answer })
     }
 
     fn chat<'a>(
@@ -141,6 +158,12 @@ struct FakeSkill {
     sent: Arc<AtomicUsize>,
     send_fails: bool,
     alive: bool,
+    /// Lo que devuelven las lecturas; por omisión un correo chico.
+    read_result: String,
+    /// Si está, el envío avisa que empezó y espera a que lo suelten.
+    gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    /// Se corre al armar el draft de `send_mail`, antes de devolverlo.
+    on_send_mail: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl FakeSkill {
@@ -150,6 +173,9 @@ impl FakeSkill {
             sent: Arc::default(),
             send_fails: false,
             alive: true,
+            read_result: "[{\"id\":7,\"asunto\":\"Hola\"}]".into(),
+            gate: None,
+            on_send_mail: Mutex::default(),
         })
     }
 
@@ -189,8 +215,12 @@ impl Skill for FakeSkill {
         Box::pin(async move {
             match name {
                 "send_mail" => {
+                    if let Some(hook) = self.on_send_mail.lock().as_ref() {
+                        hook();
+                    }
                     let sent = self.sent.clone();
                     let fails = self.send_fails;
+                    let gate = self.gate.clone();
                     let action = PendingAction {
                         id: uuid::Uuid::new_v4().to_string(),
                         conversation_id: ctx.conversation_id.clone(),
@@ -202,6 +232,10 @@ impl Skill for FakeSkill {
                     };
                     let execute: SendAction = Box::new(move || {
                         Box::pin(async move {
+                            if let Some((started, release)) = gate {
+                                started.notify_one();
+                                release.notified().await;
+                            }
                             sent.fetch_add(1, Ordering::SeqCst);
                             if fails {
                                 Err(Error::Backend("no se pudo encolar".into()))
@@ -213,9 +247,7 @@ impl Skill for FakeSkill {
                     Ok(ToolOutcome::Pending { action, execute })
                 }
                 "boom_mail" => Err(Error::Backend("se rompió".into())),
-                _ => Ok(ToolOutcome::Result(
-                    "[{\"id\":7,\"asunto\":\"Hola\"}]".into(),
-                )),
+                _ => Ok(ToolOutcome::Result(self.read_result.clone())),
             }
         })
     }
@@ -431,25 +463,47 @@ async fn una_herramienta_de_lectura_corre_con_permiso_y_su_resultado_vuelve_al_m
 }
 
 #[tokio::test]
-async fn los_mensajes_de_herramienta_no_entran_al_historial_visible() {
+async fn un_turno_con_datos_de_correo_devuelve_el_texto_pero_no_lo_deja_en_el_historial() {
     let r = rig(
         vec![
             call("search_mail", json!({"account_id": "a1"})),
-            text("listo"),
+            text("Tenés un correo: Hola"),
         ],
         true,
     );
-    r.turn("buscá").await.unwrap();
+    // Quien llama recibe la respuesta...
+    assert_eq!(r.turn("buscá").await.unwrap().text, "Tenés un correo: Hola");
+    // ...pero ni la pregunta ni la respuesta (que puede citar el correo) quedan
+    // en el historial reutilizable.
+    assert!(r.history().is_empty(), "{:?}", r.history());
+}
+
+#[tokio::test]
+async fn un_turno_sin_datos_de_correo_conserva_su_historial_normal() {
+    // Sin llamadas a herramienta.
+    let r = rig(vec![text("hola, ¿qué tal?")], true);
+    r.turn("hola").await.unwrap();
     let history = r.history();
-    assert_eq!(
-        history.len(),
-        2,
-        "sólo la pregunta y la respuesta: {history:?}"
-    );
+    assert_eq!(history.len(), 2, "{history:?}");
     assert_eq!(history[0].role, Role::User);
     assert_eq!(history[1].role, Role::Assistant);
-    assert_eq!(history[1].content, "listo");
-    assert!(history.iter().all(|m| !m.content.contains("asunto")));
+    assert_eq!(history[1].content, "hola, ¿qué tal?");
+
+    // Con una herramienta que no trajo datos (permiso negado): tampoco hay
+    // correo que proteger.
+    let denied = rig(
+        vec![
+            call("search_mail", json!({"account_id": "a1"})),
+            text("No tengo permiso"),
+        ],
+        false,
+    );
+    denied.turn("buscá").await.unwrap();
+    assert_eq!(denied.history().len(), 2);
+    assert!(denied
+        .history()
+        .iter()
+        .all(|m| !m.content.contains("asunto")));
 }
 
 #[tokio::test]
@@ -568,7 +622,9 @@ async fn confirmar_la_accion_envia_recien_ahi() {
     let id = r.turn("mandá").await.unwrap().pending[0].id.clone();
     assert_eq!(r.skill.sent.load(Ordering::SeqCst), 0);
     let result = r.service.confirm_pending(OWNER, &id).await.unwrap();
-    assert_eq!(result, "Enviado");
+    // `SendMessage` acepta el draft en la cola; no confirma la entrega.
+    assert_eq!(result, "Puesto en cola para enviar");
+    assert_ne!(result, "Enviado");
     assert_eq!(r.skill.sent.load(Ordering::SeqCst), 1);
 }
 
@@ -585,16 +641,33 @@ async fn una_segunda_confirmacion_da_not_found_y_no_reenvia() {
 }
 
 #[tokio::test]
-async fn dos_confirmaciones_a_la_vez_envian_una_sola_vez() {
-    let r = rig(vec![call("send_mail", send_args())], true);
-    let id = r.turn("mandá").await.unwrap().pending[0].id.clone();
-    let (a, b) = tokio::join!(
-        r.service.confirm_pending(OWNER, &id),
-        r.service.confirm_pending(OWNER, &id)
+async fn la_segunda_confirmacion_da_not_found_mientras_el_primer_envio_sigue_en_curso() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut skill = Arc::try_unwrap(FakeSkill::new()).ok().unwrap();
+    skill.gate = Some((started.clone(), release.clone()));
+    let r = rig_with(
+        ToolBackend::new(vec![call("send_mail", send_args())]),
+        Arc::new(skill),
+        true,
+        false,
     );
-    assert_eq!(a.is_ok() as u8 + b.is_ok() as u8, 1, "{a:?} {b:?}");
-    let loser = if a.is_err() { a } else { b };
-    assert!(matches!(loser, Err(Error::NotFound(_))), "{loser:?}");
+    let id = r.turn("mandá").await.unwrap().pending[0].id.clone();
+
+    let first = r.service.confirm_pending(OWNER, &id);
+    tokio::pin!(first);
+    // El primer envío arranca y queda esperando en la compuerta.
+    tokio::select! {
+        done = &mut first => panic!("el envío no debía terminar todavía: {done:?}"),
+        () = started.notified() => {}
+    }
+    // Con el primero a medio camino, la acción ya no está: no hay segundo envío.
+    let second = r.service.confirm_pending(OWNER, &id).await;
+    assert!(matches!(second, Err(Error::NotFound(_))), "{second:?}");
+    assert_eq!(r.skill.sent.load(Ordering::SeqCst), 0);
+
+    release.notify_one();
+    assert_eq!(first.await.unwrap(), "Puesto en cola para enviar");
     assert_eq!(r.skill.sent.load(Ordering::SeqCst), 1);
 }
 
@@ -770,6 +843,36 @@ async fn si_el_modelo_pasa_a_remoto_en_el_medio_la_respuesta_es_segura_y_no_sale
 }
 
 #[tokio::test]
+async fn el_cambio_a_remoto_antes_de_mandar_dice_que_nada_salio_y_despues_de_mandar_no() {
+    let mut texts = Vec::new();
+    for error in [BackendError::NotLocal, BackendError::RemoteAfterSend] {
+        let backend = ToolBackend::new(vec![call("search_mail", json!({"account_id": "a1"}))]);
+        *backend.reject_local_only.lock() = Some(error);
+        let r = rig_with(backend, FakeSkill::new(), true, false);
+        let reply = r.turn("¿qué correos tengo?").await.unwrap();
+        assert!(reply.pending.is_empty());
+        texts.push(reply.text);
+    }
+    let (before, after) = (&texts[0], &texts[1]);
+    assert_ne!(before, after, "los dos casos no pueden decir lo mismo");
+    // Antes de mandar: nada salió, y lo dice.
+    assert!(before.contains("tus datos no se comparten"), "{before}");
+    // Después de mandar: pudo haber salido; no afirma lo contrario.
+    assert!(after.contains("pudo haber salido"), "{after}");
+    assert!(!after.contains("no se comparten"), "{after}");
+}
+
+#[tokio::test]
+async fn un_cambio_a_remoto_tampoco_deja_el_texto_seguro_en_el_historial_de_un_turno_de_correo() {
+    let backend = ToolBackend::new(vec![call("search_mail", json!({"account_id": "a1"}))]);
+    *backend.reject_local_only.lock() = Some(BackendError::RemoteAfterSend);
+    let r = rig_with(backend, FakeSkill::new(), true, false);
+    let reply = r.turn("hola").await.unwrap();
+    // La respuesta segura se guarda como cualquier turno sin datos de correo.
+    assert_eq!(r.history().last().unwrap().content, reply.text);
+}
+
+#[tokio::test]
 async fn sin_compartir_el_turno_usa_la_variante_solo_local_del_modelo() {
     let r = rig(vec![text("hola")], true);
     r.turn("hola").await.unwrap();
@@ -792,6 +895,256 @@ async fn compartiendo_con_remoto_el_modelo_remoto_si_ve_las_herramientas() {
     assert_eq!(r.backend.local_only_chats.load(Ordering::SeqCst), 0);
     assert_eq!(r.backend.tools_chats.load(Ordering::SeqCst), 2);
     assert_eq!(r.skill.calls_named("search_mail"), 1);
+}
+
+// ── Modelo efectivo sin herramientas (Ollama /api/show) ─────────────────────────
+
+#[tokio::test]
+async fn un_modelo_efectivo_sin_herramientas_chatea_en_texto_aunque_el_backend_las_hable() {
+    let backend = ToolBackend::new(vec![call("search_mail", json!({"account_id": "a1"}))]);
+    assert!(backend.supports_tools(), "el backend sí habla herramientas");
+    *backend.active_tools.lock() = Some(Ok(false));
+    let r = rig_with(backend, FakeSkill::new(), true, false);
+    let reply = r.turn("hola").await.unwrap();
+    assert_eq!(reply.text, "texto plano");
+    assert!(reply.pending.is_empty());
+    assert_eq!(r.backend.tools_chats.load(Ordering::SeqCst), 0);
+    assert_eq!(r.backend.plain_chats.load(Ordering::SeqCst), 1);
+    assert!(r.skill.calls.lock().is_empty());
+    // Es un chat normal: el intercambio queda en el historial.
+    assert_eq!(r.history().len(), 2);
+}
+
+#[tokio::test]
+async fn si_no_se_pudo_saber_si_el_modelo_admite_herramientas_cae_en_chat_plano() {
+    let backend = ToolBackend::new(vec![]);
+    *backend.active_tools.lock() = Some(Err(BackendError::Failed("no responde".into())));
+    let r = rig_with(backend, FakeSkill::new(), true, false);
+    assert_eq!(r.turn("hola").await.unwrap().text, "texto plano");
+    assert_eq!(r.backend.tools_chats.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn la_capacidad_de_correo_no_esta_disponible_si_el_modelo_efectivo_no_admite_herramientas() {
+    let backend = ToolBackend::new(vec![]);
+    *backend.active_tools.lock() = Some(Ok(false));
+    let cap = mail_capability(backend, Some(FakeSkill::new()), false, false).await;
+    assert!(!cap.available);
+    assert!(
+        cap.reason.contains("no admite herramientas"),
+        "{}",
+        cap.reason
+    );
+}
+
+// ── Opt-in propio del correo (share_mail_with_remote) ───────────────────────────
+
+#[test]
+fn el_correo_no_se_comparte_con_un_remoto_por_omision() {
+    assert!(!crate::config::Settings::default().share_mail_with_remote);
+    assert!(!MailChat::default().share_with_remote);
+    let leida =
+        crate::config::settings_from_json(r#"{"assistant":{"share_memory_with_remote":true}}"#)
+            .unwrap();
+    assert!(leida.share_memory_with_remote);
+    assert!(
+        !leida.share_mail_with_remote,
+        "consentir la memoria no es consentir el correo"
+    );
+    let ambos =
+        crate::config::settings_from_json(r#"{"assistant":{"share_mail_with_remote":true}}"#)
+            .unwrap();
+    assert!(ambos.share_mail_with_remote && !ambos.share_memory_with_remote);
+}
+
+#[tokio::test]
+async fn compartir_la_memoria_con_el_remoto_no_comparte_el_correo() {
+    // Memoria compartida (share=true), correo no (mail_chat con false).
+    let backend = ToolBackend::remote(vec![call("search_mail", json!({"account_id": "a1"}))]);
+    let skill = FakeSkill::new();
+    let service = build(
+        backend.clone(),
+        mail_chat(Some(skill.clone()), FakePerm::new(true), false),
+        true,
+    );
+    let id = service.conversations.lock().create(OWNER, false).unwrap();
+    let reply = service
+        .chat_turn_with(OWNER, &id, "¿qué correos tengo?", true)
+        .await
+        .unwrap();
+    assert_eq!(reply.text, "texto plano");
+    assert_eq!(backend.tools_chats.load(Ordering::SeqCst), 0);
+    assert!(skill.calls.lock().is_empty());
+
+    let cap = service.mail_capability(false).await;
+    assert!(!cap.available);
+    assert!(cap.reason.contains("remoto"), "{}", cap.reason);
+}
+
+#[tokio::test]
+async fn compartir_el_correo_alcanza_para_un_remoto_aunque_la_memoria_no_se_comparta() {
+    let backend = ToolBackend::remote(vec![
+        call("search_mail", json!({"account_id": "a1"})),
+        text("listo"),
+    ]);
+    let skill = FakeSkill::new();
+    // Correo compartido (true), memoria no (build recibe false).
+    let service = build(
+        backend.clone(),
+        mail_chat(Some(skill.clone()), FakePerm::new(true), true),
+        false,
+    );
+    let id = service.conversations.lock().create(OWNER, false).unwrap();
+    let reply = service
+        .chat_turn_with(OWNER, &id, "buscá", true)
+        .await
+        .unwrap();
+    assert_eq!(reply.text, "listo");
+    assert_eq!(skill.calls_named("search_mail"), 1);
+    assert_eq!(backend.local_only_chats.load(Ordering::SeqCst), 0);
+    assert!(service.mail_capability(false).await.available);
+}
+
+// ── Presupuesto del turno ───────────────────────────────────────────────────────
+
+fn batch(n: usize) -> Result<ModelTurn, BackendError> {
+    Ok(ModelTurn::Calls(
+        (0..n)
+            .map(|i| ToolCall {
+                id: format!("id-{i}"),
+                name: "search_mail".into(),
+                arguments: json!({"account_id": "a1"}),
+            })
+            .collect(),
+    ))
+}
+
+#[tokio::test]
+async fn una_tanda_con_mas_llamadas_que_el_tope_se_corta_sin_ejecutar_ninguna() {
+    let r = rig(vec![batch(13), text("no debió llegar")], true);
+    let reply = r.turn("buscá").await.unwrap();
+    assert!(reply.text.contains("No pude completar"), "{}", reply.text);
+    assert!(
+        r.skill.calls.lock().is_empty(),
+        "se chequea antes de la tanda"
+    );
+    assert_eq!(r.backend.tools_chats.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn doce_llamadas_en_un_turno_entran_y_la_numero_trece_no() {
+    let r = rig(vec![batch(12), text("listo")], true);
+    assert_eq!(r.turn("buscá").await.unwrap().text, "listo");
+    assert_eq!(r.skill.calls_named("search_mail"), 12);
+
+    // El tope es del turno, no de cada respuesta: 8 + 8 se pasa.
+    let r = rig(vec![batch(8), batch(8), text("no debió llegar")], true);
+    let reply = r.turn("buscá").await.unwrap();
+    assert!(reply.text.contains("No pude completar"), "{}", reply.text);
+    assert_eq!(
+        r.skill.calls_named("search_mail"),
+        8,
+        "la segunda tanda no corre"
+    );
+}
+
+#[tokio::test]
+async fn los_resultados_que_pasan_el_tope_de_bytes_cortan_el_turno() {
+    let mut big = Arc::try_unwrap(FakeSkill::new()).ok().unwrap();
+    big.read_result = "x".repeat(70 * 1024);
+    // Un resultado de 70 KiB entra; el segundo suma 140 KiB y pasa los 128 KiB.
+    let r = rig_with(
+        ToolBackend::new(vec![batch(2), text("no debió llegar")]),
+        Arc::new(big),
+        true,
+        false,
+    );
+    let reply = r.turn("buscá").await.unwrap();
+    assert!(reply.text.contains("No pude completar"), "{}", reply.text);
+    assert!(reply.pending.is_empty());
+    assert_eq!(r.backend.tools_chats.load(Ordering::SeqCst), 1);
+
+    let mut ok = Arc::try_unwrap(FakeSkill::new()).ok().unwrap();
+    ok.read_result = "x".repeat(100 * 1024);
+    let r = rig_with(
+        ToolBackend::new(vec![batch(1), text("listo")]),
+        Arc::new(ok),
+        true,
+        false,
+    );
+    assert_eq!(r.turn("buscá").await.unwrap().text, "listo");
+}
+
+// ── Cerrar la conversación y los drafts ─────────────────────────────────────────
+
+#[tokio::test]
+async fn cerrar_la_conversacion_descarta_su_draft_y_una_confirmacion_tardia_no_envia() {
+    let r = rig(vec![call("send_mail", send_args())], true);
+    let id = r.turn("mandá").await.unwrap().pending[0].id.clone();
+    r.service
+        .delete_conversation_as(OWNER, &r.conversation)
+        .await
+        .unwrap();
+    assert!(r.service.mail.pending.lock().by_id.is_empty());
+    let late = r.service.confirm_pending(OWNER, &id).await;
+    assert!(matches!(late, Err(Error::NotFound(_))), "{late:?}");
+    assert_eq!(r.skill.sent.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cerrar_una_conversacion_no_toca_los_drafts_de_otra() {
+    let r = rig(
+        vec![
+            call("send_mail", send_args()),
+            call("send_mail", send_args()),
+        ],
+        true,
+    );
+    let other = r.service.conversations.lock().create(OWNER, false).unwrap();
+    r.turn("uno").await.unwrap();
+    let kept = r
+        .service
+        .chat_turn_with(OWNER, &other, "dos", true)
+        .await
+        .unwrap()
+        .pending[0]
+        .id
+        .clone();
+    r.service
+        .delete_conversation_as(OWNER, &r.conversation)
+        .await
+        .unwrap();
+    assert_eq!(r.service.mail.pending.lock().by_id.len(), 1);
+    r.service.confirm_pending(OWNER, &kept).await.unwrap();
+}
+
+#[tokio::test]
+async fn un_draft_que_llega_cuando_la_conversacion_ya_se_cerro_no_se_registra() {
+    let r = rig(vec![call("send_mail", send_args())], true);
+    // La conversación se cierra mientras la herramienta arma el draft.
+    let conversations = r.service.conversations.clone();
+    let id = r.conversation.clone();
+    *r.skill.on_send_mail.lock() = Some(Box::new(move || {
+        conversations.lock().delete(OWNER, &id).unwrap();
+    }));
+    let reply = r.turn("mandá").await.unwrap();
+    // Se le muestra el resumen a quien llama, pero sin acción confirmable.
+    assert!(!reply.text.is_empty());
+    assert!(reply.pending.is_empty(), "{:?}", reply.pending);
+    assert!(r.service.mail.pending.lock().by_id.is_empty());
+    assert_eq!(r.skill.sent.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn remove_conversation_saca_solo_los_drafts_de_esa_conversacion_y_dueno() {
+    let mut pending = PendingActions::default();
+    pending.insert("a", "c1", action("1"), noop());
+    pending.insert("a", "c2", action("2"), noop());
+    pending.insert("b", "c1", action("3"), noop());
+    pending.remove_conversation("a", "c1");
+    assert!(pending.take("1", "a").is_err());
+    assert!(pending.take("2", "a").is_ok());
+    assert!(pending.take("3", "b").is_ok());
 }
 
 // ── 10. Capacidad DOMAIN_MAIL ───────────────────────────────────────────────────
@@ -881,6 +1234,30 @@ async fn la_capacidad_de_correo_no_esta_disponible_con_motivo_en_cada_caso_que_f
         reasons.insert(cap.reason);
     }
     assert_eq!(reasons.len(), 5, "cada caso explica su propio motivo");
+}
+
+#[tokio::test]
+async fn la_capacidad_distingue_un_modelo_inalcanzable_de_uno_remoto() {
+    let unreachable = ToolBackend::new(vec![]);
+    *unreachable.active_model_error.lock() = Some(BackendError::Unavailable("caído".into()));
+    // Aun compartiendo con remotos, un modelo que no responde no es «remoto».
+    let down = mail_capability(unreachable, Some(FakeSkill::new()), true, false).await;
+    let remote = mail_capability(
+        ToolBackend::remote(vec![]),
+        Some(FakeSkill::new()),
+        false,
+        false,
+    )
+    .await;
+    assert!(!down.available && !remote.available);
+    assert!(down.reason.contains("no responde"), "{}", down.reason);
+    assert!(!down.reason.contains("remoto"), "{}", down.reason);
+    assert!(remote.reason.contains("remoto"), "{}", remote.reason);
+
+    let not_allowed = ToolBackend::new(vec![]);
+    *not_allowed.active_model_error.lock() = Some(BackendError::NotAllowed("nube".into()));
+    let cap = mail_capability(not_allowed, Some(FakeSkill::new()), false, false).await;
+    assert!(cap.reason.contains("allow_remote"), "{}", cap.reason);
 }
 
 // ── Registro de acciones pendientes ─────────────────────────────────────────────

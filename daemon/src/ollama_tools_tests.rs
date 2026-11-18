@@ -260,3 +260,51 @@ async fn los_errores_http_del_chat_con_herramientas_se_mapean_como_en_el_chat_co
         .unwrap_err();
     assert!(matches!(error, BackendError::Failed(_)), "{error:?}");
 }
+
+// ── Capacidad `tools` del modelo efectivo (/api/show) ───────────────────────────
+
+#[test]
+fn parse_capabilities_dice_si_el_modelo_tiene_la_capacidad_tools() {
+    assert!(parse_capabilities(br#"{"capabilities":["completion","tools"]}"#).unwrap());
+    assert!(!parse_capabilities(br#"{"capabilities":["completion"]}"#).unwrap());
+    // Una versión vieja de Ollama no manda `capabilities`: no se asume.
+    assert!(!parse_capabilities(b"{}").unwrap());
+    assert!(matches!(
+        parse_capabilities(b"no es json"),
+        Err(BackendError::Failed(_))
+    ));
+}
+
+#[tokio::test]
+async fn active_supports_tools_pregunta_a_api_show_por_el_modelo_efectivo() {
+    for (capabilities, expected) in [
+        (r#"["completion","tools"]"#, true),
+        (r#"["completion"]"#, false),
+    ] {
+        let server = FakeServer::start(move |pedido| match pedido.path.as_str() {
+            "/api/tags" => Reply::json(TAGS),
+            "/api/show" => Reply::json(&format!(r#"{{"capabilities":{capabilities}}}"#)),
+            _ => Reply::status(404),
+        })
+        .await;
+        let answer = backend(&server).active_supports_tools().await.unwrap();
+        assert_eq!(answer, expected, "{capabilities}");
+        let show = server
+            .captured()
+            .into_iter()
+            .find(|p| p.path == "/api/show")
+            .expect("hubo un pedido a /api/show");
+        assert_eq!(show.json()["model"], "llama3.2:latest");
+    }
+}
+
+#[tokio::test]
+async fn si_api_show_falla_active_supports_tools_da_error_y_no_afirma_nada() {
+    let server = FakeServer::start(|pedido| match pedido.path.as_str() {
+        "/api/tags" => Reply::json(TAGS),
+        _ => Reply::status(500),
+    })
+    .await;
+    let error = backend(&server).active_supports_tools().await.unwrap_err();
+    assert!(matches!(error, BackendError::Failed(m) if m.contains("500")));
+}

@@ -40,6 +40,34 @@ fn el_recorte_del_cuerpo_respeta_el_limite_y_los_caracteres() {
 }
 
 #[test]
+fn un_caracter_de_dos_bytes_que_cruza_el_limite_se_descarta_entero() {
+    // 239 bytes ASCII y una `é` (2 bytes) que empieza en el 239: cruza el límite
+    // de 240, así que el recorte termina en el último ASCII.
+    let cuerpo = format!("{}é y mucho más texto", "a".repeat(BODY_PREVIEW_BYTES - 1));
+    let recorte = preview(&cuerpo);
+    assert_eq!(recorte, format!("{}…", "a".repeat(BODY_PREVIEW_BYTES - 1)));
+}
+
+#[tokio::test]
+async fn una_llamada_que_no_responde_a_tiempo_da_error_de_backend_en_vez_de_colgarse() {
+    let colgada = std::future::pending::<zbus::Result<String>>();
+    // El plazo externo hace que, sin el timeout, el test falle en vez de colgarse.
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        call_with_timeout(Duration::from_millis(20), colgada),
+    )
+    .await
+    .expect("la llamada no puede quedarse esperando para siempre");
+    assert!(
+        matches!(&result, Err(Error::Backend(m)) if m.contains("a tiempo")),
+        "{result:?}"
+    );
+    // Una respuesta a tiempo pasa tal cual.
+    let ok = call_with_timeout(Duration::from_secs(5), async { Ok::<_, zbus::Error>(7) }).await;
+    assert_eq!(ok.unwrap(), 7);
+}
+
+#[test]
 fn el_error_del_bus_dice_que_el_servicio_de_cuentas_no_respondio() {
     let error = backend_error("boom");
     assert!(matches!(&error, Error::Backend(m) if m.contains("boom") && m.contains("cuentas")));
@@ -262,6 +290,34 @@ async fn send_mail_no_manda_nada_hasta_que_se_ejecuta_la_accion() {
     assert_eq!(draft["para"], json!(["ana@x.org", "bea@x.org"]));
     assert_eq!(draft["asunto"], "Hola");
     assert_eq!(draft["cuerpo"].as_str().unwrap().len(), 500);
+}
+
+#[tokio::test]
+async fn send_mail_sin_destinatarios_validos_es_invalid_args_y_no_arma_el_draft() {
+    let (skill, log, _server) = accounts().await;
+    for to in ["", " , , ", ",", "   "] {
+        let args = json!({"account_id": "a1", "to": to, "subject": "s", "body": "b"});
+        let result = skill.call("send_mail", &args, &ctx()).await;
+        assert!(matches!(result, Err(Error::InvalidArgs(_))), "to={to:?}");
+    }
+    assert!(log.lock().is_empty());
+}
+
+#[tokio::test]
+async fn el_resumen_del_envio_nombra_la_cuenta_que_envia() {
+    let (skill, _log, _server) = accounts().await;
+    let mut summaries = Vec::new();
+    for account in ["personal", "trabajo"] {
+        let args = json!({"account_id": account, "to": "a@b.c", "subject": "Hola", "body": "b"});
+        let ToolOutcome::Pending { action, .. } =
+            skill.call("send_mail", &args, &ctx()).await.unwrap()
+        else {
+            panic!("pendiente");
+        };
+        assert!(action.summary.contains(account), "{}", action.summary);
+        summaries.push(action.summary);
+    }
+    assert_ne!(summaries[0], summaries[1], "mismos destinatarios y asunto");
 }
 
 #[tokio::test]
