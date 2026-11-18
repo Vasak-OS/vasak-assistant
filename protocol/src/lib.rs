@@ -155,6 +155,48 @@ pub struct Message {
     pub content: String,
 }
 
+// ── Las acciones que la persona confirma ───────────────────────────────────────
+
+/// Cuántos pasos de herramienta puede dar el asistente en un turno antes de
+/// cortar con una respuesta segura. Está en el contrato porque acota cuánto
+/// puede tardar un turno de [`Assistant::chat_turn`].
+pub const MAX_TOOL_ITERATIONS: usize = 5;
+
+/// Una acción que el asistente propone y que la persona confirma antes de que
+/// ocurra (mandar un correo, por ahora). El borrador completo **no viaja**: se
+/// queda en el servicio, atado a este `id`, y la persona confirma mirando
+/// `to`/`subject`/`body_preview`. Firma `(sssssss)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct PendingAction {
+    /// El identificador de la acción (un UUID), el que toman
+    /// [`Assistant::confirm_action`] y [`Assistant::cancel_action`].
+    pub id: String,
+    /// La conversación en la que se propuso.
+    pub conversation_id: String,
+    /// Qué clase de acción es (`send_mail`).
+    pub kind: String,
+    /// Una frase para mostrarle a la persona.
+    pub summary: String,
+    /// Los destinatarios, separados por coma.
+    pub to: String,
+    /// El asunto.
+    pub subject: String,
+    /// El cuerpo recortado; el borrador completo no viaja.
+    pub body_preview: String,
+}
+
+/// La respuesta de un turno de [`Assistant::chat_turn`]: el texto del asistente
+/// y, si corresponde, la acción que propone para que la persona la confirme.
+/// Firma `(sa(sssssss))`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct ChatReply {
+    /// El texto del asistente.
+    pub text: String,
+    /// Cero o una acción pendiente de confirmación. Es un `Vec` y no un
+    /// `Option` para que la firma D-Bus quede limpia.
+    pub pending: Vec<PendingAction>,
+}
+
 // ── El estado ─────────────────────────────────────────────────────────────────
 
 /// El modelo con el que responde el asistente.
@@ -472,6 +514,26 @@ pub trait Assistant {
     /// modelo. Si falla, la conversación queda como estaba.
     fn chat(&self, conversation_id: &str, content: &str) -> Result<String, Error>;
 
+    /// Como [`Self::chat`], pero el asistente puede usar sus habilidades (leer
+    /// el correo, redactar un envío) cuando están disponibles, y devuelve
+    /// además la acción que proponga. Nunca ejecuta una acción con efecto por
+    /// su cuenta: un envío siempre vuelve como [`PendingAction`] para que la
+    /// persona lo confirme con [`Self::confirm_action`].
+    ///
+    /// Un llamador confinado (AppArmor) chatea **sin habilidades**: su
+    /// respuesta nunca trae acciones pendientes.
+    fn chat_turn(&self, conversation_id: &str, content: &str) -> Result<ChatReply, Error>;
+
+    /// Confirma una acción propuesta por su `id` y la ejecuta (encola el
+    /// correo). Devuelve un texto para la persona. `NotFound` si el `id` no
+    /// existe, es de otra conexión, venció o ya se consumió: la acción se saca
+    /// del registro antes de ejecutarse, así un envío no se repite.
+    fn confirm_action(&self, action_id: &str) -> Result<String, Error>;
+
+    /// Descarta una acción propuesta por su `id` sin ejecutarla. `NotFound` con
+    /// las mismas condiciones que [`Self::confirm_action`].
+    fn cancel_action(&self, action_id: &str) -> Result<(), Error>;
+
     /// Cierra una conversación y olvida sus mensajes.
     fn delete_conversation(&self, conversation_id: &str) -> Result<(), Error>;
 
@@ -582,6 +644,8 @@ mod tests {
         assert_eq!(signature::<ServiceStatus>(), "(bs(ssbs)u)");
         assert_eq!(signature::<Capability>(), "(sbs)");
         assert_eq!(signature::<MemoryStatus>(), "(bbst)");
+        assert_eq!(signature::<PendingAction>(), "(sssssss)");
+        assert_eq!(signature::<ChatReply>(), "(sa(sssssss))");
     }
 
     #[test]

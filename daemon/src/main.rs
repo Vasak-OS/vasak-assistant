@@ -23,6 +23,7 @@ mod memory;
 mod ollama;
 mod openai;
 mod service;
+mod skills;
 #[cfg(test)]
 mod test_support;
 
@@ -119,6 +120,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "{}",
         logging::startup_summary(&settings, &backend.info(), memory.is_enabled().await)
     );
+    // Las habilidades le hablan al servicio de cuentas y a vasak-permissions por
+    // su propia conexión al bus de sesión (la de servir se mueve al object
+    // server más abajo).
+    let mail_bus = Connection::session().await?;
+    let mail = Arc::new(skills::MailChat {
+        skills: skills::SkillRegistry::new(vec![Arc::new(skills::mail::MailSkill::new(
+            mail_bus.clone(),
+        ))]),
+        permission: Arc::new(skills::mail::DbusPermission::new(mail_bus)),
+        pending: parking_lot::Mutex::new(skills::PendingActions::default()),
+        share_with_remote: settings.share_mail_with_remote,
+    });
     let service = AssistantService {
         backend,
         conversations: conversations.clone(),
@@ -126,6 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         secrets,
         memory,
         labels: Arc::new(service::BusLabels),
+        mail,
     };
 
     let connection = connection::Builder::session()?

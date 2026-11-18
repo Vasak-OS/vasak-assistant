@@ -54,6 +54,11 @@ pub struct Settings {
     /// manda en el contexto y se aprende de esas conversaciones). Por omisión
     /// no: con un remoto, la memoria no se lee ni se escribe.
     pub share_memory_with_remote: bool,
+    /// Si el correo (lo que leen las herramientas) se comparte con un backend
+    /// remoto. Es una decisión propia, aparte de la de la memoria: la de la
+    /// memoria NO la satisface. Por omisión no: con un remoto, el correo no se
+    /// le manda ni se ofrecen sus herramientas.
+    pub share_mail_with_remote: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,6 +342,7 @@ mod tests {
             model: some(model),
             allow_remote,
             share_memory_with_remote: false,
+            share_mail_with_remote: false,
         }
     }
 

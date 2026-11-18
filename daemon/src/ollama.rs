@@ -10,7 +10,9 @@ use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use vasak_assistant_protocol::{Message, ModelInfo};
 
-use crate::backend::{BackendError, BoxFuture, ModelBackend};
+use crate::backend::{
+    BackendError, BoxFuture, ChatMessage, ModelBackend, ModelTurn, ToolCall, ToolDef,
+};
 use crate::config::Selection;
 use crate::http::{self, CHAT_TIMEOUT, LIST_TIMEOUT};
 
@@ -62,6 +64,35 @@ impl OllamaBackend {
             )));
         }
         parse_tags(&http::read_capped(self.base(), response).await?)
+    }
+
+    /// Si el modelo efectivo tiene la capacidad `tools`. Lo dice `/api/show`
+    /// en `capabilities`: un modelo local sin esa capacidad rechaza cualquier
+    /// pedido con herramientas, hasta un saludo, así que no hay que ofrecérselas.
+    async fn model_supports_tools(&self) -> Result<bool, BackendError> {
+        let (model, _remote) = self.resolve_model().await?;
+        let response = self
+            .client
+            .post(http::endpoint(self.base(), "api/show")?)
+            .timeout(LIST_TIMEOUT)
+            .json(&ShowRequest { model: &model })
+            .send()
+            .await
+            .map_err(|error| http::map_error(self.base(), error))?;
+        tracing::debug!(
+            backend = "ollama",
+            operation = "api/show",
+            model = model.as_str(),
+            status = response.status().as_u16(),
+            "respuesta HTTP"
+        );
+        if !response.status().is_success() {
+            return Err(BackendError::Failed(format!(
+                "Ollama respondió {} al detalle del modelo",
+                response.status()
+            )));
+        }
+        parse_capabilities(&http::read_capped(self.base(), response).await?)
     }
 
     /// El modelo con el que responder y si corre fuera de la máquina.
@@ -143,6 +174,84 @@ impl OllamaBackend {
         }
         Ok(reply.message.content)
     }
+
+    /// Un turno con herramientas: igual que [`Self::send_chat`] pero manda las
+    /// `tools` y lee `message.tool_calls`. Con `require_local`, si el modelo
+    /// resuelto no es local no se manda nada ([`BackendError::NotLocal`]).
+    async fn send_chat_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDef],
+        require_local: bool,
+    ) -> Result<ModelTurn, BackendError> {
+        let (model, remote) = self.resolve_model().await?;
+        if require_local && !(self.selection.local && !remote) {
+            return Err(BackendError::NotLocal);
+        }
+        let payload = ToolsChatRequest {
+            model: &model,
+            messages: messages.iter().map(ollama_message).collect(),
+            stream: false,
+            tools: tools.iter().map(tool_spec).collect(),
+        };
+        let response = self
+            .client
+            .post(http::endpoint(self.base(), "api/chat")?)
+            .timeout(CHAT_TIMEOUT)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|error| http::map_error(self.base(), error))?;
+        tracing::debug!(
+            backend = "ollama",
+            operation = "api/chat",
+            model = model.as_str(),
+            status = response.status().as_u16(),
+            "respuesta HTTP"
+        );
+        match response.status() {
+            status if status.is_success() => {}
+            StatusCode::NOT_FOUND => return Err(model_missing(&model)),
+            status => {
+                return Err(BackendError::Failed(format!(
+                    "Ollama respondió {status} al pedido de chat"
+                )))
+            }
+        }
+        let reply = parse_chat(&http::read_capped(self.base(), response).await?)?;
+        // La misma defensa que `send_chat`: si la respuesta vino de un modelo
+        // remoto (reapuntado en el medio), se descarta sin dejar el host en el
+        // registro.
+        if !reply.remote_host.is_empty() && (require_local || !self.allow_remote) {
+            tracing::warn!(
+                backend = "ollama",
+                "el modelo cambió a uno remoto durante el pedido"
+            );
+            return Err(if self.allow_remote {
+                BackendError::RemoteAfterSend
+            } else {
+                remote_not_allowed(&model)
+            });
+        }
+        if reply.message.tool_calls.is_empty() {
+            Ok(ModelTurn::Text(reply.message.content))
+        } else {
+            Ok(ModelTurn::Calls(
+                reply
+                    .message
+                    .tool_calls
+                    .into_iter()
+                    .map(|call| ToolCall {
+                        // Ollama no manda un id de llamada: se genera uno para
+                        // aparear el resultado.
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: call.function.name,
+                        arguments: call.function.arguments,
+                    })
+                    .collect(),
+            ))
+        }
+    }
 }
 
 impl ModelBackend for OllamaBackend {
@@ -181,6 +290,73 @@ impl ModelBackend for OllamaBackend {
     ) -> BoxFuture<'a, Result<String, BackendError>> {
         Box::pin(self.send_chat(messages, true))
     }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn active_supports_tools(&self) -> BoxFuture<'_, Result<bool, BackendError>> {
+        Box::pin(self.model_supports_tools())
+    }
+
+    fn chat_tools<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        tools: &'a [ToolDef],
+    ) -> BoxFuture<'a, Result<ModelTurn, BackendError>> {
+        Box::pin(self.send_chat_tools(messages, tools, false))
+    }
+
+    fn chat_tools_local_only<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        tools: &'a [ToolDef],
+    ) -> BoxFuture<'a, Result<ModelTurn, BackendError>> {
+        Box::pin(self.send_chat_tools(messages, tools, true))
+    }
+}
+
+/// El pedido a `/api/chat` con herramientas. Los mensajes van como JSON (llevan
+/// el rol `tool` y las `tool_calls` del asistente, que [`Message`] no tiene).
+#[derive(Serialize)]
+struct ToolsChatRequest<'a> {
+    model: &'a str,
+    messages: Vec<serde_json::Value>,
+    stream: bool,
+    tools: Vec<serde_json::Value>,
+}
+
+/// Un mensaje del hilo en el formato de Ollama.
+fn ollama_message(message: &ChatMessage) -> serde_json::Value {
+    use serde_json::json;
+    match message {
+        ChatMessage::System(content) => json!({"role": "system", "content": content}),
+        ChatMessage::User(content) => json!({"role": "user", "content": content}),
+        ChatMessage::Assistant { text, calls } if calls.is_empty() => {
+            json!({"role": "assistant", "content": text})
+        }
+        ChatMessage::Assistant { text, calls } => json!({
+            "role": "assistant",
+            "content": text,
+            "tool_calls": calls
+                .iter()
+                .map(|call| json!({"function": {"name": call.name, "arguments": call.arguments}}))
+                .collect::<Vec<_>>(),
+        }),
+        ChatMessage::Tool { content, .. } => json!({"role": "tool", "content": content}),
+    }
+}
+
+/// Una herramienta en el formato de Ollama (`type: function`).
+fn tool_spec(tool: &ToolDef) -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+        },
+    })
 }
 
 // ── Lo que va y viene ─────────────────────────────────────────────────────────
@@ -192,6 +368,31 @@ struct ChatRequest<'a> {
     stream: bool,
 }
 
+/// El pedido a `/api/show`: sólo el nombre del modelo.
+#[derive(Serialize)]
+struct ShowRequest<'a> {
+    model: &'a str,
+}
+
+/// La respuesta de `/api/show`. `capabilities` lista lo que el modelo sabe
+/// hacer (`"completion"`, `"tools"`, …); falta en versiones viejas de Ollama.
+#[derive(Debug, Deserialize)]
+pub struct ShowResponse {
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+/// Si `/api/show` dice que el modelo tiene la capacidad `tools`.
+pub fn parse_capabilities(body: &[u8]) -> Result<bool, BackendError> {
+    serde_json::from_slice::<ShowResponse>(body)
+        .map(|show| {
+            show.capabilities
+                .iter()
+                .any(|capability| capability == "tools")
+        })
+        .map_err(|_| BackendError::Failed("detalle del modelo ilegible".into()))
+}
+
 /// La respuesta de `/api/chat`. `remote_host` (con `omitempty`) dice si la
 /// respondió un modelo que corre en otro host.
 #[derive(Debug, Deserialize)]
@@ -201,10 +402,28 @@ pub struct ChatResponse {
     pub remote_host: String,
 }
 
-/// El mensaje de la respuesta de `/api/chat`: sólo el texto.
+/// El mensaje de la respuesta de `/api/chat`: el texto y, si el modelo las pidió,
+/// las llamadas a herramientas.
 #[derive(Debug, Deserialize)]
 pub struct ChatResponseMessage {
     pub content: String,
+    #[serde(default)]
+    pub tool_calls: Vec<OllamaToolCall>,
+}
+
+/// Una llamada a herramienta de la respuesta de Ollama. No trae id: lo genera
+/// [`OllamaBackend::send_chat_tools`].
+#[derive(Debug, Deserialize)]
+pub struct OllamaToolCall {
+    pub function: OllamaToolFunction,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OllamaToolFunction {
+    pub name: String,
+    /// Ollama manda los argumentos como objeto JSON, no como texto.
+    #[serde(default)]
+    pub arguments: serde_json::Value,
 }
 
 /// La respuesta de `/api/tags`: una fila por modelo instalado.
@@ -973,3 +1192,7 @@ mod tests {
         assert_eq!(chats(&server), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "ollama_tools_tests.rs"]
+mod tools_tests;

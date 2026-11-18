@@ -26,16 +26,18 @@ use zbus::names::BusName;
 use zbus::{interface, Connection};
 
 use vasak_assistant_protocol::{
-    Capability, Error, Memory as MemoryRecord, MemoryStatus, Message, Role, ServiceStatus, DOMAINS,
-    DOMAIN_MEMORY, DOMAIN_REMOTE_BACKENDS,
+    Capability, ChatReply, Error, Memory as MemoryRecord, MemoryStatus, Message, Role,
+    ServiceStatus, DOMAINS, DOMAIN_MAIL, DOMAIN_MEMORY, DOMAIN_REMOTE_BACKENDS,
+    MAX_TOOL_ITERATIONS,
 };
 
-use crate::backend::{BackendError, BoxFuture, ModelBackend};
+use crate::backend::{BackendError, BoxFuture, ChatMessage, ModelBackend, ModelTurn};
 use crate::config::{is_local, normalize_url};
 use crate::conversations::Conversations;
 use crate::keyring::{ApiKey, SecretSource};
 use crate::logging::Call;
 use crate::memory::Memory;
+use crate::skills::{MailChat, SkillCtx, ToolOutcome};
 
 pub struct AssistantService {
     pub backend: Arc<dyn ModelBackend>,
@@ -48,6 +50,9 @@ pub struct AssistantService {
     pub memory: Arc<Memory>,
     /// De dónde sale la etiqueta de seguridad de quien llama.
     pub labels: Arc<dyn CallerLabels>,
+    /// Las habilidades (correo, por ahora), el permiso que las gatea y las
+    /// acciones pendientes de confirmación. Por omisión, sin habilidades.
+    pub mail: Arc<MailChat>,
 }
 
 /// La etiqueta de seguridad de quien llama. Un rasgo para que las pruebas
@@ -135,7 +140,8 @@ impl AssistantService {
         #[zbus(connection)] connection: &Connection,
     ) -> Vec<Capability> {
         let call = Call::new("Capabilities", &header);
-        let memory = if self.confined(connection, &header).await {
+        let confined = self.confined(connection, &header).await;
+        let memory = if confined {
             MemoryStatus {
                 enabled: false,
                 available: false,
@@ -145,7 +151,16 @@ impl AssistantService {
         } else {
             self.memory_status_now().await
         };
-        let all = capabilities(self.remote_allowed, &memory);
+        let mut all = capabilities(self.remote_allowed, &memory);
+        // El correo se decide de verdad (habilidad, almacén, modelo con tools);
+        // la función pura lo deja no disponible por omisión.
+        let mail = self.mail_capability(confined).await;
+        if let Some(slot) = all
+            .iter_mut()
+            .find(|capability| capability.domain == DOMAIN_MAIL)
+        {
+            *slot = mail;
+        }
         call.done();
         all
     }
@@ -219,6 +234,57 @@ impl AssistantService {
                 .await
         }
         .await;
+        call.finish(result)
+    }
+
+    /// Manda un mensaje y devuelve la respuesta, que puede proponer una acción.
+    /// Un llamador confinado chatea sin habilidades: su respuesta nunca trae
+    /// acciones pendientes.
+    async fn chat_turn(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        conversation_id: &str,
+        content: &str,
+    ) -> Result<ChatReply, Error> {
+        let call = Call::new("ChatTurn", &header).conversation(conversation_id);
+        let result = async {
+            let owner = owner(&header)?;
+            let use_skills = !self.confined(connection, &header).await;
+            if !use_skills {
+                tracing::info!(
+                    method = "ChatTurn",
+                    sender = owner,
+                    conversation = %crate::logging::short_id(conversation_id),
+                    "llamador confinado: el turno va sin habilidades"
+                );
+            }
+            self.chat_turn_with(owner, conversation_id, content, use_skills)
+                .await
+        }
+        .await;
+        call.finish(result)
+    }
+
+    /// Confirma una acción pendiente de quien llama y la ejecuta.
+    async fn confirm_action(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        action_id: &str,
+    ) -> Result<String, Error> {
+        let call = Call::new("ConfirmAction", &header);
+        let result = async { self.confirm_pending(owner(&header)?, action_id).await }.await;
+        call.finish(result)
+    }
+
+    /// Descarta una acción pendiente de quien llama sin ejecutarla.
+    async fn cancel_action(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        action_id: &str,
+    ) -> Result<(), Error> {
+        let call = Call::new("CancelAction", &header);
+        let result = async { self.cancel_pending(owner(&header)?, action_id) }.await;
         call.finish(result)
     }
 
@@ -594,6 +660,246 @@ impl AssistantService {
         Ok(reply)
     }
 
+    /// Un turno que puede usar las habilidades. Sin herramientas disponibles
+    /// —confinado, ninguna habilidad, el modelo no las admite, o el modelo es
+    /// remoto y el correo no se comparte— chatea en texto, sin acciones.
+    ///
+    /// **La memoria no se toca en este turno**: ni notas ni aprendizaje. Los
+    /// datos de la persona que trae una herramienta (correo) no se persisten, y
+    /// los mensajes de herramienta no entran al historial visible ni a la
+    /// extracción de la memoria (viven sólo en el hilo local de este turno).
+    pub async fn chat_turn_with(
+        &self,
+        owner: &str,
+        conversation_id: &str,
+        content: &str,
+        use_skills: bool,
+    ) -> Result<ChatReply, Error> {
+        let context = self
+            .conversations
+            .lock()
+            .begin_turn(owner, conversation_id, content)?;
+        let mut turn = Turn {
+            conversations: &self.conversations,
+            id: conversation_id,
+            content,
+            reply: None,
+        };
+
+        // El soporte de herramientas del modelo **efectivo** (no sólo del
+        // backend): un modelo local sin capacidad `tools` chatea en texto plano.
+        let supports_tools = use_skills
+            && !self.mail.skills.is_empty()
+            && self.backend.active_supports_tools().await.unwrap_or(false);
+        // La puerta del correo, decisión propia aparte de la memoria.
+        let tools_enabled = supports_tools && self.mail_allowed_for_model().await;
+
+        if !tools_enabled {
+            let reply = self.backend.chat(&context).await.map_err(to_dbus)?;
+            turn.reply = Some(reply.clone());
+            return Ok(ChatReply {
+                text: reply,
+                pending: Vec::new(),
+            });
+        }
+
+        let tools = self.mail.skills.tools();
+        let mut messages = to_chat_messages(&context);
+        // La misma puerta que la memoria, con la decisión propia del correo: con
+        // un modelo remoto no compartido, lo que vuelve de una herramienta no
+        // sale de la máquina.
+        let local_only = !self.mail.share_with_remote;
+        let ctx = SkillCtx {
+            conversation_id: conversation_id.to_owned(),
+        };
+
+        // Presupuesto del turno: cuántas llamadas en total y cuántos bytes de
+        // resultado se retienen para el próximo pedido. `MAX_TOOL_ITERATIONS`
+        // sólo acota cuántas veces responde el modelo; una sola respuesta puede
+        // traer decenas de llamadas.
+        let mut calls_used = 0usize;
+        let mut result_bytes = 0usize;
+        // Si el turno trajo datos del correo: su texto final no entra al
+        // historial reutilizable (no se persiste ni se reenvía en un chat
+        // posterior). Un turno sin datos de correo conserva su historial normal.
+        let mut mail_data = false;
+
+        for _ in 0..MAX_TOOL_ITERATIONS {
+            let turn_result = if local_only {
+                self.backend.chat_tools_local_only(&messages, &tools).await
+            } else {
+                self.backend.chat_tools(&messages, &tools).await
+            };
+            let model_turn = match turn_result {
+                Ok(model_turn) => model_turn,
+                // No salió nada: el modelo que respondería no es local.
+                Err(BackendError::NotLocal) => {
+                    return Ok(safe_reply(&mut turn, UNSAFE_REMOTE));
+                }
+                // Ya salió: el pedido —que en un paso encadenado podía llevar
+                // contenido del correo— se mandó y la respuesta se descartó. El
+                // mensaje no afirma que nada salió de la máquina.
+                Err(BackendError::RemoteAfterSend) => {
+                    return Ok(safe_reply(&mut turn, UNSAFE_REMOTE_AFTER_SEND));
+                }
+                Err(error) => return Err(to_dbus(error)),
+            };
+            let calls = match model_turn {
+                ModelTurn::Text(text) => {
+                    // El texto que puede citar correo se devuelve a quien llama
+                    // pero no se guarda en el historial reutilizable.
+                    if !mail_data {
+                        turn.reply = Some(text.clone());
+                    }
+                    return Ok(ChatReply {
+                        text,
+                        pending: Vec::new(),
+                    });
+                }
+                ModelTurn::Calls(calls) => calls,
+            };
+            // El presupuesto total de llamadas se chequea antes de ejecutar la
+            // tanda: una respuesta con demasiadas corta con una respuesta segura.
+            if calls_used + calls.len() > MAX_TOOL_CALLS_PER_TURN {
+                return Ok(safe_reply(&mut turn, TOO_MANY_STEPS));
+            }
+            calls_used += calls.len();
+            // El turno del asistente con las llamadas que pidió, para el próximo paso.
+            messages.push(ChatMessage::Assistant {
+                text: String::new(),
+                calls: calls.clone(),
+            });
+            for call in calls {
+                let id = call.id.clone();
+                match self.run_tool(&call, &ctx, owner, conversation_id).await? {
+                    // Una acción pendiente corta el bucle: ahora decide la persona.
+                    ToolStep::Pending(reply) => {
+                        turn.reply = Some(reply.text.clone());
+                        return Ok(reply);
+                    }
+                    ToolStep::Result { content, data } => {
+                        mail_data |= data;
+                        // Tope de bytes retenidos para el próximo pedido al modelo.
+                        result_bytes += content.len();
+                        if result_bytes > MAX_TOOL_RESULT_BYTES {
+                            return Ok(safe_reply(&mut turn, TOO_MANY_STEPS));
+                        }
+                        messages.push(ChatMessage::Tool { id, content });
+                    }
+                }
+            }
+        }
+
+        // Se agotaron los pasos: respuesta segura, sin acción.
+        Ok(safe_reply(&mut turn, TOO_MANY_STEPS))
+    }
+
+    /// Si el correo puede ir al modelo que va a responder: compartido con el
+    /// remoto (`share_mail_with_remote`), o el modelo efectivo es local. Con el
+    /// backend sin respuesta, no (falla cerrado). Es la puerta propia del
+    /// correo, aparte de la de la memoria.
+    async fn mail_allowed_for_model(&self) -> bool {
+        self.mail.share_with_remote
+            || self
+                .backend
+                .active_model()
+                .await
+                .is_ok_and(|model| model.local)
+    }
+
+    /// Ejecuta una llamada a herramienta: busca la habilidad, comprueba el
+    /// permiso y la corre. Un fallo de la herramienta vuelve como resultado para
+    /// el modelo, no rompe el turno.
+    async fn run_tool(
+        &self,
+        call: &crate::backend::ToolCall,
+        ctx: &SkillCtx,
+        owner: &str,
+        conversation_id: &str,
+    ) -> Result<ToolStep, Error> {
+        let Some(skill) = self.mail.skills.find(&call.name) else {
+            return Ok(ToolStep::result(format!(
+                "no existe una herramienta «{}»",
+                call.name
+            )));
+        };
+        // El detalle para el diálogo del permiso: la cuenta, si viene en los
+        // argumentos. No cambia la decisión guardada.
+        let detail = call
+            .arguments
+            .get("account_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !self
+            .mail
+            .permission
+            .check(skill.permission(), detail)
+            .await?
+        {
+            return Ok(ToolStep::result(format!(
+                "la persona no concedió el permiso «{}»",
+                skill.permission()
+            )));
+        }
+        match skill.call(&call.name, &call.arguments, ctx).await {
+            // Un resultado con datos del usuario: lo marca para que el texto
+            // final del turno no entre al historial reutilizable.
+            Ok(ToolOutcome::Result(content)) => Ok(ToolStep::Result {
+                content,
+                data: true,
+            }),
+            Ok(ToolOutcome::Pending { action, execute }) => {
+                let text = action.summary.clone();
+                // Bajo el candado de las conversaciones (el mismo orden que el
+                // borrado): si la conversación se cerró durante el turno, no se
+                // registra el draft, y confirmarlo dará `NotFound`. Cierra la
+                // carrera entre insertar un draft y borrar la conversación.
+                let conversations = self.conversations.lock();
+                if !conversations.contains(owner, conversation_id) {
+                    drop(conversations);
+                    return Ok(ToolStep::Pending(ChatReply {
+                        text,
+                        pending: Vec::new(),
+                    }));
+                }
+                let pending = vec![action.clone()];
+                self.mail
+                    .pending
+                    .lock()
+                    .insert(owner, conversation_id, action, execute);
+                drop(conversations);
+                Ok(ToolStep::Pending(ChatReply { text, pending }))
+            }
+            Err(error) => Ok(ToolStep::result(format!(
+                "la herramienta no se pudo ejecutar: {error}"
+            ))),
+        }
+    }
+
+    /// Confirma una acción pendiente y la ejecuta. La saca del registro **antes**
+    /// de ejecutarla: si el envío falla, no se reintenta por la misma acción —el
+    /// correo pudo haber salido—.
+    pub async fn confirm_pending(&self, owner: &str, action_id: &str) -> Result<String, Error> {
+        let entry = self.mail.pending.lock().take(action_id, owner)?;
+        (entry.execute)().await?;
+        // `AccountsSync.SendMessage` vuelve al aceptar el draft en la cola, no
+        // al entregarlo: se informa eso, no «Enviado».
+        Ok(QUEUED_FOR_SEND.to_owned())
+    }
+
+    /// Descarta una acción pendiente sin ejecutarla.
+    pub fn cancel_pending(&self, owner: &str, action_id: &str) -> Result<(), Error> {
+        self.mail
+            .pending
+            .lock()
+            .take(action_id, owner)
+            .map(|_entry| ())
+    }
+
+    /// Cierra una conversación sin tocar la memoria ni los drafts. El camino
+    /// del bus pasa por [`Self::delete_conversation_as`]; esto queda para las
+    /// pruebas.
+    #[cfg(test)]
     pub fn delete_as(&self, owner: &str, conversation_id: &str) -> Result<(), Error> {
         self.conversations.lock().delete(owner, conversation_id)
     }
@@ -606,7 +912,18 @@ impl AssistantService {
         owner: &str,
         conversation_id: &str,
     ) -> Result<(), Error> {
-        self.delete_as(owner, conversation_id)?;
+        {
+            // Bajo el candado de las conversaciones (el mismo orden que la
+            // inserción de un draft): se cierra la conversación y se sacan sus
+            // drafts, para que una confirmación tardía no mande un correo de una
+            // conversación ya cerrada.
+            let mut conversations = self.conversations.lock();
+            conversations.delete(owner, conversation_id)?;
+            self.mail
+                .pending
+                .lock()
+                .remove_conversation(owner, conversation_id);
+        }
         self.memory.forget_conversation(conversation_id).await;
         Ok(())
     }
@@ -711,6 +1028,141 @@ impl Drop for Turn<'_> {
     }
 }
 
+/// El sistema que abre un turno con herramientas: le dice al modelo qué puede
+/// hacer y que nunca manda un correo sin que la persona lo confirme.
+const SYSTEM_PROMPT: &str = "Sos el asistente de VasakOS. Podés usar las herramientas de \
+    correo para buscar y leer mensajes, y para preparar envíos. «send_mail» sólo prepara \
+    el correo: nunca se manda sin que la persona lo confirme. Usá las herramientas sólo \
+    cuando hagan falta para responder.";
+
+/// La respuesta segura cuando el modelo que respondería resultó no ser local
+/// **antes** de mandar nada: el correo no salió de la máquina.
+const UNSAFE_REMOTE: &str =
+    "No pude usar el correo: el modelo que respondería no es local y tus datos no se \
+     comparten con un proveedor remoto.";
+
+/// La respuesta cuando el modelo resultó no ser local **después** de mandar el
+/// pedido (Ollama reapuntó el nombre en el medio): el contenido —que en un paso
+/// encadenado podía incluir correo— ya pudo haber salido. No afirma que nada
+/// salió de la máquina.
+const UNSAFE_REMOTE_AFTER_SEND: &str =
+    "No pude usar el correo: el modelo resultó no ser local durante el pedido. Si ya había \
+     contenido de tu correo en la consulta, pudo haber salido hacia ese proveedor; no lo reintento.";
+
+/// La respuesta segura cuando se agotaron los pasos de herramienta, el
+/// presupuesto de llamadas o el tope de bytes retenidos.
+const TOO_MANY_STEPS: &str = "No pude completar la tarea en los pasos disponibles. \
+    Probá de nuevo siendo más específico.";
+
+/// Lo que informa una confirmación: `AccountsSync` acepta el draft en la cola,
+/// no confirma la entrega real.
+const QUEUED_FOR_SEND: &str = "Puesto en cola para enviar";
+
+/// Cuántas llamadas a herramienta puede ejecutar un turno en total, sumadas
+/// sobre todas las respuestas del modelo. [`MAX_TOOL_ITERATIONS`] sólo acota
+/// cuántas veces responde el modelo; una respuesta puede traer muchas llamadas.
+const MAX_TOOL_CALLS_PER_TURN: usize = 12;
+
+/// Cuántos bytes de resultados de herramienta se retienen para el próximo
+/// pedido al modelo. El almacén ya acota cada respuesta; esto acota el total.
+const MAX_TOOL_RESULT_BYTES: usize = 128 * 1024;
+
+/// Guarda el texto seguro en el turno y arma la respuesta sin acción.
+fn safe_reply(turn: &mut Turn, text: &str) -> ChatReply {
+    turn.reply = Some(text.to_owned());
+    ChatReply {
+        text: text.to_owned(),
+        pending: Vec::new(),
+    }
+}
+
+/// Qué hacer con el resultado de una herramienta dentro del bucle.
+enum ToolStep {
+    /// Un texto para devolverle al modelo como resultado. `data` es `true` si
+    /// trae datos del usuario (correo): el texto final del turno no entra
+    /// entonces al historial reutilizable.
+    Result { content: String, data: bool },
+    /// Una acción pendiente: corta el bucle y vuelve a la persona.
+    Pending(ChatReply),
+}
+
+impl ToolStep {
+    /// Un resultado sintético (error, permiso negado): no son datos del usuario.
+    fn result(content: String) -> Self {
+        ToolStep::Result {
+            content,
+            data: false,
+        }
+    }
+}
+
+/// El hilo que ve el modelo al abrir un turno con herramientas: el sistema más
+/// el historial de la conversación.
+fn to_chat_messages(context: &[Message]) -> Vec<ChatMessage> {
+    let mut messages = Vec::with_capacity(context.len() + 1);
+    messages.push(ChatMessage::System(SYSTEM_PROMPT.to_owned()));
+    for message in context {
+        messages.push(match message.role {
+            Role::System => ChatMessage::System(message.content.clone()),
+            Role::User => ChatMessage::User(message.content.clone()),
+            Role::Assistant => ChatMessage::Assistant {
+                text: message.content.clone(),
+                calls: Vec::new(),
+            },
+        });
+    }
+    messages
+}
+
+impl AssistantService {
+    /// La capacidad del correo: disponible sólo si hay habilidad registrada, el
+    /// almacén responde, el modelo admite herramientas y puede verlas (local o
+    /// compartido). Si no, no disponible con el motivo —nunca un error—.
+    pub async fn mail_capability(&self, confined: bool) -> Capability {
+        let unavailable = |reason: &str| Capability {
+            domain: DOMAIN_MAIL.to_owned(),
+            available: false,
+            reason: reason.to_owned(),
+        };
+        if confined {
+            return unavailable("No disponible para aplicaciones confinadas.");
+        }
+        let Some(skill) = self.mail.skills.for_domain(DOMAIN_MAIL) else {
+            return unavailable("Todavía no está disponible en esta versión del asistente.");
+        };
+        // El modelo efectivo decide, aparte del permiso de compartir: un modelo
+        // inalcanzable hace el correo no disponible bajo cualquier ajuste, y no
+        // se confunde con uno «remoto».
+        match self.backend.active_model().await {
+            Ok(model) if model.local || self.mail.share_with_remote => {}
+            Ok(_) => {
+                return unavailable(
+                    "El modelo es remoto y tu correo no se comparte con un proveedor remoto.",
+                )
+            }
+            Err(BackendError::NotAllowed(_)) => {
+                return unavailable(
+                    "El modelo no está permitido: corre en la nube y falta «allow_remote».",
+                )
+            }
+            Err(_) => return unavailable("El modelo no responde."),
+        }
+        if !self.backend.active_supports_tools().await.unwrap_or(false) {
+            return unavailable(
+                "El modelo actual no admite herramientas: no puede leer el correo ni redactar envíos.",
+            );
+        }
+        if !skill.probe().await {
+            return unavailable("El servicio de cuentas no responde.");
+        }
+        Capability {
+            domain: DOMAIN_MAIL.to_owned(),
+            available: true,
+            reason: String::new(),
+        }
+    }
+}
+
 /// Las capacidades de [`DOMAINS`]. `remote_backends` está si la configuración
 /// permite un proveedor remoto; `memory`, si la memoria está encendida y
 /// abierta, con el motivo de `memory` si no; las demás, todavía no.
@@ -769,6 +1221,7 @@ mod tests {
 
     fn service(backend: impl ModelBackend + 'static, remote_allowed: bool) -> AssistantService {
         AssistantService {
+            mail: Default::default(),
             backend: Arc::new(backend),
             conversations: Arc::new(Mutex::new(Conversations::default())),
             remote_allowed,
@@ -905,6 +1358,7 @@ mod tests {
     async fn el_chat_guarda_el_intercambio_y_el_modelo_ve_el_historial_completo() {
         let backend = Arc::new(FakeBackend::replying("respuesta"));
         let service = AssistantService {
+            mail: Default::default(),
             backend: backend.clone(),
             conversations: Arc::default(),
             remote_allowed: false,
@@ -947,6 +1401,7 @@ mod tests {
     async fn un_chat_fallido_deja_la_conversacion_como_estaba_y_libre() {
         let backend = Arc::new(FakeBackend::failing(BackendError::Failed("se cayó".into())));
         let service = AssistantService {
+            mail: Default::default(),
             backend: backend.clone(),
             conversations: Arc::default(),
             remote_allowed: false,
@@ -1017,6 +1472,7 @@ mod tests {
     async fn un_chat_con_mensaje_invalido_no_llega_al_modelo() {
         let backend = Arc::new(FakeBackend::replying("x"));
         let service = AssistantService {
+            mail: Default::default(),
             backend: backend.clone(),
             conversations: Arc::default(),
             remote_allowed: false,
@@ -1191,6 +1647,7 @@ mod tests {
     async fn otro_dueno_no_ve_lee_escribe_ni_borra_lo_ajeno() {
         let backend = Arc::new(FakeBackend::replying("respuesta"));
         let service = AssistantService {
+            mail: Default::default(),
             backend: backend.clone(),
             conversations: Arc::default(),
             remote_allowed: false,
@@ -1373,6 +1830,7 @@ mod tests {
     fn service_with_keys() -> (AssistantService, Arc<FixedKey>) {
         let keys = FixedKey::new(None);
         let service = AssistantService {
+            mail: Default::default(),
             secrets: keys.clone(),
             labels: crate::test_support::FixedLabel::none(),
             ..service(FakeBackend::replying(""), false)
@@ -1609,6 +2067,7 @@ mod memory_tests {
                     .with_remote_blocked(remote_blocked),
             );
             let service = AssistantService {
+                mail: Default::default(),
                 backend: backend.clone(),
                 conversations: Arc::default(),
                 remote_allowed: false,
@@ -1757,6 +2216,7 @@ mod memory_tests {
         let remote =
             Memory::new(Some(world.tmp.memory_dir()), world.keys.clone()).with_remote_blocked(true);
         let service = AssistantService {
+            mail: Default::default(),
             backend: backend.clone(),
             conversations: Arc::default(),
             remote_allowed: true,
@@ -1994,6 +2454,7 @@ mod gate_tests {
         let backend = ScriptedBackend::new(replies);
         let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
         let service = AssistantService {
+            mail: Default::default(),
             backend: backend.clone(),
             conversations: Arc::default(),
             remote_allowed: false,
@@ -2268,6 +2729,7 @@ mod gate_tests {
         );
         memory.set_enabled(true).await.unwrap();
         let service = AssistantService {
+            mail: Default::default(),
             backend: Arc::new(crate::backend::Limited::new(Arc::new(ollama))),
             conversations: Arc::default(),
             remote_allowed: false,
@@ -2443,6 +2905,7 @@ mod effective_model_tests {
             .await
             .unwrap();
         let service = AssistantService {
+            mail: Default::default(),
             backend,
             conversations: Arc::default(),
             remote_allowed: true,
@@ -3066,6 +3529,7 @@ mod no_sender_tests {
         let keys = FixedKey::new(None);
         let conversations = Arc::new(parking_lot::Mutex::new(Conversations::default()));
         let service = AssistantService {
+            mail: Default::default(),
             backend: backend.clone(),
             conversations: conversations.clone(),
             remote_allowed: false,
@@ -3243,6 +3707,7 @@ mod no_sender_tests {
     async fn con_remitente_new_conversation_por_punto_a_punto_contesta_rapido_y_no_se_cuelga() {
         let keys = FixedKey::new(None);
         let service = AssistantService {
+            mail: Default::default(),
             backend: Arc::new(FakeBackend::replying("hola")),
             conversations: Arc::default(),
             remote_allowed: false,
@@ -3289,6 +3754,7 @@ mod delete_conversation_tests {
         let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
         memory.set_enabled(true).await.unwrap();
         let service = AssistantService {
+            mail: Default::default(),
             backend: Arc::new(FakeBackend::replying("hola")),
             conversations: Arc::default(),
             remote_allowed: false,
@@ -3622,6 +4088,7 @@ mod log_tests {
         let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
         let backend = Arc::new(backend);
         let service = AssistantService {
+            mail: Default::default(),
             backend: backend.clone(),
             conversations: Arc::default(),
             remote_allowed: false,
@@ -4050,6 +4517,7 @@ mod privacy_tests {
         let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
         seeded(&memory).await;
         let service = AssistantService {
+            mail: Default::default(),
             backend: Arc::new(Limited::new(Arc::new(OllamaBackend::new(
                 client(),
                 local_selection("ollama", &server.url(""), None),
@@ -4116,6 +4584,7 @@ mod privacy_tests {
         let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
         seeded(&memory).await;
         let service = AssistantService {
+            mail: Default::default(),
             backend: Arc::new(Limited::new(Arc::new(OpenAiBackend::new(
                 client(),
                 local_selection("openai", &server.url("/v1"), Some("modelo-a")),
@@ -4148,6 +4617,7 @@ mod privacy_tests {
         let keys = FixedKey::new(None);
         let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
         let service = AssistantService {
+            mail: Default::default(),
             backend: Arc::new(crate::test_support::FakeBackend::replying(
                 "respuestacanariaqzx",
             )),
@@ -4195,6 +4665,7 @@ mod owner_chat_limit_tests {
 
     fn service(backend: Arc<dyn ModelBackend>) -> Arc<AssistantService> {
         Arc::new(AssistantService {
+            mail: Default::default(),
             backend,
             conversations: Arc::default(),
             remote_allowed: false,
@@ -4373,6 +4844,7 @@ mod owner_chat_limit_tests {
         let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
         memory.set_enabled(true).await.unwrap();
         let service = Arc::new(AssistantService {
+            mail: Default::default(),
             backend: Arc::new(Limited::new(backend.clone())),
             conversations: Arc::default(),
             remote_allowed: false,
@@ -4412,6 +4884,7 @@ mod owner_chat_limit_tests {
         let (fake, gate) = FakeBackend::gated("hola");
         let backend = Arc::new(fake);
         let service = AssistantService {
+            mail: Default::default(),
             backend: Arc::new(Limited::new(backend.clone())),
             conversations: Arc::default(),
             remote_allowed: false,
@@ -4597,6 +5070,7 @@ mod turn_epoch_tests {
         let memory = Arc::new(Memory::new(Some(tmp.memory_dir()), keys.clone()));
         memory.set_enabled(true).await.unwrap();
         let service = Arc::new(AssistantService {
+            mail: Default::default(),
             backend,
             conversations: Arc::default(),
             remote_allowed: false,

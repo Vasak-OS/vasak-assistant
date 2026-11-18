@@ -1281,6 +1281,7 @@ mod tests {
         ] {
             let setup = secret_service(item, b"x").await;
             let service = crate::service::AssistantService {
+                mail: Default::default(),
                 backend: Arc::new(FakeBackend::replying("")),
                 conversations: Arc::default(),
                 remote_allowed: false,
