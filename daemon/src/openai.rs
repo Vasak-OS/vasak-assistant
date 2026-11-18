@@ -128,6 +128,12 @@ impl OpenAiBackend {
     }
 }
 
+// PR1: el camino de herramientas es Ollama. Este backend **no** sobrescribe
+// `supports_tools`/`chat_tools`, así que usa el `default` del rasgo, que ignora
+// las herramientas y recae en `chat`: con un proveedor remoto se chatea en
+// texto, sin acciones (no disponible, nunca roto —decisión 2—). El tool-calling
+// de OpenAI (`tools`/`tool_calls` en `/chat/completions`) queda para un
+// follow-up.
 impl ModelBackend for OpenAiBackend {
     fn info(&self) -> ModelInfo {
         self.selection.info()

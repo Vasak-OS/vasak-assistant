@@ -57,6 +57,80 @@ impl BackendError {
     }
 }
 
+// ── Las herramientas (tool calling) ─────────────────────────────────────────────
+//
+// El modelo puede pedir que se ejecute una herramienta (leer el correo,
+// redactar un envío) en vez de contestar con texto. Estos tipos son el contrato
+// entre el motor de conversación y los backends que lo admiten (Ollama). Un
+// backend que no lo admite recae en [`ModelBackend::chat`] por el método con
+// `default` más abajo.
+
+/// La definición de una herramienta que se le ofrece al modelo: su nombre, para
+/// qué sirve y el esquema JSON de sus argumentos.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+/// Una llamada a una herramienta que pidió el modelo.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCall {
+    /// El identificador de la llamada, para aparear el resultado. Si el backend
+    /// no lo da (Ollama no lo manda), el backend genera uno.
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+/// Lo que devuelve un turno del modelo: o texto, o un pedido de ejecutar
+/// herramientas.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModelTurn {
+    Text(String),
+    Calls(Vec<ToolCall>),
+}
+
+/// Un mensaje del hilo que ve el modelo cuando hay herramientas. A diferencia de
+/// [`Message`] distingue el rol `tool` (el resultado de una herramienta) y deja
+/// que el mensaje del asistente lleve las llamadas que pidió.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChatMessage {
+    System(String),
+    User(String),
+    Assistant { text: String, calls: Vec<ToolCall> },
+    Tool { id: String, content: String },
+}
+
+/// Aplana el hilo con herramientas a [`Message`] para los backends que no las
+/// admiten: el resultado de una herramienta entra como un turno del usuario
+/// (no hay rol `tool` en [`Message`]).
+pub fn flatten_messages(messages: &[ChatMessage]) -> Vec<Message> {
+    use vasak_assistant_protocol::Role;
+    messages
+        .iter()
+        .map(|message| match message {
+            ChatMessage::System(content) => Message {
+                role: Role::System,
+                content: content.clone(),
+            },
+            ChatMessage::User(content) => Message {
+                role: Role::User,
+                content: content.clone(),
+            },
+            ChatMessage::Assistant { text, .. } => Message {
+                role: Role::Assistant,
+                content: text.clone(),
+            },
+            ChatMessage::Tool { content, .. } => Message {
+                role: Role::User,
+                content: content.clone(),
+            },
+        })
+        .collect()
+}
+
 pub trait ModelBackend: Send + Sync {
     /// Lo que se sabe sin preguntarle nada a nadie: proveedor, host, si es
     /// local, y el modelo configurado (vacío si se elige solo).
@@ -89,6 +163,43 @@ pub trait ModelBackend: Send + Sync {
                 return Err(BackendError::NotLocal);
             }
             self.chat(messages).await
+        })
+    }
+
+    /// Si el backend admite herramientas. Por omisión no: recae en
+    /// [`Self::chat`] e ignora las que se le ofrezcan.
+    fn supports_tools(&self) -> bool {
+        false
+    }
+
+    /// Un turno del modelo con herramientas disponibles. Por omisión **ignora**
+    /// las herramientas: aplana el hilo a [`Message`], llama a [`Self::chat`] y
+    /// devuelve texto. Así un backend sin soporte (y [`RejectedBackend`]) sigue
+    /// respondiendo, y el motor de conversación no las ofrece.
+    fn chat_tools<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        _tools: &'a [ToolDef],
+    ) -> BoxFuture<'a, Result<ModelTurn, BackendError>> {
+        Box::pin(async move {
+            let flat = flatten_messages(messages);
+            self.chat(&flat).await.map(ModelTurn::Text)
+        })
+    }
+
+    /// Como [`Self::chat_tools`], pero sólo si el modelo que responde es local:
+    /// lo que vuelve de una herramienta (correo, por ejemplo) no sale de la
+    /// máquina por un modelo remoto. Decide igual que [`Self::chat_local_only`].
+    fn chat_tools_local_only<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        tools: &'a [ToolDef],
+    ) -> BoxFuture<'a, Result<ModelTurn, BackendError>> {
+        Box::pin(async move {
+            if !self.info().local {
+                return Err(BackendError::NotLocal);
+            }
+            self.chat_tools(messages, tools).await
         })
     }
 }
@@ -258,6 +369,38 @@ impl ModelBackend for Limited {
             let started = Instant::now();
             let result = self.inner.chat_local_only(messages).await;
             log_request(&self.inner, "chat_local_only", started, &result);
+            result
+        })
+    }
+
+    fn supports_tools(&self) -> bool {
+        self.inner.supports_tools()
+    }
+
+    fn chat_tools<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        tools: &'a [ToolDef],
+    ) -> BoxFuture<'a, Result<ModelTurn, BackendError>> {
+        Box::pin(async move {
+            let _permit = self.permit().await?;
+            let started = Instant::now();
+            let result = self.inner.chat_tools(messages, tools).await;
+            log_request(&self.inner, "chat_tools", started, &result);
+            result
+        })
+    }
+
+    fn chat_tools_local_only<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        tools: &'a [ToolDef],
+    ) -> BoxFuture<'a, Result<ModelTurn, BackendError>> {
+        Box::pin(async move {
+            let _permit = self.permit().await?;
+            let started = Instant::now();
+            let result = self.inner.chat_tools_local_only(messages, tools).await;
+            log_request(&self.inner, "chat_tools_local_only", started, &result);
             result
         })
     }
