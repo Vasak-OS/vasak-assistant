@@ -305,6 +305,7 @@ fn mail_chat(skill: Option<Arc<FakeSkill>>, perm: Arc<FakePerm>, share: bool) ->
         share_mail_with_remote: share,
         share_calendar_with_remote: share,
         share_contacts_with_remote: share,
+        share_files_with_remote: false,
     })
 }
 
@@ -1586,6 +1587,7 @@ fn duo(
         share_mail_with_remote: share_mail,
         share_calendar_with_remote: share_calendar,
         share_contacts_with_remote: false,
+        share_files_with_remote: false,
     });
     let service = build(backend.clone(), chat, false);
     let conversation = service.conversations.lock().create(OWNER, false).unwrap();
@@ -1780,6 +1782,7 @@ async fn calendar_capability(
         share_mail_with_remote: share_mail,
         share_calendar_with_remote: share_calendar,
         share_contacts_with_remote: false,
+        share_files_with_remote: false,
     });
     build(backend, chat, false)
         .calendar_capability(confined)
@@ -1979,6 +1982,7 @@ fn pair(
         share_mail_with_remote: share_mail,
         share_calendar_with_remote: false,
         share_contacts_with_remote: share_contacts,
+        share_files_with_remote: false,
     });
     let service = build(backend.clone(), chat, false);
     let conversation = service.conversations.lock().create(OWNER, false).unwrap();
@@ -2010,6 +2014,7 @@ fn los_contactos_se_comparten_con_un_remoto_solo_si_se_consintio_ese_dominio() {
     let chat = |mail, contacts| MailChat {
         share_mail_with_remote: mail,
         share_contacts_with_remote: contacts,
+        share_files_with_remote: false,
         ..MailChat::default()
     };
     assert!(!MailChat::default().shares_with_remote(DOMAIN_CONTACTS));
@@ -2158,6 +2163,7 @@ async fn contacts_capability(
         share_mail_with_remote: share_mail,
         share_calendar_with_remote: false,
         share_contacts_with_remote: share_contacts,
+        share_files_with_remote: false,
     });
     build(backend, chat, false)
         .contacts_capability(confined)
@@ -2268,4 +2274,374 @@ async fn la_capacidad_de_contactos_se_decide_aparte_de_la_del_correo() {
     let contacts = d.service.contacts_capability(false).await;
     assert!(!contacts.available);
     assert!(contacts.reason.contains("contactos"), "{}", contacts.reason);
+}
+
+// ── 12. Archivos: puerta por dominio y capacidad ────────────────────────────────
+
+/// Una habilidad de archivos de mentira: anota lo que se ejecutó.
+struct FakeFiles {
+    calls: Mutex<Vec<String>>,
+    alive: bool,
+}
+
+impl FakeFiles {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            calls: Mutex::default(),
+            alive: true,
+        })
+    }
+}
+
+impl Skill for FakeFiles {
+    fn domain(&self) -> &'static str {
+        DOMAIN_FILES
+    }
+
+    fn permission(&self) -> &'static str {
+        PERMISSION_FILES
+    }
+
+    fn tools(&self) -> Vec<ToolDef> {
+        vec![tool("search_files"), tool("read_file")]
+    }
+
+    fn call<'a>(
+        &'a self,
+        name: &'a str,
+        _args: &'a Value,
+        _ctx: &'a SkillCtx,
+    ) -> BoxFuture<'a, Result<ToolOutcome, Error>> {
+        self.calls.lock().push(name.to_owned());
+        Box::pin(async { Ok(ToolOutcome::Result("{\"archivo\":1}".into())) })
+    }
+
+    fn probe(&self) -> BoxFuture<'_, bool> {
+        let alive = self.alive;
+        Box::pin(async move { alive })
+    }
+}
+
+/// Un servicio con correo y archivos, cada uno con su propio consentimiento.
+struct FilesPair {
+    service: AssistantService,
+    backend: Arc<ToolBackend>,
+    mail: Arc<FakeSkill>,
+    files: Arc<FakeFiles>,
+    perm: Arc<FakePerm>,
+    conversation: String,
+}
+
+fn files_pair(
+    backend: Arc<ToolBackend>,
+    grant: bool,
+    share_mail: bool,
+    share_files: bool,
+) -> FilesPair {
+    let mail = FakeSkill::new();
+    let files = FakeFiles::new();
+    let perm = FakePerm::new(grant);
+    let chat = Arc::new(MailChat {
+        skills: SkillRegistry::new(vec![mail.clone(), files.clone()]),
+        permission: perm.clone(),
+        pending: Mutex::new(PendingActions::default()),
+        share_mail_with_remote: share_mail,
+        share_files_with_remote: share_files,
+        ..MailChat::default()
+    });
+    let service = build(backend.clone(), chat, false);
+    let conversation = service.conversations.lock().create(OWNER, false).unwrap();
+    FilesPair {
+        service,
+        backend,
+        mail,
+        files,
+        perm,
+        conversation,
+    }
+}
+
+impl FilesPair {
+    async fn turn(&self) {
+        self.service
+            .chat_turn_with(OWNER, &self.conversation, "hola", true)
+            .await
+            .unwrap();
+    }
+
+    fn tool_results(&self) -> String {
+        format!("{:?}", self.backend.threads.lock())
+    }
+}
+
+#[test]
+fn los_archivos_se_comparten_con_un_remoto_solo_si_se_consintio_ese_dominio() {
+    let chat = |others: bool, files: bool| MailChat {
+        share_mail_with_remote: others,
+        share_calendar_with_remote: others,
+        share_contacts_with_remote: others,
+        share_files_with_remote: files,
+        ..MailChat::default()
+    };
+    assert!(!MailChat::default().shares_with_remote(DOMAIN_FILES));
+    assert!(!MailChat::default().share_files_with_remote);
+    // Compartir los demás dominios no comparte los archivos.
+    assert!(!chat(true, false).shares_with_remote(DOMAIN_FILES));
+    assert!(chat(false, true).shares_with_remote(DOMAIN_FILES));
+    assert!(!chat(false, true).shares_with_remote(DOMAIN_MAIL));
+}
+
+#[test]
+fn el_registro_ofrece_las_herramientas_de_archivos_solo_con_su_dominio() {
+    let registry = SkillRegistry::new(vec![FakeSkill::new(), FakeFiles::new()]);
+    let names: Vec<String> = registry
+        .tools_for(|d| d == DOMAIN_FILES)
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(names, ["search_files", "read_file"]);
+}
+
+#[tokio::test]
+async fn con_el_modelo_local_se_ejecutan_los_archivos_y_se_pide_el_permiso_files() {
+    let d = files_pair(
+        ToolBackend::new(vec![
+            call("search_files", json!({"query": "q"})),
+            text("listo"),
+        ]),
+        true,
+        false,
+        false,
+    );
+    d.turn().await;
+    assert_eq!(d.backend.offered_tools.lock()[0], 5);
+    assert_eq!(d.files.calls.lock().as_slice(), ["search_files"]);
+    assert!(d.tool_results().contains("archivo"));
+    let asked: Vec<_> = d.perm.asked.lock().iter().map(|(r, _)| r.clone()).collect();
+    assert_eq!(asked, [PERMISSION_FILES]);
+}
+
+#[tokio::test]
+async fn con_un_remoto_sin_compartir_nada_los_archivos_no_arrancan_un_turno_con_herramientas() {
+    let d = files_pair(
+        ToolBackend::remote(vec![call("search_files", json!({"query": "q"}))]),
+        true,
+        false,
+        false,
+    );
+    d.turn().await;
+    assert_eq!(d.backend.tools_chats.load(Ordering::SeqCst), 0);
+    assert!(d.files.calls.lock().is_empty());
+}
+
+#[tokio::test]
+async fn con_un_remoto_y_solo_el_correo_compartido_los_archivos_no_se_ofrecen_ni_se_ejecutan() {
+    let d = files_pair(
+        ToolBackend::remote(vec![
+            call("read_file", json!({"path": "/x"})),
+            call("search_mail", json!({"account_id": "a1"})),
+            text("listo"),
+        ]),
+        true,
+        true,
+        false,
+    );
+    d.turn().await;
+    // Primera capa: sólo se ofrecen las tres del correo.
+    assert_eq!(d.backend.offered_tools.lock()[0], 3);
+    // Segunda capa: aunque el modelo la pida, no se ejecuta.
+    assert!(d.files.calls.lock().is_empty());
+    let results = d.tool_results();
+    assert!(results.contains("no está disponible con un modelo remoto"));
+    assert!(!results.contains("archivo\\\":1"), "{results}");
+    assert!(d
+        .perm
+        .asked
+        .lock()
+        .iter()
+        .all(|(r, _)| r != PERMISSION_FILES));
+    assert_eq!(d.mail.calls_named("search_mail"), 1);
+}
+
+#[tokio::test]
+async fn con_un_remoto_y_solo_los_archivos_compartidos_el_correo_se_rechaza_y_los_archivos_corren()
+{
+    let d = files_pair(
+        ToolBackend::remote(vec![
+            call("search_mail", json!({"account_id": "a1"})),
+            call("search_files", json!({"query": "q"})),
+            text("listo"),
+        ]),
+        true,
+        false,
+        true,
+    );
+    d.turn().await;
+    assert_eq!(d.backend.offered_tools.lock()[0], 2);
+    assert_eq!(d.mail.calls_named("search_mail"), 0);
+    assert_eq!(d.files.calls.lock().as_slice(), ["search_files"]);
+}
+
+#[tokio::test]
+async fn con_files_negado_ninguna_herramienta_de_archivos_se_ejecuta() {
+    let d = files_pair(
+        ToolBackend::new(vec![
+            call("search_files", json!({"query": "q"})),
+            text("listo"),
+        ]),
+        false,
+        false,
+        false,
+    );
+    d.turn().await;
+    assert!(d.files.calls.lock().is_empty());
+    assert_eq!(
+        d.perm.asked.lock().as_slice(),
+        [(PERMISSION_FILES.to_owned(), String::new())]
+    );
+    assert!(d.tool_results().contains("no concedió el permiso «files»"));
+}
+
+async fn files_capability(
+    backend: Arc<ToolBackend>,
+    files: Option<Arc<dyn Skill>>,
+    share_files: bool,
+    confined: bool,
+) -> vasak_assistant_protocol::Capability {
+    let skills: Vec<Arc<dyn Skill>> = [Some(FakeSkill::new() as Arc<dyn Skill>), files]
+        .into_iter()
+        .flatten()
+        .collect();
+    let chat = Arc::new(MailChat {
+        skills: SkillRegistry::new(skills),
+        permission: FakePerm::new(true),
+        pending: Mutex::new(PendingActions::default()),
+        share_files_with_remote: share_files,
+        // Los demás dominios compartidos no habilitan los archivos.
+        share_mail_with_remote: true,
+        share_calendar_with_remote: true,
+        share_contacts_with_remote: true,
+    });
+    build(backend, chat, false).files_capability(confined).await
+}
+
+#[tokio::test]
+async fn la_capacidad_de_archivos_esta_disponible_en_el_caso_bueno() {
+    let local = files_capability(
+        ToolBackend::new(vec![]),
+        Some(FakeFiles::new()),
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(local.domain, DOMAIN_FILES);
+    assert!(
+        local.available && local.reason.is_empty(),
+        "{}",
+        local.reason
+    );
+    let remote = files_capability(
+        ToolBackend::remote(vec![]),
+        Some(FakeFiles::new()),
+        true,
+        false,
+    )
+    .await;
+    assert!(remote.available, "{}", remote.reason);
+}
+
+#[tokio::test]
+async fn la_capacidad_de_archivos_no_esta_disponible_con_motivo_en_cada_caso_que_falta() {
+    let mut dead = Arc::try_unwrap(FakeFiles::new()).ok().unwrap();
+    dead.alive = false;
+    let fake = || Some(FakeFiles::new() as Arc<dyn Skill>);
+    let cases = [
+        (
+            "confinado",
+            files_capability(ToolBackend::new(vec![]), fake(), false, true).await,
+        ),
+        (
+            "sin habilidad",
+            files_capability(ToolBackend::new(vec![]), None, false, false).await,
+        ),
+        (
+            "sin herramientas",
+            files_capability(ToolBackend::without_tools(), fake(), false, false).await,
+        ),
+        (
+            // Compartir el correo, el calendario y los contactos no comparte los archivos.
+            "remoto sin compartir",
+            files_capability(ToolBackend::remote(vec![]), fake(), false, false).await,
+        ),
+        (
+            "sin carpetas",
+            files_capability(ToolBackend::new(vec![]), Some(Arc::new(dead)), false, false).await,
+        ),
+        (
+            "la habilidad real sin raíces",
+            files_capability(
+                ToolBackend::new(vec![]),
+                Some(Arc::new(super::files::FilesSkill::new(vec![]))),
+                false,
+                false,
+            )
+            .await,
+        ),
+    ];
+    let mut reasons = std::collections::HashSet::new();
+    for (name, cap) in cases {
+        assert_eq!(cap.domain, DOMAIN_FILES, "{name}");
+        assert!(!cap.available, "{name}");
+        assert!(!cap.reason.is_empty(), "{name}");
+        reasons.insert(cap.reason);
+    }
+    // Las dos últimas comparten motivo: sin carpetas.
+    assert_eq!(reasons.len(), 5, "cada caso explica su propio motivo");
+
+    let unreachable = ToolBackend::new(vec![]);
+    *unreachable.active_model_error.lock() = Some(BackendError::Unavailable("caído".into()));
+    let down = files_capability(unreachable, fake(), true, false).await;
+    assert!(down.reason.contains("no responde"), "{}", down.reason);
+    let denied = ToolBackend::new(vec![]);
+    *denied.active_model_error.lock() = Some(BackendError::NotAllowed("nube".into()));
+    let cap = files_capability(denied, fake(), false, false).await;
+    assert!(cap.reason.contains("allow_remote"), "{}", cap.reason);
+}
+
+#[tokio::test]
+async fn la_capacidad_de_archivos_se_decide_aparte_de_la_del_correo() {
+    let d = files_pair(ToolBackend::remote(vec![]), true, true, false);
+    assert!(d.service.mail_capability(false).await.available);
+    let files = d.service.files_capability(false).await;
+    assert!(!files.available);
+    assert!(files.reason.contains("archivos"), "{}", files.reason);
+}
+
+#[cfg(test)]
+mod files_bus {
+    use super::*;
+    use vasak_assistant_protocol::{AssistantProxy, SERVICE_PATH};
+
+    #[tokio::test]
+    async fn las_capacidades_por_el_bus_informan_los_archivos_disponibles() {
+        let d = files_pair(ToolBackend::new(vec![]), true, false, false);
+        let (server, client) = crate::test_support::p2p_pair_as(OWNER, |builder| {
+            builder.serve_at(SERVICE_PATH, d.service)
+        })
+        .await
+        .unwrap();
+        let proxy = AssistantProxy::builder(&client)
+            .path(SERVICE_PATH)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let capabilities = proxy.capabilities().await.unwrap();
+        let files = capabilities
+            .iter()
+            .find(|c| c.domain == DOMAIN_FILES)
+            .unwrap();
+        assert!(files.available, "{}", files.reason);
+        drop(server);
+    }
 }

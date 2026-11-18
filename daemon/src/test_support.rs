@@ -253,6 +253,8 @@ pub fn local_selection(backend: &str, url: &str, model: Option<&str>) -> Selecti
         share_mail_with_remote: false,
         share_calendar_with_remote: false,
         share_contacts_with_remote: false,
+        share_files_with_remote: false,
+        lince_files_roots: Vec::new(),
     })
     .unwrap_or_else(|rejection| panic!("la selección local se acepta: {}", rejection.reason))
 }
@@ -282,6 +284,8 @@ pub fn ollama_backend(
         share_mail_with_remote: false,
         share_calendar_with_remote: false,
         share_contacts_with_remote: false,
+        share_files_with_remote: false,
+        lince_files_roots: Vec::new(),
     })
     .unwrap_or_else(|rejection| panic!("{}", rejection.reason));
     crate::ollama::OllamaBackend::new(client(), selection, allow_remote)

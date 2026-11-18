@@ -27,8 +27,8 @@ use zbus::{interface, Connection};
 
 use vasak_assistant_protocol::{
     Capability, ChatReply, Error, Memory as MemoryRecord, MemoryStatus, Message, Role,
-    ServiceStatus, DOMAINS, DOMAIN_CALENDAR, DOMAIN_CONTACTS, DOMAIN_MAIL, DOMAIN_MEMORY,
-    DOMAIN_REMOTE_BACKENDS, MAX_TOOL_ITERATIONS,
+    ServiceStatus, DOMAINS, DOMAIN_CALENDAR, DOMAIN_CONTACTS, DOMAIN_FILES, DOMAIN_MAIL,
+    DOMAIN_MEMORY, DOMAIN_REMOTE_BACKENDS, MAX_TOOL_ITERATIONS,
 };
 
 use crate::backend::{BackendError, BoxFuture, ChatMessage, ModelBackend, ModelTurn};
@@ -174,6 +174,13 @@ impl AssistantService {
             .find(|capability| capability.domain == DOMAIN_CONTACTS)
         {
             *slot = contacts;
+        }
+        let files = self.files_capability(confined).await;
+        if let Some(slot) = all
+            .iter_mut()
+            .find(|capability| capability.domain == DOMAIN_FILES)
+        {
+            *slot = files;
         }
         call.done();
         all
@@ -1295,6 +1302,52 @@ impl AssistantService {
         }
         Capability {
             domain: DOMAIN_CONTACTS.to_owned(),
+            available: true,
+            reason: String::new(),
+        }
+    }
+
+    /// La capacidad de los archivos, resuelta de verdad: la habilidad, el modelo
+    /// (local o remoto consentido, con soporte de herramientas) y que haya al
+    /// menos una carpeta configurada y legible. No disponible, nunca rota.
+    pub async fn files_capability(&self, confined: bool) -> Capability {
+        let unavailable = |reason: &str| Capability {
+            domain: DOMAIN_FILES.to_owned(),
+            available: false,
+            reason: reason.to_owned(),
+        };
+        if confined {
+            return unavailable("No disponible para aplicaciones confinadas.");
+        }
+        let Some(skill) = self.mail.skills.for_domain(DOMAIN_FILES) else {
+            return unavailable("Todavía no está disponible en esta versión del asistente.");
+        };
+        match self.backend.active_model().await {
+            Ok(model) if model.local || self.mail.shares_with_remote(DOMAIN_FILES) => {}
+            Ok(_) => {
+                return unavailable(
+                    "El modelo es remoto y tus archivos no se comparten con un proveedor remoto.",
+                )
+            }
+            Err(BackendError::NotAllowed(_)) => {
+                return unavailable(
+                    "El modelo no está permitido: corre en la nube y falta «allow_remote».",
+                )
+            }
+            Err(_) => return unavailable("El modelo no responde."),
+        }
+        if !self.backend.active_supports_tools().await.unwrap_or(false) {
+            return unavailable(
+                "El modelo actual no admite herramientas: no puede leer los archivos.",
+            );
+        }
+        // Sin carpetas configuradas y legibles, `probe` es falso: la persona
+        // todavía no eligió qué puede ver Lince.
+        if !skill.probe().await {
+            return unavailable("No hay carpetas configuradas para que Lince lea.");
+        }
+        Capability {
+            domain: DOMAIN_FILES.to_owned(),
             available: true,
             reason: String::new(),
         }
