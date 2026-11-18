@@ -134,12 +134,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(skills::mail::MailSkill::new(skills_bus.clone())),
             Arc::new(skills::calendar::CalendarSkill::new(skills_bus.clone())),
             Arc::new(skills::contacts::ContactsSkill::new(skills_bus)),
+            // Los archivos no van por un servicio: se leen del filesystem directo
+            // dentro de las raíces que la persona configuró (ninguna por omisión).
+            Arc::new(skills::files::FilesSkill::new(
+                settings.lince_files_roots.clone(),
+            )),
         ]),
         permission: Arc::new(skills::mail::DbusPermission::new(permissions_bus)),
         pending: parking_lot::Mutex::new(skills::PendingActions::default()),
         share_mail_with_remote: settings.share_mail_with_remote,
         share_calendar_with_remote: settings.share_calendar_with_remote,
         share_contacts_with_remote: settings.share_contacts_with_remote,
+        share_files_with_remote: settings.share_files_with_remote,
     });
     let service = AssistantService {
         backend,

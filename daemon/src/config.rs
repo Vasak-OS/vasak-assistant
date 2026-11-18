@@ -73,6 +73,17 @@ pub struct Settings {
     /// omisión no, con el mismo alcance que [`Settings::share_mail_with_remote`]
     /// (los contactos son sólo lectura, así que no tienen el caso del envío).
     pub share_contacts_with_remote: bool,
+    /// Si los archivos (lo que leen sus herramientas) se comparten con un backend
+    /// remoto. Decisión propia, aparte de las demás. Por omisión no: con un
+    /// remoto, el contenido de los archivos no se le manda ni se ofrecen sus
+    /// herramientas.
+    pub share_files_with_remote: bool,
+    /// Las carpetas que Lince puede leer (el alcance fino de la habilidad de
+    /// archivos). Rutas absolutas, o con `~/` inicial. Por omisión **ninguna**:
+    /// sin configurar una carpeta, Lince no ve archivos (la capacidad se ve no
+    /// disponible). Nunca todo el disco por defecto. El recurso `files` de
+    /// `vasak-permissions` es el on/off grueso; esto es qué puede ver.
+    pub lince_files_roots: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,6 +370,8 @@ mod tests {
             share_mail_with_remote: false,
             share_calendar_with_remote: false,
             share_contacts_with_remote: false,
+            share_files_with_remote: false,
+            lince_files_roots: Vec::new(),
         }
     }
 

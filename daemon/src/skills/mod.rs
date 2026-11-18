@@ -20,12 +20,13 @@ use std::time::{Duration, Instant};
 
 use crate::backend::{BoxFuture, ToolDef};
 use vasak_assistant_protocol::{
-    Error, PendingAction, DOMAIN_CALENDAR, DOMAIN_CONTACTS, DOMAIN_MAIL,
+    Error, PendingAction, DOMAIN_CALENDAR, DOMAIN_CONTACTS, DOMAIN_FILES, DOMAIN_MAIL,
 };
 
 pub mod calendar;
 pub mod contacts;
 pub mod dbus;
+pub mod files;
 pub mod mail;
 
 /// El recurso de permiso del correo, el mismo que exige `AccountsStore`.
@@ -36,6 +37,10 @@ pub const PERMISSION_CALENDAR: &str = "store.calendar";
 
 /// El recurso de permiso de los contactos, el mismo que exige `AccountsStore`.
 pub const PERMISSION_CONTACTS: &str = "store.contacts";
+
+/// El recurso de permiso de los archivos. A diferencia de los `store.*`, no lo
+/// sirve ningún demonio: es consentimiento y visibilidad, no una frontera.
+pub const PERMISSION_FILES: &str = "files";
 
 /// Cuánto vive una acción pendiente antes de vencer. Pasado eso, confirmarla da
 /// `NotFound`: un borrador viejo no se manda por una confirmación tardía.
@@ -254,6 +259,8 @@ pub struct MailChat {
     pub share_calendar_with_remote: bool,
     /// `share_contacts_with_remote` de `vasak.conf`: lo mismo para los contactos.
     pub share_contacts_with_remote: bool,
+    /// `share_files_with_remote` de `vasak.conf`: lo mismo para los archivos.
+    pub share_files_with_remote: bool,
 }
 
 impl MailChat {
@@ -264,6 +271,7 @@ impl MailChat {
             DOMAIN_MAIL => self.share_mail_with_remote,
             DOMAIN_CALENDAR => self.share_calendar_with_remote,
             DOMAIN_CONTACTS => self.share_contacts_with_remote,
+            DOMAIN_FILES => self.share_files_with_remote,
             _ => false,
         }
     }
@@ -278,6 +286,7 @@ impl Default for MailChat {
             share_mail_with_remote: false,
             share_calendar_with_remote: false,
             share_contacts_with_remote: false,
+            share_files_with_remote: false,
         }
     }
 }
