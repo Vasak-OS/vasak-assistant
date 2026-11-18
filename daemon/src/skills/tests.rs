@@ -299,7 +299,8 @@ fn mail_chat(skill: Option<Arc<FakeSkill>>, perm: Arc<FakePerm>, share: bool) ->
         ),
         permission: perm,
         pending: Mutex::new(PendingActions::default()),
-        share_with_remote: share,
+        share_mail_with_remote: share,
+        share_calendar_with_remote: share,
     })
 }
 
@@ -942,7 +943,8 @@ async fn la_capacidad_de_correo_no_esta_disponible_si_el_modelo_efectivo_no_admi
 #[test]
 fn el_correo_no_se_comparte_con_un_remoto_por_omision() {
     assert!(!crate::config::Settings::default().share_mail_with_remote);
-    assert!(!MailChat::default().share_with_remote);
+    assert!(!MailChat::default().share_mail_with_remote);
+    assert!(!MailChat::default().share_calendar_with_remote);
     let leida =
         crate::config::settings_from_json(r#"{"assistant":{"share_memory_with_remote":true}}"#)
             .unwrap();
@@ -1328,7 +1330,7 @@ async fn sin_permiso_de_mentira_el_verificador_por_omision_niega() {
 fn el_registro_de_habilidades_encuentra_por_herramienta_y_por_dominio() {
     let registry = SkillRegistry::new(vec![FakeSkill::new()]);
     assert!(!registry.is_empty());
-    assert_eq!(registry.tools().len(), 3);
+    assert_eq!(registry.tools_for(|_| true).len(), 3);
     assert!(registry.find("send_mail").is_some());
     assert!(registry.find("nada").is_none());
     assert!(registry.for_domain(DOMAIN_MAIL).is_some());

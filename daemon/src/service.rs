@@ -27,7 +27,7 @@ use zbus::{interface, Connection};
 
 use vasak_assistant_protocol::{
     Capability, ChatReply, Error, Memory as MemoryRecord, MemoryStatus, Message, Role,
-    ServiceStatus, DOMAINS, DOMAIN_MAIL, DOMAIN_MEMORY, DOMAIN_REMOTE_BACKENDS,
+    ServiceStatus, DOMAINS, DOMAIN_CALENDAR, DOMAIN_MAIL, DOMAIN_MEMORY, DOMAIN_REMOTE_BACKENDS,
     MAX_TOOL_ITERATIONS,
 };
 
@@ -152,14 +152,21 @@ impl AssistantService {
             self.memory_status_now().await
         };
         let mut all = capabilities(self.remote_allowed, &memory);
-        // El correo se decide de verdad (habilidad, almacén, modelo con tools);
-        // la función pura lo deja no disponible por omisión.
+        // El correo y el calendario se deciden de verdad (habilidad, almacén,
+        // modelo con tools); la función pura los deja no disponibles por omisión.
         let mail = self.mail_capability(confined).await;
         if let Some(slot) = all
             .iter_mut()
             .find(|capability| capability.domain == DOMAIN_MAIL)
         {
             *slot = mail;
+        }
+        let calendar = self.calendar_capability(confined).await;
+        if let Some(slot) = all
+            .iter_mut()
+            .find(|capability| capability.domain == DOMAIN_CALENDAR)
+        {
+            *slot = calendar;
         }
         call.done();
         all
@@ -691,10 +698,23 @@ impl AssistantService {
         let supports_tools = use_skills
             && !self.mail.skills.is_empty()
             && self.backend.active_supports_tools().await.unwrap_or(false);
-        // La puerta del correo, decisión propia aparte de la memoria.
-        let tools_enabled = supports_tools && self.mail_allowed_for_model().await;
+        // Con el modelo efectivo local, todas las habilidades; con un remoto,
+        // sólo las de los dominios que la persona aceptó compartir (cada dominio
+        // decide por separado). Falla cerrado: si no se sabe el modelo, no es local.
+        let model_local = self
+            .backend
+            .active_model()
+            .await
+            .is_ok_and(|model| model.local);
+        let tools = if supports_tools {
+            self.mail
+                .skills
+                .tools_for(|domain| model_local || self.mail.shares_with_remote(domain))
+        } else {
+            Vec::new()
+        };
 
-        if !tools_enabled {
+        if tools.is_empty() {
             let reply = self.backend.chat(&context).await.map_err(to_dbus)?;
             turn.reply = Some(reply.clone());
             return Ok(ChatReply {
@@ -703,12 +723,12 @@ impl AssistantService {
             });
         }
 
-        let tools = self.mail.skills.tools();
         let mut messages = to_chat_messages(&context);
-        // La misma puerta que la memoria, con la decisión propia del correo: con
-        // un modelo remoto no compartido, lo que vuelve de una herramienta no
-        // sale de la máquina.
-        let local_only = !self.mail.share_with_remote;
+        // Con el modelo local se usa el camino que exige localidad en el envío
+        // (atrapa un cambio a remoto a mitad de turno); con un remoto consentido,
+        // el camino normal. run_tool re-chequea el dominio por si el modelo llama
+        // una herramienta que no se le ofreció.
+        let local_only = model_local;
         let ctx = SkillCtx {
             conversation_id: conversation_id.to_owned(),
         };
@@ -719,10 +739,11 @@ impl AssistantService {
         // traer decenas de llamadas.
         let mut calls_used = 0usize;
         let mut result_bytes = 0usize;
-        // Si el turno trajo datos del correo: su texto final no entra al
-        // historial reutilizable (no se persiste ni se reenvía en un chat
-        // posterior). Un turno sin datos de correo conserva su historial normal.
-        let mut mail_data = false;
+        // Si el turno trajo datos del usuario (correo, calendario): su texto
+        // final no entra al historial reutilizable (no se persiste ni se
+        // reenvía en un chat posterior). Un turno sin esos datos conserva su
+        // historial normal.
+        let mut user_data = false;
 
         for _ in 0..MAX_TOOL_ITERATIONS {
             let turn_result = if local_only {
@@ -748,7 +769,7 @@ impl AssistantService {
                 ModelTurn::Text(text) => {
                     // El texto que puede citar correo se devuelve a quien llama
                     // pero no se guarda en el historial reutilizable.
-                    if !mail_data {
+                    if !user_data {
                         turn.reply = Some(text.clone());
                     }
                     return Ok(ChatReply {
@@ -771,14 +792,17 @@ impl AssistantService {
             });
             for call in calls {
                 let id = call.id.clone();
-                match self.run_tool(&call, &ctx, owner, conversation_id).await? {
+                match self
+                    .run_tool(&call, &ctx, owner, conversation_id, model_local)
+                    .await?
+                {
                     // Una acción pendiente corta el bucle: ahora decide la persona.
                     ToolStep::Pending(reply) => {
                         turn.reply = Some(reply.text.clone());
                         return Ok(reply);
                     }
                     ToolStep::Result { content, data } => {
-                        mail_data |= data;
+                        user_data |= data;
                         // Tope de bytes retenidos para el próximo pedido al modelo.
                         result_bytes += content.len();
                         if result_bytes > MAX_TOOL_RESULT_BYTES {
@@ -794,19 +818,6 @@ impl AssistantService {
         Ok(safe_reply(&mut turn, TOO_MANY_STEPS))
     }
 
-    /// Si el correo puede ir al modelo que va a responder: compartido con el
-    /// remoto (`share_mail_with_remote`), o el modelo efectivo es local. Con el
-    /// backend sin respuesta, no (falla cerrado). Es la puerta propia del
-    /// correo, aparte de la de la memoria.
-    async fn mail_allowed_for_model(&self) -> bool {
-        self.mail.share_with_remote
-            || self
-                .backend
-                .active_model()
-                .await
-                .is_ok_and(|model| model.local)
-    }
-
     /// Ejecuta una llamada a herramienta: busca la habilidad, comprueba el
     /// permiso y la corre. Un fallo de la herramienta vuelve como resultado para
     /// el modelo, no rompe el turno.
@@ -816,6 +827,7 @@ impl AssistantService {
         ctx: &SkillCtx,
         owner: &str,
         conversation_id: &str,
+        model_local: bool,
     ) -> Result<ToolStep, Error> {
         let Some(skill) = self.mail.skills.find(&call.name) else {
             return Ok(ToolStep::result(format!(
@@ -823,6 +835,15 @@ impl AssistantService {
                 call.name
             )));
         };
+        // Con un modelo remoto, un dominio que no se consintió compartir no se
+        // ejecuta aunque el modelo lo pida: su resultado iría al remoto. Con el
+        // modelo local, el backend ya exige localidad en el envío.
+        if !model_local && !self.mail.shares_with_remote(skill.domain()) {
+            return Ok(ToolStep::result(format!(
+                "la herramienta «{}» no está disponible con un modelo remoto",
+                call.name
+            )));
+        }
         // El detalle para el diálogo del permiso: la cuenta, si viene en los
         // argumentos. No cambia la decisión guardada.
         let detail = call
@@ -1032,8 +1053,9 @@ impl Drop for Turn<'_> {
 /// hacer y que nunca manda un correo sin que la persona lo confirme.
 const SYSTEM_PROMPT: &str = "Sos el asistente de VasakOS. Podés usar las herramientas de \
     correo para buscar y leer mensajes, y para preparar envíos. «send_mail» sólo prepara \
-    el correo: nunca se manda sin que la persona lo confirme. Usá las herramientas sólo \
-    cuando hagan falta para responder.";
+    el correo: nunca se manda sin que la persona lo confirme. También tenés herramientas \
+    de calendario de sólo lectura para listar y leer eventos y tareas. Usá las \
+    herramientas sólo cuando hagan falta para responder.";
 
 /// La respuesta segura cuando el modelo que respondería resultó no ser local
 /// **antes** de mandar nada: el correo no salió de la máquina.
@@ -1134,7 +1156,7 @@ impl AssistantService {
         // inalcanzable hace el correo no disponible bajo cualquier ajuste, y no
         // se confunde con uno «remoto».
         match self.backend.active_model().await {
-            Ok(model) if model.local || self.mail.share_with_remote => {}
+            Ok(model) if model.local || self.mail.shares_with_remote(DOMAIN_MAIL) => {}
             Ok(_) => {
                 return unavailable(
                     "El modelo es remoto y tu correo no se comparte con un proveedor remoto.",
@@ -1157,6 +1179,52 @@ impl AssistantService {
         }
         Capability {
             domain: DOMAIN_MAIL.to_owned(),
+            available: true,
+            reason: String::new(),
+        }
+    }
+
+    /// La capacidad del calendario: la misma puerta que el correo (habilidad
+    /// registrada, almacén que responde, modelo que admite herramientas y puede
+    /// verlas), con sus propios motivos. Sólo lectura, pero datos de la persona
+    /// igual: su propia puerta de compartir con el remoto. Si no, no disponible
+    /// con el motivo —nunca un error—.
+    pub async fn calendar_capability(&self, confined: bool) -> Capability {
+        let unavailable = |reason: &str| Capability {
+            domain: DOMAIN_CALENDAR.to_owned(),
+            available: false,
+            reason: reason.to_owned(),
+        };
+        if confined {
+            return unavailable("No disponible para aplicaciones confinadas.");
+        }
+        let Some(skill) = self.mail.skills.for_domain(DOMAIN_CALENDAR) else {
+            return unavailable("Todavía no está disponible en esta versión del asistente.");
+        };
+        match self.backend.active_model().await {
+            Ok(model) if model.local || self.mail.shares_with_remote(DOMAIN_CALENDAR) => {}
+            Ok(_) => {
+                return unavailable(
+                    "El modelo es remoto y tu calendario no se comparte con un proveedor remoto.",
+                )
+            }
+            Err(BackendError::NotAllowed(_)) => {
+                return unavailable(
+                    "El modelo no está permitido: corre en la nube y falta «allow_remote».",
+                )
+            }
+            Err(_) => return unavailable("El modelo no responde."),
+        }
+        if !self.backend.active_supports_tools().await.unwrap_or(false) {
+            return unavailable(
+                "El modelo actual no admite herramientas: no puede leer el calendario.",
+            );
+        }
+        if !skill.probe().await {
+            return unavailable("El servicio de cuentas no responde.");
+        }
+        Capability {
+            domain: DOMAIN_CALENDAR.to_owned(),
             available: true,
             reason: String::new(),
         }

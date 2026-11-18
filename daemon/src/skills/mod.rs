@@ -19,12 +19,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::backend::{BoxFuture, ToolDef};
-use vasak_assistant_protocol::{Error, PendingAction};
+use vasak_assistant_protocol::{Error, PendingAction, DOMAIN_CALENDAR, DOMAIN_MAIL};
 
+pub mod calendar;
 pub mod mail;
 
 /// El recurso de permiso del correo, el mismo que exige `AccountsStore`.
 pub const PERMISSION_EMAIL: &str = "store.email";
+
+/// El recurso de permiso del calendario, el mismo que exige `AccountsStore`.
+pub const PERMISSION_CALENDAR: &str = "store.calendar";
 
 /// Cuánto vive una acción pendiente antes de vencer. Pasado eso, confirmarla da
 /// `NotFound`: un borrador viejo no se manda por una confirmación tardía.
@@ -104,9 +108,15 @@ impl SkillRegistry {
         self.skills.is_empty()
     }
 
-    /// Todas las herramientas de todas las habilidades registradas.
-    pub fn tools(&self) -> Vec<ToolDef> {
-        self.skills.iter().flat_map(|skill| skill.tools()).collect()
+    /// Las herramientas de las habilidades cuyo dominio acepta `allow`. Se usa
+    /// para no ofrecerle a un modelo remoto las de un dominio que no se consintió
+    /// compartir.
+    pub fn tools_for(&self, mut allow: impl FnMut(&str) -> bool) -> Vec<ToolDef> {
+        self.skills
+            .iter()
+            .filter(|skill| allow(skill.domain()))
+            .flat_map(|skill| skill.tools())
+            .collect()
     }
 
     /// La habilidad que atiende la herramienta `name`, si hay alguna.
@@ -227,11 +237,26 @@ pub struct MailChat {
     pub skills: SkillRegistry,
     pub permission: Arc<dyn PermissionCheck>,
     pub pending: parking_lot::Mutex<PendingActions>,
-    /// `share_mail_with_remote` de `vasak.conf`: si el correo se comparte con
-    /// un modelo que no es local. Es una decisión propia, aparte de la de la
-    /// memoria. Por omisión `false`: con un remoto, el correo no sale ni se
+    /// `share_mail_with_remote` de `vasak.conf`: si el correo se comparte con un
+    /// modelo que no es local. Decisión propia, aparte de la memoria.
+    pub share_mail_with_remote: bool,
+    /// `share_calendar_with_remote` de `vasak.conf`: lo mismo para el calendario.
+    /// Cada dominio decide por separado; compartir el correo no comparte el
+    /// calendario. Por omisión `false`: con un remoto, el dominio no sale ni se
     /// ofrecen sus herramientas.
-    pub share_with_remote: bool,
+    pub share_calendar_with_remote: bool,
+}
+
+impl MailChat {
+    /// Si el dominio `domain` se comparte con un modelo remoto. Un dominio
+    /// desconocido, no.
+    pub fn shares_with_remote(&self, domain: &str) -> bool {
+        match domain {
+            DOMAIN_MAIL => self.share_mail_with_remote,
+            DOMAIN_CALENDAR => self.share_calendar_with_remote,
+            _ => false,
+        }
+    }
 }
 
 impl Default for MailChat {
@@ -240,7 +265,8 @@ impl Default for MailChat {
             skills: SkillRegistry::default(),
             permission: Arc::new(DenyPermission),
             pending: parking_lot::Mutex::new(PendingActions::default()),
-            share_with_remote: false,
+            share_mail_with_remote: false,
+            share_calendar_with_remote: false,
         }
     }
 }

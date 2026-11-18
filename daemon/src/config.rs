@@ -59,6 +59,11 @@ pub struct Settings {
     /// memoria NO la satisface. Por omisión no: con un remoto, el correo no se
     /// le manda ni se ofrecen sus herramientas.
     pub share_mail_with_remote: bool,
+    /// Si el calendario (lo que leen sus herramientas) se comparte con un backend
+    /// remoto. Decisión propia, aparte de la del correo y la de la memoria:
+    /// ninguna la satisface. Por omisión no: con un remoto, el calendario no se
+    /// le manda ni se ofrecen sus herramientas.
+    pub share_calendar_with_remote: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,6 +348,7 @@ mod tests {
             allow_remote,
             share_memory_with_remote: false,
             share_mail_with_remote: false,
+            share_calendar_with_remote: false,
         }
     }
 
