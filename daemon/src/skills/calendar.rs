@@ -260,3 +260,7 @@ fn string_array_arg(args: &Value, key: &str) -> Result<Vec<String>, Error> {
 fn backend_error(error: impl std::fmt::Display) -> Error {
     Error::Backend(format!("el servicio de cuentas no respondió: {error}"))
 }
+
+#[cfg(test)]
+#[path = "calendar_tests.rs"]
+mod tests;
