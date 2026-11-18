@@ -172,6 +172,17 @@ pub trait ModelBackend: Send + Sync {
         false
     }
 
+    /// Si el **modelo efectivo** admite herramientas: no alcanza con que el
+    /// backend las hable (Ollama), el modelo instalado tiene que tener la
+    /// capacidad `tools`. Por omisión responde [`Self::supports_tools`], para
+    /// el backend que no puede mirar el modelo; Ollama lo consulta por
+    /// `/api/show`. `Err` si no se pudo saber (el modelo no responde): quien
+    /// llama decide (cae en el camino de chat plano, nunca roto).
+    fn active_supports_tools(&self) -> BoxFuture<'_, Result<bool, BackendError>> {
+        let supports = self.supports_tools();
+        Box::pin(async move { Ok(supports) })
+    }
+
     /// Un turno del modelo con herramientas disponibles. Por omisión **ignora**
     /// las herramientas: aplana el hilo a [`Message`], llama a [`Self::chat`] y
     /// devuelve texto. Así un backend sin soporte (y [`RejectedBackend`]) sigue
@@ -375,6 +386,15 @@ impl ModelBackend for Limited {
 
     fn supports_tools(&self) -> bool {
         self.inner.supports_tools()
+    }
+
+    fn active_supports_tools(&self) -> BoxFuture<'_, Result<bool, BackendError>> {
+        // Sin lugar libre, `Busy`: la consulta del modelo va con el cupo de
+        // metadatos, no con el de los chats (#3).
+        Box::pin(async move {
+            let _permit = self.metadata_permit().await?;
+            self.inner.active_supports_tools().await
+        })
     }
 
     fn chat_tools<'a>(

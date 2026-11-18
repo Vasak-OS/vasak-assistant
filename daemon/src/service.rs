@@ -686,10 +686,13 @@ impl AssistantService {
             reply: None,
         };
 
-        let tools_enabled = use_skills
+        // El soporte de herramientas del modelo **efectivo** (no sólo del
+        // backend): un modelo local sin capacidad `tools` chatea en texto plano.
+        let supports_tools = use_skills
             && !self.mail.skills.is_empty()
-            && self.backend.supports_tools()
-            && self.memory.allowed_for(&*self.backend).await;
+            && self.backend.active_supports_tools().await.unwrap_or(false);
+        // La puerta del correo, decisión propia aparte de la memoria.
+        let tools_enabled = supports_tools && self.mail_allowed_for_model().await;
 
         if !tools_enabled {
             let reply = self.backend.chat(&context).await.map_err(to_dbus)?;
@@ -702,12 +705,24 @@ impl AssistantService {
 
         let tools = self.mail.skills.tools();
         let mut messages = to_chat_messages(&context);
-        // La misma puerta que la memoria: con un modelo remoto no compartido, lo
-        // que vuelve de una herramienta no sale de la máquina.
-        let local_only = !self.memory.shares_with_remote();
+        // La misma puerta que la memoria, con la decisión propia del correo: con
+        // un modelo remoto no compartido, lo que vuelve de una herramienta no
+        // sale de la máquina.
+        let local_only = !self.mail.share_with_remote;
         let ctx = SkillCtx {
             conversation_id: conversation_id.to_owned(),
         };
+
+        // Presupuesto del turno: cuántas llamadas en total y cuántos bytes de
+        // resultado se retienen para el próximo pedido. `MAX_TOOL_ITERATIONS`
+        // sólo acota cuántas veces responde el modelo; una sola respuesta puede
+        // traer decenas de llamadas.
+        let mut calls_used = 0usize;
+        let mut result_bytes = 0usize;
+        // Si el turno trajo datos del correo: su texto final no entra al
+        // historial reutilizable (no se persiste ni se reenvía en un chat
+        // posterior). Un turno sin datos de correo conserva su historial normal.
+        let mut mail_data = false;
 
         for _ in 0..MAX_TOOL_ITERATIONS {
             let turn_result = if local_only {
@@ -717,20 +732,25 @@ impl AssistantService {
             };
             let model_turn = match turn_result {
                 Ok(model_turn) => model_turn,
-                // El modelo pasó a remoto entre la puerta y el envío: respuesta
-                // segura, sin acción, y nada del correo salió hacia el remoto.
-                Err(BackendError::NotLocal | BackendError::RemoteAfterSend) => {
-                    turn.reply = Some(UNSAFE_REMOTE.to_owned());
-                    return Ok(ChatReply {
-                        text: UNSAFE_REMOTE.to_owned(),
-                        pending: Vec::new(),
-                    });
+                // No salió nada: el modelo que respondería no es local.
+                Err(BackendError::NotLocal) => {
+                    return Ok(safe_reply(&mut turn, UNSAFE_REMOTE));
+                }
+                // Ya salió: el pedido —que en un paso encadenado podía llevar
+                // contenido del correo— se mandó y la respuesta se descartó. El
+                // mensaje no afirma que nada salió de la máquina.
+                Err(BackendError::RemoteAfterSend) => {
+                    return Ok(safe_reply(&mut turn, UNSAFE_REMOTE_AFTER_SEND));
                 }
                 Err(error) => return Err(to_dbus(error)),
             };
             let calls = match model_turn {
                 ModelTurn::Text(text) => {
-                    turn.reply = Some(text.clone());
+                    // El texto que puede citar correo se devuelve a quien llama
+                    // pero no se guarda en el historial reutilizable.
+                    if !mail_data {
+                        turn.reply = Some(text.clone());
+                    }
                     return Ok(ChatReply {
                         text,
                         pending: Vec::new(),
@@ -738,6 +758,12 @@ impl AssistantService {
                 }
                 ModelTurn::Calls(calls) => calls,
             };
+            // El presupuesto total de llamadas se chequea antes de ejecutar la
+            // tanda: una respuesta con demasiadas corta con una respuesta segura.
+            if calls_used + calls.len() > MAX_TOOL_CALLS_PER_TURN {
+                return Ok(safe_reply(&mut turn, TOO_MANY_STEPS));
+            }
+            calls_used += calls.len();
             // El turno del asistente con las llamadas que pidió, para el próximo paso.
             messages.push(ChatMessage::Assistant {
                 text: String::new(),
@@ -751,7 +777,13 @@ impl AssistantService {
                         turn.reply = Some(reply.text.clone());
                         return Ok(reply);
                     }
-                    ToolStep::Result(content) => {
+                    ToolStep::Result { content, data } => {
+                        mail_data |= data;
+                        // Tope de bytes retenidos para el próximo pedido al modelo.
+                        result_bytes += content.len();
+                        if result_bytes > MAX_TOOL_RESULT_BYTES {
+                            return Ok(safe_reply(&mut turn, TOO_MANY_STEPS));
+                        }
                         messages.push(ChatMessage::Tool { id, content });
                     }
                 }
@@ -759,11 +791,20 @@ impl AssistantService {
         }
 
         // Se agotaron los pasos: respuesta segura, sin acción.
-        turn.reply = Some(TOO_MANY_STEPS.to_owned());
-        Ok(ChatReply {
-            text: TOO_MANY_STEPS.to_owned(),
-            pending: Vec::new(),
-        })
+        Ok(safe_reply(&mut turn, TOO_MANY_STEPS))
+    }
+
+    /// Si el correo puede ir al modelo que va a responder: compartido con el
+    /// remoto (`share_mail_with_remote`), o el modelo efectivo es local. Con el
+    /// backend sin respuesta, no (falla cerrado). Es la puerta propia del
+    /// correo, aparte de la de la memoria.
+    async fn mail_allowed_for_model(&self) -> bool {
+        self.mail.share_with_remote
+            || self
+                .backend
+                .active_model()
+                .await
+                .is_ok_and(|model| model.local)
     }
 
     /// Ejecuta una llamada a herramienta: busca la habilidad, comprueba el
@@ -777,7 +818,7 @@ impl AssistantService {
         conversation_id: &str,
     ) -> Result<ToolStep, Error> {
         let Some(skill) = self.mail.skills.find(&call.name) else {
-            return Ok(ToolStep::Result(format!(
+            return Ok(ToolStep::result(format!(
                 "no existe una herramienta «{}»",
                 call.name
             )));
@@ -795,25 +836,41 @@ impl AssistantService {
             .check(skill.permission(), detail)
             .await?
         {
-            return Ok(ToolStep::Result(format!(
+            return Ok(ToolStep::result(format!(
                 "la persona no concedió el permiso «{}»",
                 skill.permission()
             )));
         }
         match skill.call(&call.name, &call.arguments, ctx).await {
-            Ok(ToolOutcome::Result(content)) => Ok(ToolStep::Result(content)),
+            // Un resultado con datos del usuario: lo marca para que el texto
+            // final del turno no entre al historial reutilizable.
+            Ok(ToolOutcome::Result(content)) => Ok(ToolStep::Result {
+                content,
+                data: true,
+            }),
             Ok(ToolOutcome::Pending { action, execute }) => {
-                let reply = ChatReply {
-                    text: action.summary.clone(),
-                    pending: vec![action.clone()],
-                };
+                let text = action.summary.clone();
+                // Bajo el candado de las conversaciones (el mismo orden que el
+                // borrado): si la conversación se cerró durante el turno, no se
+                // registra el draft, y confirmarlo dará `NotFound`. Cierra la
+                // carrera entre insertar un draft y borrar la conversación.
+                let conversations = self.conversations.lock();
+                if !conversations.contains(owner, conversation_id) {
+                    drop(conversations);
+                    return Ok(ToolStep::Pending(ChatReply {
+                        text,
+                        pending: Vec::new(),
+                    }));
+                }
+                let pending = vec![action.clone()];
                 self.mail
                     .pending
                     .lock()
                     .insert(owner, conversation_id, action, execute);
-                Ok(ToolStep::Pending(reply))
+                drop(conversations);
+                Ok(ToolStep::Pending(ChatReply { text, pending }))
             }
-            Err(error) => Ok(ToolStep::Result(format!(
+            Err(error) => Ok(ToolStep::result(format!(
                 "la herramienta no se pudo ejecutar: {error}"
             ))),
         }
@@ -825,7 +882,9 @@ impl AssistantService {
     pub async fn confirm_pending(&self, owner: &str, action_id: &str) -> Result<String, Error> {
         let entry = self.mail.pending.lock().take(action_id, owner)?;
         (entry.execute)().await?;
-        Ok("Enviado".into())
+        // `AccountsSync.SendMessage` vuelve al aceptar el draft en la cola, no
+        // al entregarlo: se informa eso, no «Enviado».
+        Ok(QUEUED_FOR_SEND.to_owned())
     }
 
     /// Descarta una acción pendiente sin ejecutarla.
@@ -837,6 +896,10 @@ impl AssistantService {
             .map(|_entry| ())
     }
 
+    /// Cierra una conversación sin tocar la memoria ni los drafts. El camino
+    /// del bus pasa por [`Self::delete_conversation_as`]; esto queda para las
+    /// pruebas.
+    #[cfg(test)]
     pub fn delete_as(&self, owner: &str, conversation_id: &str) -> Result<(), Error> {
         self.conversations.lock().delete(owner, conversation_id)
     }
@@ -849,7 +912,18 @@ impl AssistantService {
         owner: &str,
         conversation_id: &str,
     ) -> Result<(), Error> {
-        self.delete_as(owner, conversation_id)?;
+        {
+            // Bajo el candado de las conversaciones (el mismo orden que la
+            // inserción de un draft): se cierra la conversación y se sacan sus
+            // drafts, para que una confirmación tardía no mande un correo de una
+            // conversación ya cerrada.
+            let mut conversations = self.conversations.lock();
+            conversations.delete(owner, conversation_id)?;
+            self.mail
+                .pending
+                .lock()
+                .remove_conversation(owner, conversation_id);
+        }
         self.memory.forget_conversation(conversation_id).await;
         Ok(())
     }
@@ -961,22 +1035,65 @@ const SYSTEM_PROMPT: &str = "Sos el asistente de VasakOS. Podés usar las herram
     el correo: nunca se manda sin que la persona lo confirme. Usá las herramientas sólo \
     cuando hagan falta para responder.";
 
-/// La respuesta segura cuando el modelo que respondería resultó remoto: nada del
-/// correo salió de la máquina.
+/// La respuesta segura cuando el modelo que respondería resultó no ser local
+/// **antes** de mandar nada: el correo no salió de la máquina.
 const UNSAFE_REMOTE: &str =
     "No pude usar el correo: el modelo que respondería no es local y tus datos no se \
      comparten con un proveedor remoto.";
 
-/// La respuesta segura cuando se agotaron los pasos de herramienta.
+/// La respuesta cuando el modelo resultó no ser local **después** de mandar el
+/// pedido (Ollama reapuntó el nombre en el medio): el contenido —que en un paso
+/// encadenado podía incluir correo— ya pudo haber salido. No afirma que nada
+/// salió de la máquina.
+const UNSAFE_REMOTE_AFTER_SEND: &str =
+    "No pude usar el correo: el modelo resultó no ser local durante el pedido. Si ya había \
+     contenido de tu correo en la consulta, pudo haber salido hacia ese proveedor; no lo reintento.";
+
+/// La respuesta segura cuando se agotaron los pasos de herramienta, el
+/// presupuesto de llamadas o el tope de bytes retenidos.
 const TOO_MANY_STEPS: &str = "No pude completar la tarea en los pasos disponibles. \
     Probá de nuevo siendo más específico.";
 
+/// Lo que informa una confirmación: `AccountsSync` acepta el draft en la cola,
+/// no confirma la entrega real.
+const QUEUED_FOR_SEND: &str = "Puesto en cola para enviar";
+
+/// Cuántas llamadas a herramienta puede ejecutar un turno en total, sumadas
+/// sobre todas las respuestas del modelo. [`MAX_TOOL_ITERATIONS`] sólo acota
+/// cuántas veces responde el modelo; una respuesta puede traer muchas llamadas.
+const MAX_TOOL_CALLS_PER_TURN: usize = 12;
+
+/// Cuántos bytes de resultados de herramienta se retienen para el próximo
+/// pedido al modelo. El almacén ya acota cada respuesta; esto acota el total.
+const MAX_TOOL_RESULT_BYTES: usize = 128 * 1024;
+
+/// Guarda el texto seguro en el turno y arma la respuesta sin acción.
+fn safe_reply(turn: &mut Turn, text: &str) -> ChatReply {
+    turn.reply = Some(text.to_owned());
+    ChatReply {
+        text: text.to_owned(),
+        pending: Vec::new(),
+    }
+}
+
 /// Qué hacer con el resultado de una herramienta dentro del bucle.
 enum ToolStep {
-    /// Un texto para devolverle al modelo como resultado.
-    Result(String),
+    /// Un texto para devolverle al modelo como resultado. `data` es `true` si
+    /// trae datos del usuario (correo): el texto final del turno no entra
+    /// entonces al historial reutilizable.
+    Result { content: String, data: bool },
     /// Una acción pendiente: corta el bucle y vuelve a la persona.
     Pending(ChatReply),
+}
+
+impl ToolStep {
+    /// Un resultado sintético (error, permiso negado): no son datos del usuario.
+    fn result(content: String) -> Self {
+        ToolStep::Result {
+            content,
+            data: false,
+        }
+    }
 }
 
 /// El hilo que ve el modelo al abrir un turno con herramientas: el sistema más
@@ -1013,14 +1130,26 @@ impl AssistantService {
         let Some(skill) = self.mail.skills.for_domain(DOMAIN_MAIL) else {
             return unavailable("Todavía no está disponible en esta versión del asistente.");
         };
-        if !self.backend.supports_tools() {
+        // El modelo efectivo decide, aparte del permiso de compartir: un modelo
+        // inalcanzable hace el correo no disponible bajo cualquier ajuste, y no
+        // se confunde con uno «remoto».
+        match self.backend.active_model().await {
+            Ok(model) if model.local || self.mail.share_with_remote => {}
+            Ok(_) => {
+                return unavailable(
+                    "El modelo es remoto y tu correo no se comparte con un proveedor remoto.",
+                )
+            }
+            Err(BackendError::NotAllowed(_)) => {
+                return unavailable(
+                    "El modelo no está permitido: corre en la nube y falta «allow_remote».",
+                )
+            }
+            Err(_) => return unavailable("El modelo no responde."),
+        }
+        if !self.backend.active_supports_tools().await.unwrap_or(false) {
             return unavailable(
                 "El modelo actual no admite herramientas: no puede leer el correo ni redactar envíos.",
-            );
-        }
-        if !self.memory.allowed_for(&*self.backend).await {
-            return unavailable(
-                "El modelo es remoto y tu correo no se comparte con un proveedor remoto.",
             );
         }
         if !skill.probe().await {

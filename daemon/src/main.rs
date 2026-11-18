@@ -130,6 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))]),
         permission: Arc::new(skills::mail::DbusPermission::new(mail_bus)),
         pending: parking_lot::Mutex::new(skills::PendingActions::default()),
+        share_with_remote: settings.share_mail_with_remote,
     });
     let service = AssistantService {
         backend,

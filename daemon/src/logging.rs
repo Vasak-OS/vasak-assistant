@@ -434,6 +434,7 @@ mod startup_tests {
             model: Some("modelo-canario".into()),
             allow_remote,
             share_memory_with_remote: share,
+            share_mail_with_remote: false,
         }
     }
 

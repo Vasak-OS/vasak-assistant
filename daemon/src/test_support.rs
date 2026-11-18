@@ -250,6 +250,7 @@ pub fn local_selection(backend: &str, url: &str, model: Option<&str>) -> Selecti
         model: model.map(str::to_owned),
         allow_remote: false,
         share_memory_with_remote: false,
+        share_mail_with_remote: false,
     })
     .unwrap_or_else(|rejection| panic!("la selección local se acepta: {}", rejection.reason))
 }
@@ -276,6 +277,7 @@ pub fn ollama_backend(
         model: model.map(str::to_owned),
         allow_remote: true,
         share_memory_with_remote: false,
+        share_mail_with_remote: false,
     })
     .unwrap_or_else(|rejection| panic!("{}", rejection.reason));
     crate::ollama::OllamaBackend::new(client(), selection, allow_remote)

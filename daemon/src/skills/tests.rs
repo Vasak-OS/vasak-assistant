@@ -257,7 +257,7 @@ impl PermissionCheck for FakePerm {
 
 // ── Armado ──────────────────────────────────────────────────────────────────────
 
-fn mail_chat(skill: Option<Arc<FakeSkill>>, perm: Arc<FakePerm>) -> Arc<MailChat> {
+fn mail_chat(skill: Option<Arc<FakeSkill>>, perm: Arc<FakePerm>, share: bool) -> Arc<MailChat> {
     Arc::new(MailChat {
         skills: SkillRegistry::new(
             skill
@@ -267,6 +267,7 @@ fn mail_chat(skill: Option<Arc<FakeSkill>>, perm: Arc<FakePerm>) -> Arc<MailChat
         ),
         permission: perm,
         pending: Mutex::new(PendingActions::default()),
+        share_with_remote: share,
     })
 }
 
@@ -294,7 +295,7 @@ fn rig_with(backend: Arc<ToolBackend>, skill: Arc<FakeSkill>, grant: bool, share
     let perm = FakePerm::new(grant);
     let service = build(
         backend.clone(),
-        mail_chat(Some(skill.clone()), perm.clone()),
+        mail_chat(Some(skill.clone()), perm.clone(), share),
         share,
     );
     let conversation = service.conversations.lock().create(OWNER, false).unwrap();
@@ -348,7 +349,11 @@ impl Rig {
 #[tokio::test]
 async fn sin_habilidades_registradas_el_turno_responde_texto_sin_acciones() {
     let backend = ToolBackend::new(vec![]);
-    let service = build(backend.clone(), mail_chat(None, FakePerm::new(true)), false);
+    let service = build(
+        backend.clone(),
+        mail_chat(None, FakePerm::new(true), false),
+        false,
+    );
     let id = service.conversations.lock().create(OWNER, false).unwrap();
     let reply = service
         .chat_turn_with(OWNER, &id, "hola", true)
@@ -797,7 +802,7 @@ async fn mail_capability(
     share: bool,
     confined: bool,
 ) -> vasak_assistant_protocol::Capability {
-    let service = build(backend, mail_chat(skill, FakePerm::new(true)), share);
+    let service = build(backend, mail_chat(skill, FakePerm::new(true), share), share);
     service.mail_capability(confined).await
 }
 

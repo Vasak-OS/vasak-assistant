@@ -7,6 +7,8 @@
 //! control del lado de Lince es el permiso propio (lo comprueba el servicio
 //! antes de ejecutar la herramienta) más la confirmación de la persona.
 
+use std::time::Duration;
+
 use serde_json::{json, Value};
 use zbus::Connection;
 
@@ -31,6 +33,17 @@ const SEARCH_LIMIT: u32 = 20;
 
 /// Cuánto del cuerpo se le muestra a la persona en el resumen de un envío.
 const BODY_PREVIEW_BYTES: usize = 240;
+
+/// Plazo de una lectura, de `GetStatus` o de la consulta de permiso: zbus 5 no
+/// tiene timeout por método, y un servicio conectado pero que no responde
+/// dejaría la llamada —y el lugar de conversación del turno— esperando para
+/// siempre.
+const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Plazo del envío (`SendMessage`), algo más holgado que una lectura. Si se
+/// vence, el resultado queda **desconocido**: el correo pudo haber salido, así
+/// que no se reintenta (la acción ya se consumió del registro).
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// La habilidad de correo. Guarda la conexión al bus de sesión para hablarle al
 /// servicio de cuentas; los proxies se arman por llamada, que es barato.
@@ -136,7 +149,8 @@ impl Skill for MailSkill {
             let Ok(proxy) = self.store_proxy().await else {
                 return false;
             };
-            proxy.call::<_, _, String>("GetStatus", &()).await.is_ok()
+            let status = proxy.call::<_, _, String>("GetStatus", &());
+            matches!(tokio::time::timeout(CALL_TIMEOUT, status).await, Ok(Ok(_)))
         })
     }
 }
@@ -147,13 +161,14 @@ impl MailSkill {
         let query = string_arg(args, "query")?;
         let proxy = self.store_proxy().await?;
         // `mailbox_id` 0 es "todas las casillas"; sin cursor, la primera página.
-        let json: String = proxy
-            .call(
+        let json: String = call_with_timeout(
+            CALL_TIMEOUT,
+            proxy.call(
                 "SearchMessages",
                 &(account_id, query, 0i64, String::new(), SEARCH_LIMIT),
-            )
-            .await
-            .map_err(backend_error)?;
+            ),
+        )
+        .await?;
         Ok(ToolOutcome::Result(json))
     }
 
@@ -161,10 +176,11 @@ impl MailSkill {
         let account_id = string_arg(args, "account_id")?;
         let message_id = int_arg(args, "message_id")?;
         let proxy = self.store_proxy().await?;
-        let json: String = proxy
-            .call("GetMessage", &(account_id, message_id))
-            .await
-            .map_err(backend_error)?;
+        let json: String = call_with_timeout(
+            CALL_TIMEOUT,
+            proxy.call("GetMessage", &(account_id, message_id)),
+        )
+        .await?;
         Ok(ToolOutcome::Result(json))
     }
 
@@ -182,6 +198,13 @@ impl MailSkill {
             .map(|address| address.trim().to_owned())
             .filter(|address| !address.is_empty())
             .collect();
+        // Una lista que se normaliza a vacía (`" , , "`) no es un envío: sin
+        // destinatarios no hay a quién mandarle.
+        if recipients.is_empty() {
+            return Err(Error::InvalidArgs(
+                "no hay destinatarios: la lista «to» quedó vacía".into(),
+            ));
+        }
         let draft = json!({
             "para": recipients,
             "asunto": subject,
@@ -193,7 +216,12 @@ impl MailSkill {
             id: uuid::Uuid::new_v4().to_string(),
             conversation_id: ctx.conversation_id.clone(),
             kind: "send_mail".into(),
-            summary: format!("Enviar un correo a {to} con el asunto «{subject}»"),
+            // La cuenta que envía entra en el resumen: dos borradores con los
+            // mismos destinatarios y asunto pero distinta cuenta (personal y
+            // trabajo) no se ven iguales al confirmar.
+            summary: format!(
+                "Enviar un correo a {to} con el asunto «{subject}» desde la cuenta «{account_id}»"
+            ),
             to,
             subject,
             body_preview: preview(&body),
@@ -208,11 +236,20 @@ impl MailSkill {
                     zbus::Proxy::new(&connection, ACCOUNTS_SERVICE, SYNC_PATH, SYNC_INTERFACE)
                         .await
                         .map_err(backend_error)?;
-                // `not_before` vacío: "cuando se pueda".
-                let _queued: String = proxy
-                    .call("SendMessage", &(account_id, draft, String::new()))
-                    .await
-                    .map_err(backend_error)?;
+                // `not_before` vacío: "cuando se pueda". Con plazo: si se vence,
+                // el resultado es desconocido (el correo pudo haber salido) y no
+                // se reintenta.
+                let args = (account_id, draft, String::new());
+                let send = proxy.call::<_, _, String>("SendMessage", &args);
+                let _queued: String = match tokio::time::timeout(SEND_TIMEOUT, send).await {
+                    Ok(result) => result.map_err(backend_error)?,
+                    Err(_) => {
+                        return Err(Error::Backend(
+                            "no se sabe si el correo salió: el envío no respondió a tiempo; no se reintentará."
+                                .into(),
+                        ))
+                    }
+                };
                 Ok(())
             })
         });
@@ -250,11 +287,27 @@ impl PermissionCheck for DbusPermission {
             )
             .await
             .map_err(backend_error)?;
-            proxy
-                .call("CheckPermission", &(resource, detail))
-                .await
-                .map_err(backend_error)
+            call_with_timeout(
+                CALL_TIMEOUT,
+                proxy.call("CheckPermission", &(resource, detail)),
+            )
+            .await
         })
+    }
+}
+
+/// Envuelve una llamada D-Bus en un plazo y traduce su error: zbus 5 no tiene
+/// timeout por método. Si se vence, el servicio está conectado pero no
+/// responde, y la llamada no espera para siempre.
+async fn call_with_timeout<T>(
+    timeout: Duration,
+    call: impl std::future::Future<Output = zbus::Result<T>>,
+) -> Result<T, Error> {
+    match tokio::time::timeout(timeout, call).await {
+        Ok(result) => result.map_err(backend_error),
+        Err(_) => Err(Error::Backend(
+            "el servicio de cuentas no respondió a tiempo".into(),
+        )),
     }
 }
 

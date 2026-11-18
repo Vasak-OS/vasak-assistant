@@ -66,6 +66,35 @@ impl OllamaBackend {
         parse_tags(&http::read_capped(self.base(), response).await?)
     }
 
+    /// Si el modelo efectivo tiene la capacidad `tools`. Lo dice `/api/show`
+    /// en `capabilities`: un modelo local sin esa capacidad rechaza cualquier
+    /// pedido con herramientas, hasta un saludo, así que no hay que ofrecérselas.
+    async fn model_supports_tools(&self) -> Result<bool, BackendError> {
+        let (model, _remote) = self.resolve_model().await?;
+        let response = self
+            .client
+            .post(http::endpoint(self.base(), "api/show")?)
+            .timeout(LIST_TIMEOUT)
+            .json(&ShowRequest { model: &model })
+            .send()
+            .await
+            .map_err(|error| http::map_error(self.base(), error))?;
+        tracing::debug!(
+            backend = "ollama",
+            operation = "api/show",
+            model = model.as_str(),
+            status = response.status().as_u16(),
+            "respuesta HTTP"
+        );
+        if !response.status().is_success() {
+            return Err(BackendError::Failed(format!(
+                "Ollama respondió {} al detalle del modelo",
+                response.status()
+            )));
+        }
+        parse_capabilities(&http::read_capped(self.base(), response).await?)
+    }
+
     /// El modelo con el que responder y si corre fuera de la máquina.
     async fn resolve_model(&self) -> Result<(String, bool), BackendError> {
         let installed = self.installed_models().await?;
@@ -266,6 +295,10 @@ impl ModelBackend for OllamaBackend {
         true
     }
 
+    fn active_supports_tools(&self) -> BoxFuture<'_, Result<bool, BackendError>> {
+        Box::pin(self.model_supports_tools())
+    }
+
     fn chat_tools<'a>(
         &'a self,
         messages: &'a [ChatMessage],
@@ -333,6 +366,31 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: &'a [Message],
     stream: bool,
+}
+
+/// El pedido a `/api/show`: sólo el nombre del modelo.
+#[derive(Serialize)]
+struct ShowRequest<'a> {
+    model: &'a str,
+}
+
+/// La respuesta de `/api/show`. `capabilities` lista lo que el modelo sabe
+/// hacer (`"completion"`, `"tools"`, …); falta en versiones viejas de Ollama.
+#[derive(Debug, Deserialize)]
+pub struct ShowResponse {
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+/// Si `/api/show` dice que el modelo tiene la capacidad `tools`.
+pub fn parse_capabilities(body: &[u8]) -> Result<bool, BackendError> {
+    serde_json::from_slice::<ShowResponse>(body)
+        .map(|show| {
+            show.capabilities
+                .iter()
+                .any(|capability| capability == "tools")
+        })
+        .map_err(|_| BackendError::Failed("detalle del modelo ilegible".into()))
 }
 
 /// La respuesta de `/api/chat`. `remote_host` (con `omitempty`) dice si la

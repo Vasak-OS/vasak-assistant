@@ -164,6 +164,14 @@ pub struct PendingActions {
 }
 
 impl PendingActions {
+    /// Descarta los drafts de una conversación (de su dueño). Se llama al
+    /// cerrarla, bajo el candado de las conversaciones, para que un draft no
+    /// sobreviva a la conversación que lo propuso.
+    pub fn remove_conversation(&mut self, owner: &str, conversation_id: &str) {
+        self.by_id
+            .retain(|_, entry| !(entry.owner == owner && entry.conversation_id == conversation_id));
+    }
+
     /// Guarda una acción, reemplazando la que hubiera en la misma conversación
     /// del mismo dueño (un turno nuevo deja una sola pendiente). De paso
     /// descarta las vencidas.
@@ -219,6 +227,11 @@ pub struct MailChat {
     pub skills: SkillRegistry,
     pub permission: Arc<dyn PermissionCheck>,
     pub pending: parking_lot::Mutex<PendingActions>,
+    /// `share_mail_with_remote` de `vasak.conf`: si el correo se comparte con
+    /// un modelo que no es local. Es una decisión propia, aparte de la de la
+    /// memoria. Por omisión `false`: con un remoto, el correo no sale ni se
+    /// ofrecen sus herramientas.
+    pub share_with_remote: bool,
 }
 
 impl Default for MailChat {
@@ -227,6 +240,7 @@ impl Default for MailChat {
             skills: SkillRegistry::default(),
             permission: Arc::new(DenyPermission),
             pending: parking_lot::Mutex::new(PendingActions::default()),
+            share_with_remote: false,
         }
     }
 }
