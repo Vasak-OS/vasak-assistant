@@ -230,3 +230,6 @@ impl Default for MailChat {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -1419,3 +1419,7 @@ mod metadata_tests {
         assert!(meta.peak.load(Ordering::SeqCst) <= MAX_METADATA_IN_FLIGHT);
     }
 }
+
+#[cfg(test)]
+#[path = "backend_tools_tests.rs"]
+mod tools_tests;

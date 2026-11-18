@@ -289,3 +289,7 @@ fn preview(body: &str) -> String {
 fn backend_error(error: impl std::fmt::Display) -> Error {
     Error::Backend(format!("el servicio de cuentas no respondió: {error}"))
 }
+
+#[cfg(test)]
+#[path = "mail_tests.rs"]
+mod tests;

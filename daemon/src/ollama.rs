@@ -1134,3 +1134,7 @@ mod tests {
         assert_eq!(chats(&server), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "ollama_tools_tests.rs"]
+mod tools_tests;
