@@ -178,19 +178,14 @@ async fn list_events_consulta_ocurrencias_con_rango_calendarios_y_tope() {
     );
     assert_eq!(
         log.lock().as_slice(),
-        [format!(
-            "occ 2026-11-01T00:00:00Z 2026-11-30T00:00:00Z [\"c1\", \"c2\"] [] {PAGE_LIMIT}"
-        )]
+        ["occ 2026-11-01T00:00:00Z 2026-11-30T00:00:00Z [\"c1\", \"c2\"] [] 100"]
     );
     // Sin calendar_ids son todos: la lista va vacía.
     log.lock().clear();
     run(&skill, "list_events", json!({"from": "a", "to": "b"}))
         .await
         .unwrap();
-    assert_eq!(
-        log.lock().as_slice(),
-        [format!("occ a b [] [] {PAGE_LIMIT}")]
-    );
+    assert_eq!(log.lock().as_slice(), ["occ a b [] [] 100"]);
 }
 
 #[tokio::test]
@@ -226,10 +221,7 @@ async fn list_tasks_pide_las_pendientes_salvo_con_include_completed() {
     .unwrap();
     assert_eq!(
         log.lock().as_slice(),
-        [
-            format!("tasks [] false [] {PAGE_LIMIT}"),
-            format!("tasks [\"c1\"] true [] {PAGE_LIMIT}")
-        ]
+        ["tasks [] false [] 100", "tasks [\"c1\"] true [] 100"]
     );
 }
 
