@@ -12,18 +12,19 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use zbus::Connection;
 
+use super::dbus::{
+    backend_error, call_with_timeout, int_arg, store_alive, store_proxy, string_arg,
+    ACCOUNTS_SERVICE, CALL_TIMEOUT,
+};
 use super::{PermissionCheck, Skill, SkillCtx, ToolOutcome, PERMISSION_EMAIL};
 use crate::backend::{BoxFuture, ToolDef};
 use vasak_assistant_protocol::{Error, PendingAction, DOMAIN_MAIL};
 
-// ── Direcciones del bus de cuentas ──────────────────────────────────────────────
+// ── Direcciones de la sincronización ──────────────────────────────────────────
 //
 // El almacén local y la sincronización los sirve el mismo servicio, dueño del
-// nombre `ar.net.vasak.os.AccountsSync`, en dos objetos distintos.
+// nombre `ar.net.vasak.os.AccountsSync` (ver `dbus`), en dos objetos distintos.
 
-const ACCOUNTS_SERVICE: &str = "ar.net.vasak.os.AccountsSync";
-const STORE_PATH: &str = "/ar/net/vasak/os/AccountsStore";
-const STORE_INTERFACE: &str = "ar.net.vasak.os.AccountsStore";
 const SYNC_PATH: &str = "/ar/net/vasak/os/AccountsSync";
 const SYNC_INTERFACE: &str = "ar.net.vasak.os.AccountsSync";
 
@@ -33,12 +34,6 @@ const SEARCH_LIMIT: u32 = 20;
 
 /// Cuánto del cuerpo se le muestra a la persona en el resumen de un envío.
 const BODY_PREVIEW_BYTES: usize = 240;
-
-/// Plazo de una lectura, de `GetStatus` o de la consulta de permiso: zbus 5 no
-/// tiene timeout por método, y un servicio conectado pero que no responde
-/// dejaría la llamada —y el lugar de conversación del turno— esperando para
-/// siempre.
-const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Plazo del envío (`SendMessage`), algo más holgado que una lectura. Si se
 /// vence, el resultado queda **desconocido**: el correo pudo haber salido, así
@@ -54,17 +49,6 @@ pub struct MailSkill {
 impl MailSkill {
     pub fn new(connection: Connection) -> Self {
         Self { connection }
-    }
-
-    async fn store_proxy(&self) -> Result<zbus::Proxy<'_>, Error> {
-        zbus::Proxy::new(
-            &self.connection,
-            ACCOUNTS_SERVICE,
-            STORE_PATH,
-            STORE_INTERFACE,
-        )
-        .await
-        .map_err(backend_error)
     }
 }
 
@@ -143,15 +127,7 @@ impl Skill for MailSkill {
     }
 
     fn probe(&self) -> BoxFuture<'_, bool> {
-        Box::pin(async move {
-            // `GetStatus` no abre ningún diálogo ni pide permiso: si contesta,
-            // el almacén está en pie.
-            let Ok(proxy) = self.store_proxy().await else {
-                return false;
-            };
-            let status = proxy.call::<_, _, String>("GetStatus", &());
-            matches!(tokio::time::timeout(CALL_TIMEOUT, status).await, Ok(Ok(_)))
-        })
+        Box::pin(store_alive(&self.connection))
     }
 }
 
@@ -159,7 +135,7 @@ impl MailSkill {
     async fn search_mail(&self, args: &Value) -> Result<ToolOutcome, Error> {
         let account_id = string_arg(args, "account_id")?;
         let query = string_arg(args, "query")?;
-        let proxy = self.store_proxy().await?;
+        let proxy = store_proxy(&self.connection).await?;
         // `mailbox_id` 0 es "todas las casillas"; sin cursor, la primera página.
         let json: String = call_with_timeout(
             CALL_TIMEOUT,
@@ -175,7 +151,7 @@ impl MailSkill {
     async fn read_mail(&self, args: &Value) -> Result<ToolOutcome, Error> {
         let account_id = string_arg(args, "account_id")?;
         let message_id = int_arg(args, "message_id")?;
-        let proxy = self.store_proxy().await?;
+        let proxy = store_proxy(&self.connection).await?;
         let json: String = call_with_timeout(
             CALL_TIMEOUT,
             proxy.call("GetMessage", &(account_id, message_id)),
@@ -262,6 +238,9 @@ impl MailSkill {
 /// Consulta `CheckPermission` en cada llamada: quien recuerda la decisión de la
 /// persona es el servicio de permisos, no esto. Re-preguntar siempre es lo más
 /// seguro; si alguna vez pesa, se le pone una caché corta como la de `access.rs`.
+///
+/// La conexión es la del bus donde vive `vasak-permissions` —el del **sistema**
+/// en producción (ver `dbus::permission_bus`)—, no la del almacén de cuentas.
 pub struct DbusPermission {
     connection: Connection,
 }
@@ -287,43 +266,15 @@ impl PermissionCheck for DbusPermission {
             )
             .await
             .map_err(backend_error)?;
-            call_with_timeout(
-                CALL_TIMEOUT,
-                proxy.call("CheckPermission", &(resource, detail)),
-            )
-            .await
+            // Sin plazo: `CheckPermission` abre un diálogo la primera vez y la
+            // respuesta llega recién cuando la persona contesta, lo que puede
+            // tardar minutos. Un plazo corto lo tomaría por una negativa.
+            proxy
+                .call("CheckPermission", &(resource, detail))
+                .await
+                .map_err(backend_error)
         })
     }
-}
-
-/// Envuelve una llamada D-Bus en un plazo y traduce su error: zbus 5 no tiene
-/// timeout por método. Si se vence, el servicio está conectado pero no
-/// responde, y la llamada no espera para siempre.
-async fn call_with_timeout<T>(
-    timeout: Duration,
-    call: impl std::future::Future<Output = zbus::Result<T>>,
-) -> Result<T, Error> {
-    match tokio::time::timeout(timeout, call).await {
-        Ok(result) => result.map_err(backend_error),
-        Err(_) => Err(Error::Backend(
-            "el servicio de cuentas no respondió a tiempo".into(),
-        )),
-    }
-}
-
-/// El valor de un argumento de texto, o `InvalidArgs` si falta o no es texto.
-fn string_arg(args: &Value, key: &str) -> Result<String, Error> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| Error::InvalidArgs(format!("falta el argumento «{key}»")))
-}
-
-/// El valor de un argumento entero.
-fn int_arg(args: &Value, key: &str) -> Result<i64, Error> {
-    args.get(key)
-        .and_then(Value::as_i64)
-        .ok_or_else(|| Error::InvalidArgs(format!("falta el argumento «{key}» o no es un número")))
 }
 
 /// Un recorte del cuerpo para mostrarle a la persona, cortado en un límite de
@@ -337,12 +288,6 @@ fn preview(body: &str) -> String {
         end -= 1;
     }
     format!("{}…", &body[..end])
-}
-
-/// Un error del bus de cuentas o permisos, para la persona, sin filtrar nada
-/// delicado del cable.
-fn backend_error(error: impl std::fmt::Display) -> Error {
-    Error::Backend(format!("el servicio de cuentas no respondió: {error}"))
 }
 
 #[cfg(test)]

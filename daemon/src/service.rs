@@ -700,18 +700,23 @@ impl AssistantService {
             && self.backend.active_supports_tools().await.unwrap_or(false);
         // Con el modelo efectivo local, todas las habilidades; con un remoto,
         // sólo las de los dominios que la persona aceptó compartir (cada dominio
-        // decide por separado). Falla cerrado: si no se sabe el modelo, no es local.
-        let model_local = self
-            .backend
-            .active_model()
-            .await
-            .is_ok_and(|model| model.local);
-        let tools = if supports_tools {
-            self.mail
+        // decide por separado). Falla cerrado: si no se sabe el modelo, no es
+        // local. La localidad se resuelve sólo si hay herramientas que ofrecer:
+        // un chat en texto plano no espera a `active_model` (en frío, un
+        // `/api/tags` lento le sumaría segundos antes de empezar).
+        let (tools, model_local) = if supports_tools {
+            let model_local = self
+                .backend
+                .active_model()
+                .await
+                .is_ok_and(|model| model.local);
+            let tools = self
+                .mail
                 .skills
-                .tools_for(|domain| model_local || self.mail.shares_with_remote(domain))
+                .tools_for(|domain| model_local || self.mail.shares_with_remote(domain));
+            (tools, model_local)
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
 
         if tools.is_empty() {
@@ -798,7 +803,20 @@ impl AssistantService {
                 {
                     // Una acción pendiente corta el bucle: ahora decide la persona.
                     ToolStep::Pending(reply) => {
-                        turn.reply = Some(reply.text.clone());
+                        // El resumen puede venir de datos del usuario (el asunto
+                        // de un borrador sacado de un correo o de un evento):
+                        // como el texto final, no entra al historial reutilizable
+                        // si el turno los tocó. Hoy la única herramienta que
+                        // devuelve `Pending` (`send_mail`) arma el resumen sólo
+                        // con los argumentos del modelo, y cualquier dato de
+                        // usuario llegó antes por un `Result { data: true }` que
+                        // prendió `user_data`. Una herramienta futura que **lea**
+                        // datos del usuario y devuelva `Pending` en la misma
+                        // llamada tendría que llevar su propio `data` a la
+                        // variante `Pending` para no esquivar esta guarda.
+                        if !user_data {
+                            turn.reply = Some(reply.text.clone());
+                        }
                         return Ok(reply);
                     }
                     ToolStep::Result { content, data } => {
@@ -1058,18 +1076,19 @@ const SYSTEM_PROMPT: &str = "Sos el asistente de VasakOS. Podés usar las herram
     herramientas sólo cuando hagan falta para responder.";
 
 /// La respuesta segura cuando el modelo que respondería resultó no ser local
-/// **antes** de mandar nada: el correo no salió de la máquina.
+/// **antes** de mandar nada: tus datos no salieron de la máquina.
 const UNSAFE_REMOTE: &str =
-    "No pude usar el correo: el modelo que respondería no es local y tus datos no se \
+    "No pude usar tus datos: el modelo que respondería no es local y no se \
      comparten con un proveedor remoto.";
 
 /// La respuesta cuando el modelo resultó no ser local **después** de mandar el
 /// pedido (Ollama reapuntó el nombre en el medio): el contenido —que en un paso
-/// encadenado podía incluir correo— ya pudo haber salido. No afirma que nada
-/// salió de la máquina.
+/// encadenado podía incluir correo o calendario— ya pudo haber salido. No afirma
+/// que nada salió de la máquina.
 const UNSAFE_REMOTE_AFTER_SEND: &str =
-    "No pude usar el correo: el modelo resultó no ser local durante el pedido. Si ya había \
-     contenido de tu correo en la consulta, pudo haber salido hacia ese proveedor; no lo reintento.";
+    "No pude completar el pedido: el modelo resultó no ser local durante el pedido. Si ya había \
+     contenido de tu correo o de tu calendario en la consulta, pudo haber salido hacia ese \
+     proveedor; no lo reintento.";
 
 /// La respuesta segura cuando se agotaron los pasos de herramienta, el
 /// presupuesto de llamadas o el tope de bytes retenidos.

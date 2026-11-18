@@ -8,32 +8,20 @@
 //! el permiso propio, que el servicio comprueba antes de ejecutar la
 //! herramienta.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 use zbus::Connection;
 
+use super::dbus::{
+    bool_arg, call_with_timeout, opt_string_arg, store_alive, store_proxy, string_arg,
+    string_array_arg, CALL_TIMEOUT,
+};
 use super::{Skill, SkillCtx, ToolOutcome, PERMISSION_CALENDAR};
 use crate::backend::{BoxFuture, ToolDef};
 use vasak_assistant_protocol::{Error, DOMAIN_CALENDAR};
 
-// ── Direcciones del bus de cuentas ──────────────────────────────────────────────
-//
-// El almacén local lo sirve el servicio dueño del nombre
-// `ar.net.vasak.os.AccountsSync`, en el objeto `AccountsStore`.
-
-const ACCOUNTS_SERVICE: &str = "ar.net.vasak.os.AccountsSync";
-const STORE_PATH: &str = "/ar/net/vasak/os/AccountsStore";
-const STORE_INTERFACE: &str = "ar.net.vasak.os.AccountsStore";
-
 /// Cuántos eventos o tareas trae una página. El almacén además acota el tamaño
 /// de la respuesta y topea el límite, así que esto es sólo para no pedir de más.
 const PAGE_LIMIT: u32 = 100;
-
-/// Plazo de una lectura o de `GetStatus`: zbus 5 no tiene timeout por método, y
-/// un servicio conectado pero que no responde dejaría la llamada —y el lugar de
-/// conversación del turno— esperando para siempre.
-const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// La habilidad de calendario. Guarda la conexión al bus de sesión para
 /// hablarle al almacén de cuentas; los proxies se arman por llamada, que es
@@ -45,17 +33,6 @@ pub struct CalendarSkill {
 impl CalendarSkill {
     pub fn new(connection: Connection) -> Self {
         Self { connection }
-    }
-
-    async fn store_proxy(&self) -> Result<zbus::Proxy<'_>, Error> {
-        zbus::Proxy::new(
-            &self.connection,
-            ACCOUNTS_SERVICE,
-            STORE_PATH,
-            STORE_INTERFACE,
-        )
-        .await
-        .map_err(backend_error)
     }
 }
 
@@ -143,15 +120,7 @@ impl Skill for CalendarSkill {
     }
 
     fn probe(&self) -> BoxFuture<'_, bool> {
-        Box::pin(async move {
-            // `GetStatus` no abre ningún diálogo ni pide permiso: si contesta,
-            // el almacén está en pie.
-            let Ok(proxy) = self.store_proxy().await else {
-                return false;
-            };
-            let status = proxy.call::<_, _, String>("GetStatus", &());
-            matches!(tokio::time::timeout(CALL_TIMEOUT, status).await, Ok(Ok(_)))
-        })
+        Box::pin(store_alive(&self.connection))
     }
 }
 
@@ -160,7 +129,7 @@ impl CalendarSkill {
         let from = string_arg(args, "from")?;
         let to = string_arg(args, "to")?;
         let calendar_ids = string_array_arg(args, "calendar_ids")?;
-        let proxy = self.store_proxy().await?;
+        let proxy = store_proxy(&self.connection).await?;
         // Sin cursor, la primera página; `calendar_ids` vacío son todos.
         let json: String = call_with_timeout(
             CALL_TIMEOUT,
@@ -176,8 +145,8 @@ impl CalendarSkill {
     async fn read_event(&self, args: &Value) -> Result<ToolOutcome, Error> {
         let event_id = string_arg(args, "event_id")?;
         // `occurrence_id` vacío es "el evento, no una vez puntual".
-        let occurrence_id = opt_string_arg(args, "occurrence_id");
-        let proxy = self.store_proxy().await?;
+        let occurrence_id = opt_string_arg(args, "occurrence_id")?;
+        let proxy = store_proxy(&self.connection).await?;
         let json: String = call_with_timeout(
             CALL_TIMEOUT,
             proxy.call("GetEvent", &(event_id, occurrence_id)),
@@ -188,8 +157,8 @@ impl CalendarSkill {
 
     async fn list_tasks(&self, args: &Value) -> Result<ToolOutcome, Error> {
         let calendar_ids = string_array_arg(args, "calendar_ids")?;
-        let include_completed = bool_arg(args, "include_completed", false);
-        let proxy = self.store_proxy().await?;
+        let include_completed = bool_arg(args, "include_completed", false)?;
+        let proxy = store_proxy(&self.connection).await?;
         let json: String = call_with_timeout(
             CALL_TIMEOUT,
             proxy.call(
@@ -200,65 +169,6 @@ impl CalendarSkill {
         .await?;
         Ok(ToolOutcome::Result(json))
     }
-}
-
-/// Envuelve una llamada D-Bus en un plazo y traduce su error: zbus 5 no tiene
-/// timeout por método. Si se vence, el servicio está conectado pero no
-/// responde, y la llamada no espera para siempre.
-async fn call_with_timeout<T>(
-    timeout: Duration,
-    call: impl std::future::Future<Output = zbus::Result<T>>,
-) -> Result<T, Error> {
-    match tokio::time::timeout(timeout, call).await {
-        Ok(result) => result.map_err(backend_error),
-        Err(_) => Err(Error::Backend(
-            "el servicio de cuentas no respondió a tiempo".into(),
-        )),
-    }
-}
-
-/// El valor de un argumento de texto, o `InvalidArgs` si falta o no es texto.
-fn string_arg(args: &Value, key: &str) -> Result<String, Error> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| Error::InvalidArgs(format!("falta el argumento «{key}»")))
-}
-
-/// El valor de un argumento de texto opcional: vacío si falta o no es texto.
-fn opt_string_arg(args: &Value, key: &str) -> String {
-    args.get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned()
-}
-
-/// Un argumento booleano opcional, con su valor por omisión si falta.
-fn bool_arg(args: &Value, key: &str, default: bool) -> bool {
-    args.get(key).and_then(Value::as_bool).unwrap_or(default)
-}
-
-/// Un argumento de lista de textos opcional: vacío si falta. `InvalidArgs` si
-/// está pero no es una lista, o si tiene un elemento que no es texto.
-fn string_array_arg(args: &Value, key: &str) -> Result<Vec<String>, Error> {
-    match args.get(key) {
-        None | Some(Value::Null) => Ok(Vec::new()),
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|item| {
-                item.as_str().map(str::to_owned).ok_or_else(|| {
-                    Error::InvalidArgs(format!("«{key}» tiene un elemento que no es texto"))
-                })
-            })
-            .collect(),
-        Some(_) => Err(Error::InvalidArgs(format!("«{key}» no es una lista"))),
-    }
-}
-
-/// Un error del bus de cuentas, para la persona, sin filtrar nada delicado del
-/// cable.
-fn backend_error(error: impl std::fmt::Display) -> Error {
-    Error::Backend(format!("el servicio de cuentas no respondió: {error}"))
 }
 
 #[cfg(test)]

@@ -124,12 +124,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // su propia conexión al bus de sesión (la de servir se mueve al object
     // server más abajo). Correo y calendario comparten la conexión.
     let skills_bus = Connection::session().await?;
+    // El almacén de cuentas vive en el bus de **sesión** (es un servicio del
+    // usuario); `vasak-permissions`, en el del **sistema** en producción. El
+    // verificador de permisos necesita ese otro bus: por el de sesión el nombre
+    // no está y toda consulta de permiso fallaría.
+    let permissions_bus = skills::dbus::permission_bus().await?;
     let mail = Arc::new(skills::MailChat {
         skills: skills::SkillRegistry::new(vec![
             Arc::new(skills::mail::MailSkill::new(skills_bus.clone())),
-            Arc::new(skills::calendar::CalendarSkill::new(skills_bus.clone())),
+            Arc::new(skills::calendar::CalendarSkill::new(skills_bus)),
         ]),
-        permission: Arc::new(skills::mail::DbusPermission::new(skills_bus)),
+        permission: Arc::new(skills::mail::DbusPermission::new(permissions_bus)),
         pending: parking_lot::Mutex::new(skills::PendingActions::default()),
         share_mail_with_remote: settings.share_mail_with_remote,
         share_calendar_with_remote: settings.share_calendar_with_remote,

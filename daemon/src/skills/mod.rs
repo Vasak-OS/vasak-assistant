@@ -22,6 +22,7 @@ use crate::backend::{BoxFuture, ToolDef};
 use vasak_assistant_protocol::{Error, PendingAction, DOMAIN_CALENDAR, DOMAIN_MAIL};
 
 pub mod calendar;
+pub mod dbus;
 pub mod mail;
 
 /// El recurso de permiso del correo, el mismo que exige `AccountsStore`.
