@@ -1,7 +1,9 @@
 //! La habilidad de archivos: buscar y leer archivos del usuario dentro de un
-//! **alcance acotado** que la persona elige. **Sólo lectura**: ninguna
-//! herramienta renombra, mueve ni borra nada —eso sería una acción confirmable,
-//! para otra rebanada—.
+//! **alcance acotado** que la persona elige, y moverlos (o renombrarlos) con su
+//! confirmación. **Nunca borra**: `move_file` ni siquiera sobrescribe un destino
+//! que ya existe (eso sería borrar lo que había), y no hay herramienta de borrado.
+//! Mover es una acción con efecto, así que no la ejecuta el modelo: devuelve una
+//! [`ToolOutcome::Pending`] que la persona confirma viendo el origen y el destino.
 //!
 //! A diferencia del correo, el calendario y los contactos, no hay un servicio
 //! que sirva los archivos: Lince lee el filesystem directo, como el usuario. Por
@@ -15,14 +17,14 @@
 //! en `vasak.conf`); por omisión ninguna, así que sin configurar nada la
 //! capacidad se ve no disponible. Nunca todo el disco por defecto.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde_json::{json, Value};
 
 use super::dbus::string_arg;
 use super::{Skill, SkillCtx, ToolOutcome, PERMISSION_FILES};
 use crate::backend::{BoxFuture, ToolDef};
-use vasak_assistant_protocol::{Error, DOMAIN_FILES};
+use vasak_assistant_protocol::{Error, PendingAction, DOMAIN_FILES};
 
 /// Cuántos resultados trae una búsqueda. Acota el tamaño de la respuesta y el
 /// tiempo del recorrido.
@@ -250,6 +252,106 @@ impl FilesSkill {
         .to_string();
         Ok(ToolOutcome::Result(json))
     }
+
+    /// La ruta de destino de un movimiento, si es válida: su **carpeta padre**
+    /// cae dentro del alcance (canónica, resuelve symlinks, fuera de la denylist),
+    /// el último componente es un nombre normal (ni `.`, ni `..`, ni vacío) y el
+    /// destino **todavía no existe**. No se canoniza el destino en sí porque no
+    /// existe aún; se canoniza el padre y se le pega el nombre. Que no exista es
+    /// lo que garantiza que mover nunca borra: `rename` sobrescribiría en
+    /// silencio un archivo que ya estuviera ahí.
+    fn resolve_destination(&self, requested: &str) -> Option<PathBuf> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let dest = expand_tilde(requested, home.as_deref());
+        // El último componente tiene que ser un nombre de archivo normal: así se
+        // descartan `…/`, `…/.` y `…/..`, que no nombran un archivo a crear.
+        let Some(Component::Normal(name)) = dest.components().next_back() else {
+            return None;
+        };
+        let name = name.to_owned();
+        let parent = std::fs::canonicalize(dest.parent()?).ok()?;
+        if under_deny(&parent, &self.deny) {
+            return None;
+        }
+        if !parent.is_dir() || !self.roots.iter().any(|root| parent.starts_with(root)) {
+            return None;
+        }
+        let target = parent.join(&name);
+        // No sobrescribir: cualquier cosa en el destino convertiría el movimiento
+        // en un borrado de lo que había. `symlink_metadata` (lstat, no sigue el
+        // enlace) rechaza también un symlink colgante, que `exists()` —que sí lo
+        // sigue— tomaría por libre y `rename` reemplazaría.
+        if target.symlink_metadata().is_ok() {
+            return None;
+        }
+        Some(target)
+    }
+
+    /// Prepara un movimiento (o renombrado) para confirmar. No mueve nada acá: el
+    /// origen tiene que estar en el alcance y el destino ser válido y libre; si
+    /// todo cuadra, devuelve una acción pendiente cuyo `execute` corre el `rename`
+    /// recién al confirmar.
+    fn move_file(&self, args: &Value, ctx: &SkillCtx) -> Result<ToolOutcome, Error> {
+        let from_raw = string_arg(args, "from")?;
+        let to_raw = string_arg(args, "to")?;
+        let Some(source) = self.within_scope(&from_raw) else {
+            return Err(Error::InvalidArgs(
+                "el origen está fuera de las carpetas que Lince puede tocar".into(),
+            ));
+        };
+        // Sólo archivos: mover una carpeta arrastraría todo su árbol (incluso una
+        // raíz configurada), que no es lo que ofrece la herramienta.
+        if !source.is_file() {
+            return Err(Error::InvalidArgs(
+                "el origen no es un archivo: mover sólo mueve archivos".into(),
+            ));
+        }
+        let Some(target) = self.resolve_destination(&to_raw) else {
+            return Err(Error::InvalidArgs(
+                "el destino no sirve: tiene que estar dentro del alcance, nombrar un archivo \
+                 nuevo y no existir ya (mover nunca sobrescribe)"
+                    .into(),
+            ));
+        };
+        if source == target {
+            return Err(Error::InvalidArgs(
+                "el origen y el destino son el mismo archivo".into(),
+            ));
+        }
+        let action = PendingAction {
+            id: uuid::Uuid::new_v4().to_string(),
+            conversation_id: ctx.conversation_id.clone(),
+            kind: "move_file".into(),
+            summary: format!(
+                "Mover «{}» a «{}»",
+                source.to_string_lossy(),
+                target.to_string_lossy()
+            ),
+            // Campos de correo: vacíos para una acción de archivos. El resumen lo
+            // dice todo; la vista de confirmación rica es otra rebanada.
+            to: String::new(),
+            subject: String::new(),
+            body_preview: String::new(),
+        };
+        let execute = Box::new(move || -> BoxFuture<'static, Result<(), Error>> {
+            Box::pin(async move {
+                // Se revalida que el destino siga libre: entre proponer y
+                // confirmar (hasta el TTL) pudo aparecer algo ahí, y `rename` lo
+                // pisaría —un borrado silencioso—. Queda una ventana TOCTOU mínima
+                // hasta el `rename`; igual que la lectura, no es una frontera
+                // (Lince corre como el usuario). `rename` entre discos distintos
+                // falla con EXDEV y se informa; no se copia-y-borra.
+                if target.symlink_metadata().is_ok() {
+                    return Err(Error::Backend(
+                        "ya existe algo en el destino: no se mueve para no sobrescribirlo".into(),
+                    ));
+                }
+                std::fs::rename(&source, &target)
+                    .map_err(|e| Error::Backend(format!("no se pudo mover: {e}")))
+            })
+        });
+        Ok(ToolOutcome::Pending { action, execute })
+    }
 }
 
 impl Skill for FilesSkill {
@@ -289,6 +391,22 @@ impl Skill for FilesSkill {
                     "required": ["path"]
                 }),
             },
+            ToolDef {
+                name: "move_file".into(),
+                description: "Mueve o renombra un archivo dentro de las carpetas que la persona \
+                              dejó ver. No lo mueve: la persona lo confirma antes. El destino es \
+                              la ruta nueva completa (con el nombre del archivo) y no puede existir \
+                              ya; nunca sobrescribe ni borra."
+                    .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "from": {"type": "string", "description": "La ruta actual del archivo, como la devuelve search_files."},
+                        "to": {"type": "string", "description": "La ruta nueva completa, incluido el nombre del archivo. No puede existir todavía."}
+                    },
+                    "required": ["from", "to"]
+                }),
+            },
         ]
     }
 
@@ -296,12 +414,13 @@ impl Skill for FilesSkill {
         &'a self,
         name: &'a str,
         args: &'a Value,
-        _ctx: &'a SkillCtx,
+        ctx: &'a SkillCtx,
     ) -> BoxFuture<'a, Result<ToolOutcome, Error>> {
         Box::pin(async move {
             match name {
                 "search_files" => self.search_files(args),
                 "read_file" => self.read_file(args),
+                "move_file" => self.move_file(args, ctx),
                 other => Err(Error::InvalidArgs(format!(
                     "los archivos no tienen una herramienta «{other}»"
                 ))),
