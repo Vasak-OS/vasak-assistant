@@ -101,27 +101,10 @@ impl FilesSkill {
         Self { roots, deny }
     }
 
-    /// La ruta canónica de `requested` si cae dentro de una raíz permitida y no
-    /// bajo la denylist; `None` si escapa el alcance. Canoniza antes de decidir,
-    /// así que un symlink que apunta afuera se resuelve y se rechaza.
-    ///
-    /// Queda una ventana TOCTOU entre canonizar y abrir (otro proceso podría
-    /// intercambiar un componente por un symlink). No es un vector acá: el modelo
-    /// sólo busca y lee, no crea symlinks, y un proceso del propio usuario que sí
-    /// podría ya lee esos archivos igual (Lince corre como el usuario, sin
-    /// confinar). Si esta ruta llegara a quedar expuesta a un confinado, el
-    /// endurecimiento sería `openat2(RESOLVE_BENEATH)`.
+    /// La ruta canónica de `requested` dentro del alcance (ver la función libre
+    /// [`within_scope`]).
     fn within_scope(&self, requested: &str) -> Option<PathBuf> {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let expanded = expand_tilde(requested, home.as_deref());
-        let canonical = std::fs::canonicalize(expanded).ok()?;
-        if under_deny(&canonical, &self.deny) {
-            return None;
-        }
-        self.roots
-            .iter()
-            .any(|root| canonical.starts_with(root))
-            .then_some(canonical)
+        within_scope(&self.roots, &self.deny, requested)
     }
 
     fn search_files(&self, args: &Value) -> Result<ToolOutcome, Error> {
@@ -253,44 +236,16 @@ impl FilesSkill {
         Ok(ToolOutcome::Result(json))
     }
 
-    /// La ruta de destino de un movimiento, si es válida: su **carpeta padre**
-    /// cae dentro del alcance (canónica, resuelve symlinks, fuera de la denylist),
-    /// el último componente es un nombre normal (ni `.`, ni `..`, ni vacío) y el
-    /// destino **todavía no existe**. No se canoniza el destino en sí porque no
-    /// existe aún; se canoniza el padre y se le pega el nombre. Que no exista es
-    /// lo que garantiza que mover nunca borra: `rename` sobrescribiría en
-    /// silencio un archivo que ya estuviera ahí.
+    /// La ruta de destino de un movimiento, si es válida (ver la función libre
+    /// [`resolve_destination`]).
     fn resolve_destination(&self, requested: &str) -> Option<PathBuf> {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let dest = expand_tilde(requested, home.as_deref());
-        // El último componente tiene que ser un nombre de archivo normal: así se
-        // descartan `…/`, `…/.` y `…/..`, que no nombran un archivo a crear.
-        let Some(Component::Normal(name)) = dest.components().next_back() else {
-            return None;
-        };
-        let name = name.to_owned();
-        let parent = std::fs::canonicalize(dest.parent()?).ok()?;
-        if under_deny(&parent, &self.deny) {
-            return None;
-        }
-        if !parent.is_dir() || !self.roots.iter().any(|root| parent.starts_with(root)) {
-            return None;
-        }
-        let target = parent.join(&name);
-        // No sobrescribir: cualquier cosa en el destino convertiría el movimiento
-        // en un borrado de lo que había. `symlink_metadata` (lstat, no sigue el
-        // enlace) rechaza también un symlink colgante, que `exists()` —que sí lo
-        // sigue— tomaría por libre y `rename` reemplazaría.
-        if target.symlink_metadata().is_ok() {
-            return None;
-        }
-        Some(target)
+        resolve_destination(&self.roots, &self.deny, requested)
     }
 
     /// Prepara un movimiento (o renombrado) para confirmar. No mueve nada acá: el
-    /// origen tiene que estar en el alcance y el destino ser válido y libre; si
-    /// todo cuadra, devuelve una acción pendiente cuyo `execute` corre el `rename`
-    /// recién al confirmar.
+    /// origen tiene que estar en el alcance y ser un archivo, y el destino ser
+    /// válido y libre; si todo cuadra, devuelve una acción pendiente cuyo `execute`
+    /// corre el `rename` recién al confirmar.
     fn move_file(&self, args: &Value, ctx: &SkillCtx) -> Result<ToolOutcome, Error> {
         let from_raw = string_arg(args, "from")?;
         let to_raw = string_arg(args, "to")?;
@@ -333,21 +288,41 @@ impl FilesSkill {
             subject: String::new(),
             body_preview: String::new(),
         };
+        // El `execute` no se queda con las rutas canónicas de recién: las vuelve a
+        // resolver desde las crudas al confirmar. Entre proponer y confirmar (hasta
+        // el TTL) un componente del camino pudo cambiar —p. ej. un ancestro
+        // reemplazado por un symlink que apunta afuera—; revalidar desde cero
+        // rechaza un origen o un destino que se salió del alcance en vez de mover
+        // afuera. Clona lo que la resolución necesita.
+        let roots = self.roots.clone();
+        let deny = self.deny.clone();
         let execute = Box::new(move || -> BoxFuture<'static, Result<(), Error>> {
             Box::pin(async move {
-                // Se revalida que el destino siga libre: entre proponer y
-                // confirmar (hasta el TTL) pudo aparecer algo ahí, y `rename` lo
-                // pisaría —un borrado silencioso—. Queda una ventana TOCTOU mínima
-                // hasta el `rename`; igual que la lectura, no es una frontera
-                // (Lince corre como el usuario). `rename` entre discos distintos
-                // falla con EXDEV y se informa; no se copia-y-borra.
-                if target.symlink_metadata().is_ok() {
-                    return Err(Error::Backend(
-                        "ya existe algo en el destino: no se mueve para no sobrescribirlo".into(),
-                    ));
-                }
-                std::fs::rename(&source, &target)
-                    .map_err(|e| Error::Backend(format!("no se pudo mover: {e}")))
+                // La parte de filesystem es bloqueante; va a un hilo de bloqueo
+                // para no trabar el runtime.
+                tokio::task::spawn_blocking(move || {
+                    let Some(source) = within_scope(&roots, &deny, &from_raw) else {
+                        return Err(Error::InvalidArgs(
+                            "el origen ya no está dentro del alcance".into(),
+                        ));
+                    };
+                    if !source.is_file() {
+                        return Err(Error::InvalidArgs("el origen ya no es un archivo".into()));
+                    }
+                    let Some(target) = resolve_destination(&roots, &deny, &to_raw) else {
+                        return Err(Error::InvalidArgs(
+                            "el destino ya no sirve: apareció algo ahí o salió del alcance".into(),
+                        ));
+                    };
+                    if source == target {
+                        return Err(Error::InvalidArgs(
+                            "el origen y el destino son el mismo archivo".into(),
+                        ));
+                    }
+                    rename_no_replace(&source, &target)
+                })
+                .await
+                .map_err(|e| Error::Backend(format!("no se pudo mover: {e}")))?
             })
         });
         Ok(ToolOutcome::Pending { action, execute })
@@ -437,6 +412,97 @@ impl Skill for FilesSkill {
             .any(|root| std::fs::read_dir(root).is_ok());
         Box::pin(async move { alive })
     }
+}
+
+/// La ruta canónica de `requested` si cae dentro de una raíz permitida y no bajo
+/// la denylist; `None` si escapa el alcance. Canoniza antes de decidir, así que un
+/// symlink que apunta afuera se resuelve y se rechaza.
+///
+/// Queda una ventana TOCTOU entre canonizar y abrir/mover (otro proceso podría
+/// intercambiar un componente por un symlink). No es un vector acá: el modelo sólo
+/// busca, lee y mueve dentro del alcance, y un proceso del propio usuario que sí
+/// podría ya toca esos archivos igual (Lince corre como el usuario, sin confinar).
+/// Por eso `move_file` revalida con esta misma función **en el momento de mover**:
+/// la contención se resuelve justo antes de la operación, no al proponerla. Si
+/// esta ruta llegara a quedar expuesta a un confinado, el endurecimiento sería
+/// `openat2(RESOLVE_BENEATH)`.
+fn within_scope(roots: &[PathBuf], deny: &[PathBuf], requested: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let expanded = expand_tilde(requested, home.as_deref());
+    let canonical = std::fs::canonicalize(expanded).ok()?;
+    if under_deny(&canonical, deny) {
+        return None;
+    }
+    roots
+        .iter()
+        .any(|root| canonical.starts_with(root))
+        .then_some(canonical)
+}
+
+/// La ruta de destino de un movimiento, si es válida: su **carpeta padre** cae
+/// dentro del alcance (canónica, resuelve symlinks, fuera de la denylist), el
+/// último componente es un nombre normal (ni `.`, ni `..`, ni vacío) y el destino
+/// **todavía no existe**. No se canoniza el destino en sí porque no existe aún; se
+/// canoniza el padre y se le pega el nombre. Que no exista es parte de que mover
+/// nunca borra; la otra parte es el `RENAME_NOREPLACE` atómico al mover.
+fn resolve_destination(roots: &[PathBuf], deny: &[PathBuf], requested: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let dest = expand_tilde(requested, home.as_deref());
+    // El último componente tiene que ser un nombre de archivo normal: así se
+    // descartan `…/`, `…/.` y `…/..`, que no nombran un archivo a crear.
+    let Some(Component::Normal(name)) = dest.components().next_back() else {
+        return None;
+    };
+    let name = name.to_owned();
+    let parent = std::fs::canonicalize(dest.parent()?).ok()?;
+    if under_deny(&parent, deny) {
+        return None;
+    }
+    if !parent.is_dir() || !roots.iter().any(|root| parent.starts_with(root)) {
+        return None;
+    }
+    let target = parent.join(&name);
+    // No sobrescribir: cualquier cosa en el destino convertiría el movimiento en un
+    // borrado de lo que había. `symlink_metadata` (lstat, no sigue el enlace)
+    // rechaza también un symlink colgante, que `exists()` —que sí lo sigue— tomaría
+    // por libre. Es un pre-chequeo; la garantía dura la da `RENAME_NOREPLACE`.
+    if target.symlink_metadata().is_ok() {
+        return None;
+    }
+    Some(target)
+}
+
+/// Mueve `source` a `target` **sin pisar** nada: `renameat2` con
+/// `RENAME_NOREPLACE` falla con `EEXIST` si el destino apareció entre el chequeo y
+/// el movimiento, en vez de reemplazarlo (lo que `std::fs::rename` sí haría). Así
+/// un archivo que aparece en el destino en plena carrera no se borra. `rename`
+/// entre discos distintos falla con `EXDEV` y se informa; no se copia-y-borra.
+fn rename_no_replace(source: &Path, target: &Path) -> Result<(), Error> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let src = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| Error::InvalidArgs("la ruta de origen tiene un NUL".into()))?;
+    let dst = CString::new(target.as_os_str().as_bytes())
+        .map_err(|_| Error::InvalidArgs("la ruta de destino tiene un NUL".into()))?;
+    let rc = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            src.as_ptr(),
+            libc::AT_FDCWD,
+            dst.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EEXIST) {
+        return Err(Error::Backend(
+            "ya existe algo en el destino: no se mueve para no sobrescribirlo".into(),
+        ));
+    }
+    Err(Error::Backend(format!("no se pudo mover: {err}")))
 }
 
 /// Si `canonical` (una ruta ya canonizada) cae bajo una entrada de la denylist.
