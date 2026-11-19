@@ -934,10 +934,16 @@ impl AssistantService {
     /// correo pudo haber salido—.
     pub async fn confirm_pending(&self, owner: &str, action_id: &str) -> Result<String, Error> {
         let entry = self.mail.pending.lock().take(action_id, owner)?;
+        let kind = entry.kind.clone();
         (entry.execute)().await?;
-        // `AccountsSync.SendMessage` vuelve al aceptar el draft en la cola, no
-        // al entregarlo: se informa eso, no «Enviado».
-        Ok(QUEUED_FOR_SEND.to_owned())
+        // El mensaje de cierre depende de la acción: `AccountsSync.SendMessage`
+        // vuelve al aceptar el draft en la cola, no al entregarlo (se informa eso,
+        // no «Enviado»); un movimiento ya ocurrió cuando el `rename` volvió bien.
+        Ok(match kind.as_str() {
+            "move_file" => MOVED_FILE,
+            _ => QUEUED_FOR_SEND,
+        }
+        .to_owned())
     }
 
     /// Descarta una acción pendiente sin ejecutarla.
@@ -1086,7 +1092,9 @@ impl Drop for Turn<'_> {
 const SYSTEM_PROMPT: &str = "Sos el asistente de VasakOS. Podés usar las herramientas de \
     correo para buscar y leer mensajes, y para preparar envíos. «send_mail» sólo prepara \
     el correo: nunca se manda sin que la persona lo confirme. También tenés herramientas \
-    de calendario de sólo lectura para listar y leer eventos y tareas. Usá las \
+    de calendario de sólo lectura para listar y leer eventos y tareas. Con los \
+    archivos podés buscar y leer, y mover o renombrar: «move_file» sólo prepara el \
+    movimiento, nunca mueve ni sobrescribe sin que la persona lo confirme. Usá las \
     herramientas sólo cuando hagan falta para responder.";
 
 /// La respuesta segura cuando el modelo que respondería resultó no ser local
@@ -1112,6 +1120,7 @@ const TOO_MANY_STEPS: &str = "No pude completar la tarea en los pasos disponible
 /// Lo que informa una confirmación: `AccountsSync` acepta el draft en la cola,
 /// no confirma la entrega real.
 const QUEUED_FOR_SEND: &str = "Puesto en cola para enviar";
+const MOVED_FILE: &str = "Archivo movido";
 
 /// Cuántas llamadas a herramienta puede ejecutar un turno en total, sumadas
 /// sobre todas las respuestas del modelo. [`MAX_TOOL_ITERATIONS`] sólo acota

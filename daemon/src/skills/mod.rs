@@ -174,6 +174,9 @@ impl PermissionCheck for DenyPermission {
 pub struct PendingEntry {
     pub owner: String,
     pub conversation_id: String,
+    /// La clase de acción (`send_mail`, `move_file`), para informar al confirmar
+    /// qué pasó: un movimiento no se anuncia como un correo encolado.
+    pub kind: String,
     pub execute: SendAction,
     created: Instant,
 }
@@ -207,11 +210,13 @@ impl PendingActions {
         self.purge_expired();
         self.by_id
             .retain(|_, entry| !(entry.owner == owner && entry.conversation_id == conversation_id));
+        let kind = action.kind.clone();
         self.by_id.insert(
             action.id,
             PendingEntry {
                 owner: owner.to_owned(),
                 conversation_id: conversation_id.to_owned(),
+                kind,
                 execute,
                 created: Instant::now(),
             },
