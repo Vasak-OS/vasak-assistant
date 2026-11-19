@@ -694,6 +694,36 @@ async fn confirmar_la_accion_envia_recien_ahi() {
     assert_eq!(r.skill.sent.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn confirmar_un_movimiento_informa_que_el_archivo_se_movio() {
+    let r = rig(vec![], true);
+    let moved = Arc::new(AtomicUsize::new(0));
+    let counter = moved.clone();
+    let action = PendingAction {
+        id: "mover-1".into(),
+        conversation_id: r.conversation.clone(),
+        kind: "move_file".into(),
+        summary: "Mover «a» a «b»".into(),
+        to: String::new(),
+        subject: String::new(),
+        body_preview: String::new(),
+    };
+    let execute: SendAction = Box::new(move || {
+        Box::pin(async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    });
+    r.service
+        .mail
+        .pending
+        .lock()
+        .insert(OWNER, &r.conversation, action, execute);
+    let result = r.service.confirm_pending(OWNER, "mover-1").await.unwrap();
+    assert_eq!(result, "Archivo movido");
+    assert_eq!(moved.load(Ordering::SeqCst), 1);
+}
+
 // ── 4. Anti-doble-envío ─────────────────────────────────────────────────────────
 
 #[tokio::test]

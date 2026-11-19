@@ -432,14 +432,192 @@ async fn los_argumentos_que_faltan_o_una_herramienta_desconocida_son_invalidos()
 }
 
 #[test]
-fn la_habilidad_ofrece_solo_dos_herramientas_de_lectura_en_su_dominio() {
+fn la_habilidad_ofrece_lectura_y_mover_pero_nunca_borrar_en_su_dominio() {
     let t = tree();
     let skill = skill(&t.root);
     let names: Vec<String> = skill.tools().into_iter().map(|t| t.name).collect();
-    assert_eq!(names, ["search_files", "read_file"]);
+    assert_eq!(names, ["search_files", "read_file", "move_file"]);
     assert_eq!(skill.domain(), DOMAIN_FILES);
     assert_eq!(skill.permission(), PERMISSION_FILES);
     assert_eq!(PERMISSION_FILES, "files");
+}
+
+// ── move_file ───────────────────────────────────────────────────────────────────
+
+/// Llama a `move_file` y devuelve el resultado crudo (puede ser `Pending`).
+async fn propose_move(skill: &FilesSkill, from: &Path, to: &Path) -> Result<ToolOutcome, Error> {
+    skill
+        .call(
+            "move_file",
+            &json!({ "from": from.to_str().unwrap(), "to": to.to_str().unwrap() }),
+            &ctx(),
+        )
+        .await
+}
+
+fn pending(
+    outcome: Result<ToolOutcome, Error>,
+) -> (
+    vasak_assistant_protocol::PendingAction,
+    crate::skills::SendAction,
+) {
+    match outcome.expect("move_file debía proponer una acción") {
+        ToolOutcome::Pending { action, execute } => (action, execute),
+        ToolOutcome::Result(_) => panic!("move_file no debe devolver un resultado directo"),
+    }
+}
+
+fn is_rejected(outcome: Result<ToolOutcome, Error>) -> bool {
+    matches!(outcome, Err(Error::InvalidArgs(_)))
+}
+
+/// Control de que `move_file` existe y propone un movimiento válido con esta
+/// habilidad: sin él, un rechazo podría ser sólo «herramienta desconocida».
+async fn assert_move_works(skill: &FilesSkill, t: &Tree) {
+    let from = t.write("root/control-origen.txt", "c");
+    let to = t.root.join("control-destino.txt");
+    pending(propose_move(skill, &from, &to).await);
+}
+
+#[test]
+fn move_file_figura_entre_las_herramientas() {
+    let t = tree();
+    let names: Vec<String> = skill(&t.root).tools().into_iter().map(|d| d.name).collect();
+    assert!(names.contains(&"move_file".to_owned()), "{names:?}");
+}
+
+#[tokio::test]
+async fn mover_propone_una_accion_y_recien_al_confirmar_mueve_el_archivo() {
+    let t = tree();
+    let from = t.write("root/a.txt", "contenido");
+    let to = t.root.join("sub/b.txt");
+    std::fs::create_dir_all(t.root.join("sub")).unwrap();
+    let (action, execute) = pending(propose_move(&skill(&t.root), &from, &to).await);
+    assert_eq!(action.kind, "move_file");
+    assert!(
+        action.summary.contains(from.to_str().unwrap()),
+        "{}",
+        action.summary
+    );
+    assert!(
+        action.summary.contains(to.to_str().unwrap()),
+        "{}",
+        action.summary
+    );
+    // Proponer no mueve nada.
+    assert!(from.exists() && !to.exists());
+    execute().await.unwrap();
+    assert!(!from.exists());
+    assert_eq!(std::fs::read_to_string(&to).unwrap(), "contenido");
+}
+
+#[tokio::test]
+async fn mover_rechaza_un_origen_fuera_del_alcance() {
+    let t = tree();
+    assert_move_works(&skill(&t.root), &t).await;
+    let from = t.write("outside/a.txt", "x");
+    let to = t.root.join("b.txt");
+    assert!(is_rejected(propose_move(&skill(&t.root), &from, &to).await));
+    assert!(from.exists() && !to.exists());
+}
+
+#[tokio::test]
+async fn mover_rechaza_un_destino_cuyo_padre_esta_fuera_del_alcance() {
+    let t = tree();
+    assert_move_works(&skill(&t.root), &t).await;
+    let from = t.write("root/a.txt", "x");
+    let to = t.outside.join("b.txt");
+    assert!(is_rejected(propose_move(&skill(&t.root), &from, &to).await));
+}
+
+#[tokio::test]
+async fn mover_nunca_sobrescribe_un_destino_que_ya_existe() {
+    let t = tree();
+    assert_move_works(&skill(&t.root), &t).await;
+    let from = t.write("root/a.txt", "origen");
+    let to = t.write("root/b.txt", "no me pises");
+    assert!(is_rejected(propose_move(&skill(&t.root), &from, &to).await));
+    assert_eq!(std::fs::read_to_string(&to).unwrap(), "no me pises");
+    assert_eq!(std::fs::read_to_string(&from).unwrap(), "origen");
+}
+
+#[tokio::test]
+async fn mover_rechaza_un_destino_bajo_la_denylist() {
+    let t = tree();
+    let from = t.write("root/a.txt", "x");
+    t.write("root/.ssh/id", "llave");
+    let to = t.root.join(".ssh/a.txt");
+    let skill = FilesSkill {
+        roots: vec![t.root.clone()],
+        deny: vec![t.root.join(".ssh")],
+    };
+    assert_move_works(&skill, &t).await;
+    assert!(is_rejected(propose_move(&skill, &from, &to).await));
+    assert!(!to.exists());
+}
+
+#[tokio::test]
+async fn mover_rechaza_un_destino_cuyo_ultimo_componente_no_es_un_nombre() {
+    let t = tree();
+    assert_move_works(&skill(&t.root), &t).await;
+    let from = t.write("root/a.txt", "x");
+    std::fs::create_dir_all(t.root.join("sub")).unwrap();
+    for bad in ["root/sub/..", "root/sub/."] {
+        let to = t._tmp.path().join(bad);
+        assert!(
+            is_rejected(propose_move(&skill(&t.root), &from, &to).await),
+            "{bad}"
+        );
+    }
+    assert!(from.exists());
+}
+
+#[tokio::test]
+async fn mover_rechaza_origen_y_destino_iguales() {
+    let t = tree();
+    assert_move_works(&skill(&t.root), &t).await;
+    let from = t.write("root/a.txt", "x");
+    assert!(is_rejected(
+        propose_move(&skill(&t.root), &from, &from).await
+    ));
+    assert_eq!(std::fs::read_to_string(&from).unwrap(), "x");
+}
+
+#[tokio::test]
+async fn al_confirmar_se_revalida_el_destino_y_no_se_pisa_lo_que_aparecio() {
+    let t = tree();
+    let from = t.write("root/a.txt", "origen");
+    let to = t.root.join("b.txt");
+    let (_, execute) = pending(propose_move(&skill(&t.root), &from, &to).await);
+    // Entre proponer y confirmar aparece algo en el destino.
+    std::fs::write(&to, "llegó después").unwrap();
+    assert!(execute().await.is_err());
+    assert_eq!(std::fs::read_to_string(&from).unwrap(), "origen");
+    assert_eq!(std::fs::read_to_string(&to).unwrap(), "llegó después");
+}
+
+#[tokio::test]
+async fn mover_rechaza_un_destino_que_es_un_symlink_colgante_y_no_lo_reemplaza() {
+    let t = tree();
+    assert_move_works(&skill(&t.root), &t).await;
+    let from = t.write("root/a.txt", "origen");
+    let to = t.root.join("roto");
+    std::os::unix::fs::symlink(t.root.join("no-existe"), &to).unwrap();
+    assert!(is_rejected(propose_move(&skill(&t.root), &from, &to).await));
+    // El enlace sigue ahí, sin tocar, y el origen también.
+    assert!(to.symlink_metadata().unwrap().file_type().is_symlink());
+    assert_eq!(std::fs::read_to_string(&from).unwrap(), "origen");
+}
+
+#[tokio::test]
+async fn mover_rechaza_un_origen_que_es_una_carpeta() {
+    let t = tree();
+    assert_move_works(&skill(&t.root), &t).await;
+    let dir = t.root.join("carpeta");
+    std::fs::create_dir_all(&dir).unwrap();
+    let to = t.root.join("otra");
+    assert!(is_rejected(propose_move(&skill(&t.root), &dir, &to).await));
+    assert!(dir.is_dir() && !to.exists());
 }
 
 // ── new y probe ─────────────────────────────────────────────────────────────────
