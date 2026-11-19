@@ -620,6 +620,22 @@ async fn mover_rechaza_un_origen_que_es_una_carpeta() {
     assert!(dir.is_dir() && !to.exists());
 }
 
+#[tokio::test]
+async fn al_confirmar_se_revalida_el_origen_y_si_desaparecio_no_se_crea_el_destino() {
+    let t = tree();
+    let from = t.write("root/a.txt", "origen");
+    let to = t.root.join("b.txt");
+    let (_, execute) = pending(propose_move(&skill(&t.root), &from, &to).await);
+    // Entre proponer y confirmar el origen desaparece.
+    std::fs::remove_file(&from).unwrap();
+    let err = execute().await.unwrap_err();
+    assert!(
+        matches!(&err, Error::InvalidArgs(m) if m == "el origen ya no está dentro del alcance"),
+        "{err:?}"
+    );
+    assert!(!to.exists());
+}
+
 // ── new y probe ─────────────────────────────────────────────────────────────────
 
 /// Serializa las pruebas que cambian `HOME` (es global del proceso).
