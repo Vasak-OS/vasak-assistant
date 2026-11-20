@@ -99,16 +99,14 @@ impl Skill for CalendarSkill {
                 "Prepara un evento nuevo en un calendario. No lo crea: la persona lo confirma \
                  antes. El calendario se nombra con «account_id» y «calendar_id», de \
                  list_calendars (uno que admita VEVENT).",
-                json!({
-                    "account_id": {"type": "string", "description": "La cuenta del calendario, de list_calendars."},
-                    "calendar_id": {"type": "string", "description": "El id del calendario, de list_calendars."},
+                calendar_props(json!({
                     "summary": {"type": "string", "description": "El título del evento."},
                     "start": {"type": "string", "description": "El comienzo. Con hora, una marca RFC 3339 en UTC («2026-01-01T09:00:00Z»); de día entero, una fecha «2026-01-01» con «all_day» en true."},
                     "end": {"type": "string", "description": "El fin, en el mismo formato que «start»."},
                     "all_day": {"type": "boolean", "description": "Si es un evento de día entero (fechas sin hora)."},
                     "description": {"type": "string", "description": "El detalle del evento; opcional."},
                     "location": {"type": "string", "description": "El lugar; opcional."}
-                }),
+                })),
                 &["account_id", "calendar_id", "summary", "start", "end"],
             ),
             tool(
@@ -116,16 +114,14 @@ impl Skill for CalendarSkill {
                 "Prepara una tarea nueva en un calendario. No la crea: la persona la confirma \
                  antes. El calendario se nombra con «account_id» y «calendar_id», de \
                  list_calendars (uno que admita VTODO).",
-                json!({
-                    "account_id": {"type": "string", "description": "La cuenta del calendario, de list_calendars."},
-                    "calendar_id": {"type": "string", "description": "El id del calendario, de list_calendars."},
+                calendar_props(json!({
                     "summary": {"type": "string", "description": "El título de la tarea."},
                     "description": {"type": "string", "description": "El detalle de la tarea; opcional."},
                     "due": {"type": "string", "description": "El vencimiento; opcional. Con hora, una marca RFC 3339 en UTC («2026-01-01T09:00:00Z»); de día entero, una fecha «2026-01-01» con «all_day» en true."},
                     "all_day": {"type": "boolean", "description": "Si el vencimiento es una fecha sin hora."},
                     "status": {"type": "string", "description": "Estado; opcional: NEEDS-ACTION, IN-PROCESS, COMPLETED o CANCELLED."},
                     "priority": {"type": "integer", "description": "Prioridad 0–9; opcional (0 es sin prioridad)."}
-                }),
+                })),
                 &["account_id", "calendar_id", "summary"],
             ),
         ]
@@ -301,6 +297,22 @@ impl CalendarSkill {
         );
         Ok(ToolOutcome::Pending { action, execute })
     }
+}
+
+/// Las propiedades de una herramienta que crea en un calendario: la cuenta y el
+/// calendario (comunes a `create_event` y `create_task`) más las propias de
+/// `extra`. Evita repetir el esquema de `account_id`/`calendar_id` en cada una.
+fn calendar_props(extra: Value) -> Value {
+    let mut props = json!({
+        "account_id": {"type": "string", "description": "La cuenta del calendario, de list_calendars."},
+        "calendar_id": {"type": "string", "description": "El id del calendario, de list_calendars."}
+    });
+    if let (Some(base), Some(more)) = (props.as_object_mut(), extra.as_object()) {
+        for (key, value) in more {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+    props
 }
 
 /// Los estados que acepta una tarea (`VTODO`), tal como los nombra el contrato de
