@@ -15,7 +15,7 @@ use super::dbus::{
     bool_arg, call_with_timeout, opt_string_arg, store_alive, store_create, store_proxy,
     string_arg, string_array_arg, CALL_TIMEOUT,
 };
-use super::{Skill, SkillCtx, ToolOutcome, PERMISSION_CALENDAR};
+use super::{tool, Skill, SkillCtx, ToolOutcome, PERMISSION_CALENDAR};
 use crate::backend::{BoxFuture, ToolDef};
 use vasak_assistant_protocol::{Error, PendingAction, DOMAIN_CALENDAR};
 
@@ -47,87 +47,70 @@ impl Skill for CalendarSkill {
 
     fn tools(&self) -> Vec<ToolDef> {
         vec![
-            ToolDef {
-                name: "list_calendars".into(),
-                description: "Lista los calendarios de todas las cuentas. Devuelve cada uno con \
-                              su id, la cuenta («account_id»), el nombre y qué objetos admite \
-                              («components»: VEVENT para eventos, VTODO para tareas). El id y la \
-                              cuenta son los que toma «create_event»."
-                    .into(),
-                parameters: json!({ "type": "object", "properties": {} }),
-            },
-            ToolDef {
-                name: "list_events".into(),
-                description: "Lista las veces de los eventos del calendario en un rango de \
-                              fechas. Devuelve metadatos (título, comienzo, fin, calendario, \
-                              id del evento y de la vez)."
-                    .into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "from": {"type": "string", "description": "El comienzo del rango, en ISO-8601 (RFC 3339)."},
-                        "to": {"type": "string", "description": "El fin del rango, en ISO-8601 (RFC 3339)."},
-                        "calendar_ids": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Los calendarios a mirar; vacío u omitido, todos."
-                        }
-                    },
-                    "required": ["from", "to"]
-                }),
-            },
-            ToolDef {
-                name: "read_event".into(),
-                description: "Lee un evento entero por su id. Con «occurrence_id» lee esa vez \
-                              puntual; sin él, el evento."
-                    .into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "event_id": {"type": "string", "description": "El id del evento."},
-                        "occurrence_id": {"type": "string", "description": "La vez puntual; omitido, el evento."}
-                    },
-                    "required": ["event_id"]
-                }),
-            },
-            ToolDef {
-                name: "list_tasks".into(),
-                description: "Lista las tareas del calendario, por vencimiento. Sin las hechas \
-                              salvo con «include_completed»."
-                    .into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "calendar_ids": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Los calendarios a mirar; vacío u omitido, todos."
-                        },
-                        "include_completed": {"type": "boolean", "description": "Incluir las tareas ya hechas."}
+            tool(
+                "list_calendars",
+                "Lista los calendarios de todas las cuentas. Devuelve cada uno con su id, la \
+                 cuenta («account_id»), el nombre y qué objetos admite («components»: VEVENT para \
+                 eventos, VTODO para tareas). El id y la cuenta son los que toma «create_event».",
+                json!({}),
+                &[],
+            ),
+            tool(
+                "list_events",
+                "Lista las veces de los eventos del calendario en un rango de fechas. Devuelve \
+                 metadatos (título, comienzo, fin, calendario, id del evento y de la vez).",
+                json!({
+                    "from": {"type": "string", "description": "El comienzo del rango, en ISO-8601 (RFC 3339)."},
+                    "to": {"type": "string", "description": "El fin del rango, en ISO-8601 (RFC 3339)."},
+                    "calendar_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Los calendarios a mirar; vacío u omitido, todos."
                     }
                 }),
-            },
-            ToolDef {
-                name: "create_event".into(),
-                description: "Prepara un evento nuevo en un calendario. No lo crea: la persona lo \
-                              confirma antes. El calendario se nombra con «account_id» y \
-                              «calendar_id», de list_calendars (uno que admita VEVENT)."
-                    .into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "account_id": {"type": "string", "description": "La cuenta del calendario, de list_calendars."},
-                        "calendar_id": {"type": "string", "description": "El id del calendario, de list_calendars."},
-                        "summary": {"type": "string", "description": "El título del evento."},
-                        "start": {"type": "string", "description": "El comienzo. Con hora, una marca RFC 3339 en UTC («2026-01-01T09:00:00Z»); de día entero, una fecha «2026-01-01» con «all_day» en true."},
-                        "end": {"type": "string", "description": "El fin, en el mismo formato que «start»."},
-                        "all_day": {"type": "boolean", "description": "Si es un evento de día entero (fechas sin hora)."},
-                        "description": {"type": "string", "description": "El detalle del evento; opcional."},
-                        "location": {"type": "string", "description": "El lugar; opcional."}
-                    },
-                    "required": ["account_id", "calendar_id", "summary", "start", "end"]
+                &["from", "to"],
+            ),
+            tool(
+                "read_event",
+                "Lee un evento entero por su id. Con «occurrence_id» lee esa vez puntual; sin él, \
+                 el evento.",
+                json!({
+                    "event_id": {"type": "string", "description": "El id del evento."},
+                    "occurrence_id": {"type": "string", "description": "La vez puntual; omitido, el evento."}
                 }),
-            },
+                &["event_id"],
+            ),
+            tool(
+                "list_tasks",
+                "Lista las tareas del calendario, por vencimiento. Sin las hechas salvo con \
+                 «include_completed».",
+                json!({
+                    "calendar_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Los calendarios a mirar; vacío u omitido, todos."
+                    },
+                    "include_completed": {"type": "boolean", "description": "Incluir las tareas ya hechas."}
+                }),
+                &[],
+            ),
+            tool(
+                "create_event",
+                "Prepara un evento nuevo en un calendario. No lo crea: la persona lo confirma \
+                 antes. El calendario se nombra con «account_id» y «calendar_id», de \
+                 list_calendars (uno que admita VEVENT).",
+                json!({
+                    "account_id": {"type": "string", "description": "La cuenta del calendario, de list_calendars."},
+                    "calendar_id": {"type": "string", "description": "El id del calendario, de list_calendars."},
+                    "summary": {"type": "string", "description": "El título del evento."},
+                    "start": {"type": "string", "description": "El comienzo. Con hora, una marca RFC 3339 en UTC («2026-01-01T09:00:00Z»); de día entero, una fecha «2026-01-01» con «all_day» en true."},
+                    "end": {"type": "string", "description": "El fin, en el mismo formato que «start»."},
+                    "all_day": {"type": "boolean", "description": "Si es un evento de día entero (fechas sin hora)."},
+                    "description": {"type": "string", "description": "El detalle del evento; opcional."},
+                    "location": {"type": "string", "description": "El lugar; opcional."}
+                }),
+                &["account_id", "calendar_id", "summary", "start", "end"],
+            ),
         ]
     }
 

@@ -15,7 +15,7 @@ use super::dbus::{
     call_with_timeout, opt_string_arg, store_alive, store_create, store_proxy, string_arg,
     string_array_arg, CALL_TIMEOUT,
 };
-use super::{Skill, SkillCtx, ToolOutcome, PERMISSION_CONTACTS};
+use super::{tool, Skill, SkillCtx, ToolOutcome, PERMISSION_CONTACTS};
 use crate::backend::{BoxFuture, ToolDef};
 use vasak_assistant_protocol::{Error, PendingAction, DOMAIN_CONTACTS};
 
@@ -46,67 +46,51 @@ impl Skill for ContactsSkill {
 
     fn tools(&self) -> Vec<ToolDef> {
         vec![
-            ToolDef {
-                name: "list_address_books".into(),
-                description: "Lista las libretas de contactos de una cuenta. Devuelve cada una \
-                              con su id, que es el que toma «create_contact»."
-                    .into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "account_id": {"type": "string", "description": "El identificador de la cuenta."}
-                    },
-                    "required": ["account_id"]
+            tool(
+                "list_address_books",
+                "Lista las libretas de contactos de una cuenta. Devuelve cada una con su id, que \
+                 es el que toma «create_contact».",
+                json!({
+                    "account_id": {"type": "string", "description": "El identificador de la cuenta."}
                 }),
-            },
-            ToolDef {
-                name: "search_contacts".into(),
-                description: "Busca contactos de una cuenta por texto (nombre, correo, teléfono \
-                              u organización). Devuelve un resumen de cada uno con su id."
-                    .into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "account_id": {"type": "string", "description": "El identificador de la cuenta."},
-                        "query": {"type": "string", "description": "Las palabras a buscar."}
-                    },
-                    "required": ["account_id", "query"]
+                &["account_id"],
+            ),
+            tool(
+                "search_contacts",
+                "Busca contactos de una cuenta por texto (nombre, correo, teléfono u \
+                 organización). Devuelve un resumen de cada uno con su id.",
+                json!({
+                    "account_id": {"type": "string", "description": "El identificador de la cuenta."},
+                    "query": {"type": "string", "description": "Las palabras a buscar."}
                 }),
-            },
-            ToolDef {
-                name: "read_contact".into(),
-                description: "Lee un contacto entero de una cuenta por su id (nombre, correos, \
-                              teléfonos, direcciones, organización, notas y relaciones)."
-                    .into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "account_id": {"type": "string", "description": "El identificador de la cuenta."},
-                        "contact_id": {"type": "string", "description": "El id del contacto."}
-                    },
-                    "required": ["account_id", "contact_id"]
+                &["account_id", "query"],
+            ),
+            tool(
+                "read_contact",
+                "Lee un contacto entero de una cuenta por su id (nombre, correos, teléfonos, \
+                 direcciones, organización, notas y relaciones).",
+                json!({
+                    "account_id": {"type": "string", "description": "El identificador de la cuenta."},
+                    "contact_id": {"type": "string", "description": "El id del contacto."}
                 }),
-            },
-            ToolDef {
-                name: "create_contact".into(),
-                description: "Prepara un contacto nuevo en una libreta. No lo crea: la persona lo \
-                              confirma antes. La libreta se nombra con «account_id» y \
-                              «address_book_id», de list_address_books."
-                    .into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "account_id": {"type": "string", "description": "La cuenta de la libreta."},
-                        "address_book_id": {"type": "string", "description": "El id de la libreta, de list_address_books."},
-                        "full_name": {"type": "string", "description": "El nombre completo del contacto."},
-                        "organization": {"type": "string", "description": "La organización; opcional."},
-                        "note": {"type": "string", "description": "Una nota; opcional."},
-                        "emails": {"type": "array", "items": {"type": "string"}, "description": "Las direcciones de correo; opcional."},
-                        "phones": {"type": "array", "items": {"type": "string"}, "description": "Los teléfonos; opcional."}
-                    },
-                    "required": ["account_id", "address_book_id", "full_name"]
+                &["account_id", "contact_id"],
+            ),
+            tool(
+                "create_contact",
+                "Prepara un contacto nuevo en una libreta. No lo crea: la persona lo confirma \
+                 antes. La libreta se nombra con «account_id» y «address_book_id», de \
+                 list_address_books.",
+                json!({
+                    "account_id": {"type": "string", "description": "La cuenta de la libreta."},
+                    "address_book_id": {"type": "string", "description": "El id de la libreta, de list_address_books."},
+                    "full_name": {"type": "string", "description": "El nombre completo del contacto."},
+                    "organization": {"type": "string", "description": "La organización; opcional."},
+                    "note": {"type": "string", "description": "Una nota; opcional."},
+                    "emails": {"type": "array", "items": {"type": "string"}, "description": "Las direcciones de correo; opcional."},
+                    "phones": {"type": "array", "items": {"type": "string"}, "description": "Los teléfonos; opcional."}
                 }),
-            },
+                &["account_id", "address_book_id", "full_name"],
+            ),
         ]
     }
 
