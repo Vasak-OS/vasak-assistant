@@ -12,8 +12,8 @@ use serde_json::{json, Value};
 use zbus::Connection;
 
 use super::dbus::{
-    backend_error, call_with_timeout, opt_string_arg, store_alive, store_proxy, string_arg,
-    string_array_arg, CALL_TIMEOUT,
+    call_with_timeout, opt_string_arg, store_alive, store_proxy, string_arg, string_array_arg,
+    CALL_TIMEOUT,
 };
 use super::{Skill, SkillCtx, ToolOutcome, PERMISSION_CONTACTS};
 use crate::backend::{BoxFuture, ToolDef};
@@ -226,8 +226,7 @@ impl ContactsSkill {
                         &(account_id, address_book_id, payload, String::new()),
                     ),
                 )
-                .await
-                .map_err(|e| backend_error(e.to_string()))?;
+                .await?;
                 Ok(())
             })
         });

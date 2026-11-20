@@ -12,8 +12,8 @@ use serde_json::{json, Value};
 use zbus::Connection;
 
 use super::dbus::{
-    backend_error, bool_arg, call_with_timeout, opt_string_arg, store_alive, store_proxy,
-    string_arg, string_array_arg, CALL_TIMEOUT,
+    bool_arg, call_with_timeout, opt_string_arg, store_alive, store_proxy, string_arg,
+    string_array_arg, CALL_TIMEOUT,
 };
 use super::{Skill, SkillCtx, ToolOutcome, PERMISSION_CALENDAR};
 use crate::backend::{BoxFuture, ToolDef};
@@ -264,8 +264,7 @@ impl CalendarSkill {
                         &(account_id, calendar_id, payload, String::new()),
                     ),
                 )
-                .await
-                .map_err(|e| backend_error(e.to_string()))?;
+                .await?;
                 Ok(())
             })
         });
