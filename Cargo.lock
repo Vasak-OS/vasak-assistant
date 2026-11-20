@@ -2190,8 +2190,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
+name = "vasak-assistant-broker"
+version = "0.3.29"
+dependencies = [
+ "parking_lot",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "vasak-assistant-ipc",
+ "vasak-assistant-protocol",
+]
+
+[[package]]
 name = "vasak-assistant-daemon"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "dirs",
  "futures-util",
@@ -2201,7 +2217,6 @@ dependencies = [
  "libc",
  "parking_lot",
  "regex",
- "reqwest",
  "serde",
  "serde_json",
  "sha2",
@@ -2209,15 +2224,32 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",
+ "url",
  "uuid",
+ "vasak-assistant-broker",
+ "vasak-assistant-ipc",
  "vasak-assistant-protocol",
  "zbus",
  "zeroize",
 ]
 
 [[package]]
+name = "vasak-assistant-ipc"
+version = "0.3.29"
+dependencies = [
+ "dirs",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+ "vasak-assistant-protocol",
+]
+
+[[package]]
 name = "vasak-assistant-protocol"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "serde",
  "tokio",

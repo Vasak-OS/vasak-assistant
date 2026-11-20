@@ -1,0 +1,72 @@
+[Unit]
+Description=Puente de red del asistente de IA de VasakOS
+Documentation=https://github.com/Vasak-OS/vasak-assistant
+PartOf=graphical-session.target
+After=graphical-session.target
+# Es el único proceso del asistente con AF_INET: el demonio (sin AF_INET por su
+# unit, #6) le pide por el socket de dominio Unix. `Restart=on-failure` lo levanta
+# si se cae; la ventana acota el tope de reintentos igual que en el demonio.
+StartLimitIntervalSec=20s
+StartLimitBurst=5
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/vasak-assistant-broker
+Restart=on-failure
+RestartSec=3
+# El registro va a stderr; journald le pone la hora. Se ve con
+# `journalctl --user -u vasak-assistant-broker`.
+StandardError=journal
+# El backend y su dirección salen de la sección `assistant` de
+# ~/.config/vasak/vasak.conf (ver el README). La clave del proveedor NO va acá:
+# en esta fase la lee el demonio y se la pasa por el socket.
+
+# El broker lee `vasak.conf`, habla con un único servidor de modelo por TCP y
+# atiende el socket del demonio. No persiste nada. Se le saca todo lo demás.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+# AF_UNIX para el socket del demonio; AF_INET y AF_INET6 porque es el que habla
+# HTTP por TCP: Ollama o llama.cpp en 127.0.0.1 por omisión, y un proveedor
+# remoto sólo si la persona lo permitió (`allow_remote`) y sólo por https.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Sin `IPAddressAllow=`/`IPAddressDeny=` ni `RestrictNetworkInterfaces=`: son
+# filtros BPF y el gestor de usuario de systemd no los aplica; quedarían escritos
+# sin efecto. Que la conversación no salga de la caja sin permiso lo decide el
+# propio broker (`config.rs` del crate `ipc`), que además no sigue redirecciones
+# ni usa el proxy del entorno (`broker/src/http.rs`).
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# El broker no genera código en memoria ni lanza nada que lo haga.
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Un volcado de memoria podría tener una conversación en vuelo y, con un
+# proveedor remoto, la clave: no se escribe ninguno.
+LimitCORE=0
+# Techos de recursos. Un pedido a la vez por conexión, respuestas de hasta
+# 256 KiB: unas decenas de MiB. Los hilos son los de Tokio.
+MemoryMax=256M
+TasksMax=256
+
+# Sólo lee `vasak.conf`; no escribe en disco (el socket vive en
+# $XDG_RUNTIME_DIR, fuera de la carpeta personal). Por eso no hay StateDirectory.
+ProtectSystem=strict
+ProtectHome=read-only
+# Lo que el broker cree (el socket), sólo para el usuario.
+UMask=0077
+
+[Install]
+WantedBy=graphical-session.target

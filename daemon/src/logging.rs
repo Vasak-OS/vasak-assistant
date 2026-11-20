@@ -106,12 +106,17 @@ pub fn library_filter() -> Targets {
         )
 }
 
+/// Esquema, host y puerto: lo único que se puede mostrar de una dirección.
+fn origin(url: &url::Url) -> String {
+    url.origin().ascii_serialization()
+}
+
 /// Lo que se puede registrar de una dirección: esquema, host y puerto, sin
 /// usuario, contraseña, ruta, consulta ni fragmento. Una dirección que no se
 /// entiende, o que no tiene host, no se muestra.
 pub fn redact_url(raw: &str) -> String {
-    match reqwest::Url::parse(raw.trim()) {
-        Ok(url) if url.host_str().is_some() => crate::http::origin(&url),
+    match url::Url::parse(raw.trim()) {
+        Ok(url) if url.host_str().is_some() => origin(&url),
         _ => "(dirección ilegible)".into(),
     }
 }
@@ -258,7 +263,7 @@ pub fn backend_summary(selection: &crate::config::Selection) -> String {
     format!(
         "backend elegido: {} en {} ({}), modelo {}",
         crate::config::provider_name(selection.kind),
-        crate::http::origin(&selection.url),
+        origin(&selection.url),
         if selection.local { "local" } else { "remoto" },
         selection
             .model
@@ -425,7 +430,8 @@ mod tests {
 mod startup_tests {
     use super::*;
     use crate::config::Settings;
-    use crate::test_support::{local_selection, model_info};
+    use crate::test_support::model_info;
+    use vasak_assistant_broker::test_support::local_selection;
 
     fn settings(allow_remote: bool, share: bool) -> Settings {
         Settings {
@@ -546,7 +552,7 @@ mod startup_tests {
 
         let mut remote = local_selection("openai", server, Some("gpt"));
         remote.local = false;
-        remote.url = reqwest::Url::parse("https://api.ejemplo.com/v1/").unwrap();
+        remote.url = url::Url::parse("https://api.ejemplo.com/v1/").unwrap();
         let line = backend_summary(&remote);
         assert_eq!(
             line,
@@ -557,7 +563,7 @@ mod startup_tests {
     #[test]
     fn el_backend_elegido_no_repite_usuario_clave_ruta_ni_consulta() {
         let mut selection = local_selection("openai", "http://127.0.0.1:8080/v1/", Some("gpt"));
-        selection.url = reqwest::Url::parse(
+        selection.url = url::Url::parse(
             "https://usuariocanario:clavecanaria@api.ejemplo.com:8443/v1/cuentacanaria?token=consultacanaria#frag",
         )
         .unwrap();

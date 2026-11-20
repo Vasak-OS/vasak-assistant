@@ -78,3 +78,68 @@ fn el_tope_de_reintentos_es_alcanzable_dentro_de_la_ventana() {
         burst * restart
     );
 }
+
+// ── Aislamiento de red (#6): el demonio sin AF_INET, el broker con ───────────
+
+/// Las líneas con efecto de un `.service` de `packaging/` (sin comentarios ni
+/// vacías), recortadas.
+fn directives(file: &str) -> Vec<String> {
+    let path = format!("{}/../packaging/{file}", env!("CARGO_MANIFEST_DIR"));
+    fs::read_to_string(&path)
+        .unwrap_or_else(|_| panic!("no se pudo leer {file}"))
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Las familias de `RestrictAddressFamilies=` de la unit.
+fn address_families(file: &str) -> Vec<String> {
+    let line = directives(file)
+        .into_iter()
+        .find_map(|line| {
+            line.strip_prefix("RestrictAddressFamilies=")
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| panic!("{file} debe llevar RestrictAddressFamilies="));
+    line.split_whitespace().map(str::to_owned).collect()
+}
+
+#[test]
+fn el_demonio_solo_puede_abrir_sockets_unix() {
+    let families = address_families("vasak-assistant.service");
+    assert_eq!(
+        families,
+        ["AF_UNIX"],
+        "el demonio no debe tener AF_INET ni AF_INET6"
+    );
+}
+
+#[test]
+fn el_broker_puede_abrir_sockets_ip() {
+    let families = address_families("vasak-assistant-broker.service");
+    for family in ["AF_UNIX", "AF_INET", "AF_INET6"] {
+        assert!(
+            families.iter().any(|f| f == family),
+            "al broker le falta {family}"
+        );
+    }
+}
+
+#[test]
+fn el_demonio_quiere_al_broker_pero_no_depende_de_el() {
+    let lines = directives("vasak-assistant.service");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "Wants=vasak-assistant-broker.service"),
+        "el demonio debe llevar Wants= del broker"
+    );
+    for strong in ["Requires=", "BindsTo=", "Requisite="] {
+        assert!(
+            !lines.iter().any(|l| l.starts_with(strong)),
+            "{strong} arrastraría al demonio a caerse con el broker"
+        );
+    }
+}

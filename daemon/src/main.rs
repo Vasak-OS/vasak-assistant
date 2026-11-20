@@ -14,14 +14,12 @@
 //! de Tauri.
 
 mod backend;
+mod broker_client;
 mod config;
 mod conversations;
-mod http;
 mod keyring;
 mod logging;
 mod memory;
-mod ollama;
-mod openai;
 mod service;
 mod skills;
 #[cfg(test)]
@@ -38,13 +36,12 @@ use zbus::names::BusName;
 use zbus::{connection, Connection};
 
 use backend::{Limited, ModelBackend, RejectedBackend};
-use config::BackendKind;
+use broker_client::BrokerClient;
 use conversations::Conversations;
 use keyring::SecretService;
 use memory::Memory;
-use ollama::OllamaBackend;
-use openai::OpenAiBackend;
 use service::AssistantService;
+use vasak_assistant_ipc::socket_path;
 use vasak_assistant_protocol::{SERVICE_NAME, SERVICE_PATH};
 
 /// El nombre tiene que quedar en nuestras manos. Con `DO_NOT_QUEUE` sólo somos
@@ -74,24 +71,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     logging::init();
 
     let settings = config::read_settings();
-    let client = http::client()?;
-    // El llavero lo usan el backend (para leer la clave) y el servicio (para
-    // guardarla desde Configuración).
+    // El llavero lo usan el cliente del broker (para leer la clave del proveedor
+    // y pasarla en el sobre del IPC) y el servicio (para guardarla desde
+    // Configuración).
     let secrets = Arc::new(SecretService {
         connection: Connection::session().await?,
     });
+    // El demonio ya no habla con el modelo por TCP: le pide al broker por el
+    // socket. Lee la configuración sólo para `info()` (local según config) y para
+    // saber por qué dirección leer la clave; el destino real lo arma el broker.
     let backend: Arc<dyn ModelBackend> = match config::select_backend(&settings) {
         Ok(selection) => {
-            info!("{}", logging::backend_summary(&selection));
-            let backend: Arc<dyn ModelBackend> = match selection.kind {
-                BackendKind::Ollama => {
-                    Arc::new(OllamaBackend::new(client, selection, settings.allow_remote))
+            match socket_path() {
+                Some(socket) => {
+                    info!("{}", logging::backend_summary(&selection));
+                    Arc::new(Limited::new(Arc::new(BrokerClient::new(
+                        selection,
+                        secrets.clone(),
+                        socket,
+                    ))))
                 }
-                BackendKind::OpenAi => {
-                    Arc::new(OpenAiBackend::new(client, selection, secrets.clone()))
+                None => {
+                    warn!("sin XDG_RUNTIME_DIR: no se puede contactar al broker de red");
+                    Arc::new(RejectedBackend {
+                    info: selection.info(),
+                    reason: "El puente de red del asistente no está disponible (sin XDG_RUNTIME_DIR).".into(),
+                })
                 }
-            };
-            Arc::new(Limited::new(backend))
+            }
         }
         Err(rejection) => {
             warn!(

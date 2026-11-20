@@ -16,9 +16,10 @@ use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use vasak_assistant_protocol::{Message, ModelInfo};
 
-use crate::backend::{
+use vasak_assistant_ipc::{
     BackendError, BoxFuture, ChatMessage, ModelBackend, ModelTurn, ToolCall, ToolDef,
 };
+
 use crate::config::Selection;
 use crate::http::{self, CHAT_TIMEOUT, LIST_TIMEOUT};
 use crate::keyring::{SecretSource, ITEM_SERVICE};

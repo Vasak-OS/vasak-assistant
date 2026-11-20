@@ -1,0 +1,47 @@
+# El broker de red: el único proceso del asistente con `AF_INET`. Tiene el
+# cliente HTTP y los backends de modelo (Ollama, OpenAI), lee la dirección de
+# `vasak.conf` y la expone al demonio por un socket de dominio Unix. El demonio,
+# sin `AF_INET` (barrera del kernel), le pide por ese socket.
+[package]
+name = "vasak-assistant-broker"
+description = "Puente de red del asistente: el único proceso que habla con el modelo por TCP"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "vasak_assistant_broker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vasak-assistant-broker"
+path = "src/main.rs"
+
+[features]
+# Expone `test_support` a quien depende del broker en sus pruebas (el demonio,
+# cuyas pruebas de integración manejan un backend real contra un servidor de
+# mentira). Fuera de las pruebas no se compila.
+test-support = []
+
+[dependencies]
+vasak-assistant-protocol.workspace = true
+vasak-assistant-ipc.workspace = true
+serde = { workspace = true }
+serde_json = "1"
+# rustls y no OpenSSL, como el resto del workspace: un proveedor remoto va por
+# https, y así no hace falta ninguna biblioteca de TLS del sistema.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio.workspace = true
+# Los ids de las llamadas a herramientas cuando el backend no los da.
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Sólo en `test_support` (pruebas y la bandera `test-support`): los mutex de los
+# ayudantes del servidor de mentira y de la captura del registro.
+parking_lot = "0.12"
+
+[dev-dependencies]
+# Reloj pausado: probar el plazo de lectura de 10 s sin esperarlo.
+tokio = { workspace = true, features = ["test-util"] }

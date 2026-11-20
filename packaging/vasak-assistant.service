@@ -3,6 +3,15 @@ Description=Asistente de IA residente de VasakOS
 Documentation=https://github.com/Vasak-OS/vasak-assistant
 PartOf=graphical-session.target
 After=graphical-session.target
+# El demonio no habla con el modelo por TCP: le pide al broker de red, el único
+# proceso con AF_INET (#6). `Wants=` lo arranca junto con el demonio y `After=`
+# espera a que esté arriba. Es `Wants=`, no `Requires=`, a propósito: si el
+# broker queda en `failed` (agota su `StartLimitBurst`), `Requires=` arrastraría
+# al demonio a detenerse; con `Wants=` el demonio sigue vivo y el servicio
+# responde «modelo no disponible», nunca roto (decisión 2). Un broker caído en
+# caliente lo reintenta su propio `Restart=on-failure`.
+Wants=vasak-assistant-broker.service
+After=vasak-assistant-broker.service
 # Si otro proceso ya tiene el nombre del bus, el demonio aborta el arranque
 # (#47) y `Restart=on-failure` lo reintenta cada `RestartSec`. El tope de
 # arranques de systemd cuenta en una ventana: con el default (10s) y
@@ -34,16 +43,19 @@ RestartSec=3
 # le saca todo lo demás.
 NoNewPrivileges=yes
 CapabilityBoundingSet=
-# AF_UNIX para el bus de sesión. AF_INET y AF_INET6 porque los backends hablan
-# HTTP por TCP: Ollama o llama.cpp en 127.0.0.1 por omisión, y un proveedor
-# remoto sólo si la persona lo permitió (`allow_remote`) y sólo por https.
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Sólo AF_UNIX: el bus de sesión, el llavero y el socket del broker. **Sin
+# AF_INET ni AF_INET6**: el proceso que ve los datos de la persona no puede abrir
+# un socket IP. Es la barrera del issue #6, aplicada por el kernel —el gestor de
+# usuario de systemd sí aplica esta directiva, a diferencia de `IPAddressAllow`—:
+# hablar con el modelo por TCP es cosa del broker (`vasak-assistant-broker.service`),
+# el único con esas familias; el demonio le pide por el socket de dominio Unix.
+RestrictAddressFamilies=AF_UNIX
 # Sin `IPAddressAllow=`/`IPAddressDeny=` ni `RestrictNetworkInterfaces=`: son
 # filtros BPF y el gestor de usuario de systemd no los aplica («unit configures
 # an IP firewall, but not running as root»); quedarían escritos sin hacer nada.
-# Que la conversación no salga de la caja sin permiso lo decide el servicio
-# (`daemon/src/config.rs`), que además no sigue redirecciones ni usa el proxy
-# del entorno (`daemon/src/http.rs`).
+# Que la conversación no salga de la caja sin permiso lo decide el broker
+# (`config.rs` en el crate `ipc`), que además no sigue redirecciones ni usa el
+# proxy del entorno (`broker/src/http.rs`).
 PrivateDevices=yes
 PrivateTmp=yes
 ProtectClock=yes

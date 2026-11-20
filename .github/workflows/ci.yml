@@ -26,8 +26,9 @@ jobs:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
     with:
       # Las pruebas de Rust corren en `revisar` y de esa misma corrida sale la
-      # cobertura que se le pasa a Sonar.
-      pruebas_rust: -p vasak-assistant-protocol -p vasak-assistant-daemon
+      # cobertura que se le pasa a Sonar. El servicio corre en dos procesos
+      # (demonio y broker) con un contrato compartido (ipc): los cuatro crates.
+      pruebas_rust: -p vasak-assistant-protocol -p vasak-assistant-ipc -p vasak-assistant-daemon -p vasak-assistant-broker
       # Lo que pide el grafo en Linux, mirado con `cargo tree -i`:
       #
       #   build-essential  el compilador de C de `ring` (vía `cc`), que trae

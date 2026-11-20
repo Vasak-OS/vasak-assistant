@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use reqwest::{redirect, Client, Response, Url};
 
-use crate::backend::BackendError;
+use vasak_assistant_ipc::{BackendError, MAX_RESPONSE_BYTES};
 
 /// Cuánto se espera para abrir la conexión.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -21,8 +21,6 @@ pub const LIST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cuánto se espera una respuesta del modelo. Generoso: un modelo local en una
 /// máquina modesta, cargándose por primera vez, tarda.
 pub const CHAT_TIMEOUT: Duration = Duration::from_secs(300);
-/// El tope del cuerpo de cualquier respuesta de un backend.
-pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
 /// El cliente que comparten todos los backends.
 pub fn client() -> reqwest::Result<Client> {

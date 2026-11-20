@@ -12,13 +12,16 @@ path = "src/main.rs"
 
 [dependencies]
 vasak-assistant-protocol.workspace = true
+# El contrato interno con el broker: el rasgo del backend, el protocolo IPC y la
+# política de destino (`config`). El demonio ya no habla HTTP —de eso se ocupa el
+# broker—, así que no hay reqwest acá; `url` sólo recorta direcciones para el
+# registro.
+vasak-assistant-ipc.workspace = true
 serde.workspace = true
 serde_json = "1"
 zbus.workspace = true
 tokio.workspace = true
-# rustls y no OpenSSL, como el resto del workspace: un proveedor remoto va por
-# https, y así no hace falta ninguna biblioteca de TLS del sistema.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+url = "2"
 uuid = { version = "1", features = ["v4"] }
 # Los directorios base XDG, como en vasak-health-service: la regla de que una
 # ruta relativa o vacía se ignora vive ahí y no en una copia acá.
@@ -60,3 +63,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zbus = { workspace = true, features = ["p2p", "bus-impl"] }
 # Reloj pausado: probar un plazo de 10 s sin esperarlo.
 tokio = { workspace = true, features = ["test-util"] }
+# Sólo las pruebas de integración manejan un backend real (Ollama/OpenAI contra
+# un servidor de mentira) y sus ayudantes de HTTP, que viven en el broker. La
+# bandera `test-support` los expone; nada de esto entra en el binario.
+vasak-assistant-broker = { path = "../broker", features = ["test-support"] }
