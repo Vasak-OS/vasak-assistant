@@ -724,6 +724,45 @@ async fn confirmar_un_movimiento_informa_que_el_archivo_se_movio() {
     assert_eq!(moved.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn confirmar_la_creacion_de_un_evento_o_un_contacto_lo_informa() {
+    for (kind, mensaje) in [
+        ("create_event", "Evento creado"),
+        ("create_contact", "Contacto creado"),
+    ] {
+        let r = rig(vec![], true);
+        let created = Arc::new(AtomicUsize::new(0));
+        let counter = created.clone();
+        let action = PendingAction {
+            id: format!("{kind}-1"),
+            conversation_id: r.conversation.clone(),
+            kind: kind.into(),
+            summary: "Crear".into(),
+            to: String::new(),
+            subject: String::new(),
+            body_preview: String::new(),
+        };
+        let execute: SendAction = Box::new(move || {
+            Box::pin(async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        r.service
+            .mail
+            .pending
+            .lock()
+            .insert(OWNER, &r.conversation, action, execute);
+        let result = r
+            .service
+            .confirm_pending(OWNER, &format!("{kind}-1"))
+            .await
+            .unwrap();
+        assert_eq!(result, mensaje, "{kind}");
+        assert_eq!(created.load(Ordering::SeqCst), 1, "{kind}");
+    }
+}
+
 // ── 4. Anti-doble-envío ─────────────────────────────────────────────────────────
 
 #[tokio::test]
