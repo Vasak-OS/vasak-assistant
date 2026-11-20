@@ -65,6 +65,11 @@ use zeroize::Zeroizing;
 
 use crate::backend::BoxFuture;
 
+// La clave del proveedor y su `service` (el atributo del ítem) viven en el crate
+// compartido; acá se reexportan para que el resto del demonio los use por
+// `crate::keyring::{ApiKey, ITEM_SERVICE}` como antes.
+pub use vasak_assistant_ipc::keyring::{ApiKey, ITEM_SERVICE};
+
 const SECRETS_NAME: &str = "org.freedesktop.secrets";
 const SECRETS_PATH: &str = "/org/freedesktop/secrets";
 const SECRETS_SERVICE: &str = "org.freedesktop.Secret.Service";
@@ -73,8 +78,6 @@ const SECRETS_COLLECTION: &str = "org.freedesktop.Secret.Collection";
 /// La colección por omisión (`login`, en una sesión normal).
 const DEFAULT_COLLECTION: &str = "/org/freedesktop/secrets/aliases/default";
 
-/// El valor del atributo `service` de los ítems del asistente.
-pub const ITEM_SERVICE: &str = "ar.net.vasak.os.Assistant";
 /// La etiqueta con la que se ve el ítem en el llavero.
 pub const ITEM_LABEL: &str = "Lince";
 /// El valor del atributo `purpose` del ítem de la clave del proveedor.
@@ -118,35 +121,6 @@ impl std::fmt::Debug for MemoryKey {
             Self::Duplicated => "Duplicated",
             Self::Invalid => "Invalid",
         })
-    }
-}
-
-/// El tope de una clave. Ninguna de verdad se le acerca.
-const MAX_KEY_BYTES: usize = 4096;
-
-/// Una clave de proveedor. Sin `Display` y con un `Debug` que no la muestra,
-/// para que no termine en el registro por accidente.
-#[derive(Clone, PartialEq, Eq)]
-pub struct ApiKey(String);
-
-impl ApiKey {
-    /// Valida lo que vino del llavero: texto, sin espacios alrededor, sin
-    /// caracteres de control (iría en una cabecera HTTP) y de un largo sensato.
-    pub fn parse(bytes: &[u8]) -> Option<Self> {
-        let text = std::str::from_utf8(bytes).ok()?.trim();
-        let valid =
-            !text.is_empty() && text.len() <= MAX_KEY_BYTES && !text.chars().any(char::is_control);
-        valid.then(|| Self(text.to_owned()))
-    }
-
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for ApiKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ApiKey(…)")
     }
 }
 
@@ -570,50 +544,8 @@ fn locked_error() -> Error {
 mod tests {
     use super::*;
 
-    #[test]
-    fn una_clave_normal_se_acepta_y_se_recorta() {
-        let key = ApiKey::parse(b"  sk-abc123\n").unwrap();
-        assert_eq!(key.expose(), "sk-abc123");
-    }
-
-    #[test]
-    fn una_clave_vacia_o_de_espacios_no_vale() {
-        for bytes in [&b""[..], b"   ", b"\n"] {
-            assert!(ApiKey::parse(bytes).is_none(), "{bytes:?}");
-        }
-    }
-
-    #[test]
-    fn una_clave_con_caracteres_de_control_no_vale_porque_iria_en_una_cabecera() {
-        for bytes in [
-            &b"sk-abc\r\nX-Otra: 1"[..],
-            b"sk-\0abc",
-            b"sk-a\tbc",
-            b"sk-\x7fabc",
-        ] {
-            assert!(ApiKey::parse(bytes).is_none(), "{bytes:?}");
-        }
-    }
-
-    #[test]
-    fn una_clave_que_no_es_utf8_no_vale() {
-        assert!(ApiKey::parse(&[0xff, 0xfe, 0x41]).is_none());
-    }
-
-    #[test]
-    fn una_clave_acepta_justo_el_tope_y_rechaza_un_byte_mas() {
-        assert!(ApiKey::parse("k".repeat(MAX_KEY_BYTES).as_bytes()).is_some());
-        assert!(ApiKey::parse("k".repeat(MAX_KEY_BYTES + 1).as_bytes()).is_none());
-    }
-
-    #[test]
-    fn el_debug_de_la_clave_no_la_muestra() {
-        let key = ApiKey::parse(b"sk-secreta").unwrap();
-        let texto = format!("{key:?}");
-        assert!(!texto.contains("secreta"));
-        let anidada = format!("{:#?}", Some(&key));
-        assert!(!anidada.contains("secreta"));
-    }
+    // El tipo `ApiKey` (validación de `parse` y su `Debug` redactado) se prueba
+    // donde vive, en el crate `ipc` (`vasak_assistant_ipc::keyring`).
 
     // ── La parte D-Bus, contra un Secret Service de mentira ───────────────────
     //

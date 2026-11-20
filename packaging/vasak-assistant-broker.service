@@ -61,10 +61,17 @@ LimitCORE=0
 MemoryMax=256M
 TasksMax=256
 
-# Sólo lee `vasak.conf`; no escribe en disco (el socket vive en
-# $XDG_RUNTIME_DIR, fuera de la carpeta personal). Por eso no hay StateDirectory.
+# Sólo lee `vasak.conf`; lo único que escribe es su socket. `ProtectHome` cubre
+# también `/run/user/<uid>`, así que con `read-only` esa carpeta queda de sólo
+# lectura y el broker no podría crear el socket. `RuntimeDirectory=` resuelve eso:
+# systemd crea `/run/user/<uid>/vasak-assistant` escribible (exento de
+# `ProtectHome`) y lo borra al parar; ahí va el socket
+# (`$XDG_RUNTIME_DIR/vasak-assistant/vasak-assistant-broker.sock`). No hay
+# StateDirectory: nada persiste entre arranques.
 ProtectSystem=strict
 ProtectHome=read-only
+RuntimeDirectory=vasak-assistant
+RuntimeDirectoryMode=0700
 # Lo que el broker cree (el socket), sólo para el usuario.
 UMask=0077
 

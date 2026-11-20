@@ -75,6 +75,9 @@ struct Broker {
     _child: Child,
     dir: PathBuf,
     socket: PathBuf,
+    /// La dirección base normalizada de la config, para marcar `key_base_url` en
+    /// el sobre igual que lo hace el demonio.
+    base_url: String,
 }
 
 impl Broker {
@@ -101,7 +104,9 @@ impl Broker {
             .kill_on_drop(true)
             .spawn()
             .expect("se lanza el broker");
-        let socket = dir.join(vasak_assistant_ipc::SOCKET_NAME);
+        let socket = dir
+            .join(vasak_assistant_ipc::RUNTIME_SUBDIR)
+            .join(vasak_assistant_ipc::SOCKET_NAME);
         // Espera acotada a que el proceso abra el socket: no hay otra señal.
         let ready = tokio::time::timeout(Duration::from_secs(10), async {
             while UnixStream::connect(&socket).await.is_err() {
@@ -110,10 +115,14 @@ impl Broker {
         })
         .await;
         assert!(ready.is_ok(), "el broker no abrió su socket");
+        let base_url = vasak_assistant_ipc::config::normalize_url(url)
+            .expect("la dirección de prueba es válida")
+            .to_string();
         Self {
             _child: child,
             dir,
             socket,
+            base_url,
         }
     }
 
@@ -130,6 +139,9 @@ impl Broker {
         let mut stream = self.connect().await;
         let envelope = BrokerEnvelope {
             api_key: key.map(str::to_owned),
+            // La clave se resolvió para la dirección de la config, igual que en
+            // el demonio: el broker la usa sólo si coincide con la suya.
+            key_base_url: key.map(|_| self.base_url.clone()),
             request,
         };
         write_frame(&mut stream, &envelope).await?;
@@ -254,25 +266,44 @@ async fn un_marco_incompleto_o_enorme_no_tumba_al_broker() {
 }
 
 #[tokio::test]
-async fn al_tope_de_conexiones_se_descarta_la_siguiente_sin_tumbar_al_broker() {
+async fn al_tope_de_conexiones_se_descartan_las_que_sobran_sin_tumbar_al_broker() {
+    const OPEN: usize = 40;
+    const CAP: usize = 32;
     let model = FakeModel::start("ok").await;
     let broker = Broker::start(&format!("http://127.0.0.1:{}/v1", model.port)).await;
 
-    // 32 conexiones abiertas que no mandan nada (el tope). Alguna puede haber
-    // sido descartada si la sonda de arranque aún no soltó su cupo: no importa,
-    // sólo cuenta que la que viene después del tope se descarte.
-    let mut idle = Vec::new();
-    for _ in 0..32 {
-        idle.push(broker.connect().await);
+    // 40 conexiones que no mandan nada, todas abiertas a la vez. Como mucho 32
+    // pueden estar aceptadas (cada una retiene su cupo hasta el plazo de
+    // lectura), así que al menos 8 se descartan, pase lo que pase con el cupo
+    // de la sonda de arranque. Se cuentan los EOF de todas en paralelo: no
+    // depende de cuál conexión cae en cuál cupo.
+    let mut reads = tokio::task::JoinSet::new();
+    for _ in 0..OPEN {
+        let mut stream = broker.connect().await;
+        reads.spawn(async move {
+            let mut byte = [0u8; 1];
+            let read = stream.read(&mut byte).await;
+            matches!(read, Ok(0) | Err(_))
+        });
     }
-    // Una aceptada se quedaría esperando el marco (hasta el plazo de lectura);
-    // una descartada se cierra y la lectura da EOF enseguida.
-    let mut over = broker.connect().await;
-    let mut byte = [0u8; 1];
-    let read = tokio::time::timeout(Duration::from_secs(3), over.read(&mut byte)).await;
+    let mut dropped = 0;
+    let counted = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(Ok(closed)) = reads.join_next().await {
+            if closed {
+                dropped += 1;
+            }
+            if dropped >= OPEN - CAP {
+                break;
+            }
+        }
+    })
+    .await;
     assert!(
-        matches!(read, Ok(Ok(0)) | Ok(Err(_))),
-        "la conexión {} pasó el tope y no se descartó: {read:?}",
-        idle.len() + 1
+        counted.is_ok() && dropped >= OPEN - CAP,
+        "se esperaban {} descartadas y hubo {dropped}",
+        OPEN - CAP
     );
+    // Las aceptadas siguen esperando el marco: el broker no se cayó.
+    assert!(!reads.is_empty());
+    reads.abort_all();
 }

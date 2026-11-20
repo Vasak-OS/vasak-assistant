@@ -24,8 +24,17 @@ tokio = { version = "1", features = ["io-util", "rt", "macros"] }
 url = "2"
 # Los directorios base XDG para la ruta de `vasak.conf`, como en el demonio.
 dirs = "6"
-# Una línea de aviso cuando `vasak.conf` no se puede leer (`read_settings`).
+# Una línea de aviso cuando `vasak.conf` no se puede leer (`read_settings`) y el
+# armado del registro que comparten el demonio y el broker (`logging`).
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Sólo con la bandera `test-support`: el mutex de la captura del registro.
+parking_lot = { version = "0.12", optional = true }
+
+[features]
+# Expone `test_support` (la captura del registro) a las pruebas del demonio y del
+# broker. Fuera de las pruebas no se compila.
+test-support = ["dep:parking_lot"]
 
 [dev-dependencies]
 # La prueba de configuración rota arma una carpeta temporal única.

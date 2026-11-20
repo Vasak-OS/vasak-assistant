@@ -81,7 +81,7 @@ fn tools() -> Vec<ToolDef> {
 async fn con_un_backend_listo_cada_pedido_da_su_variante_de_respuesta() {
     let (_server, state) = ready().await;
 
-    let r = |request| state.handle(request, Some("sk-x".into()));
+    let r = |request| state.handle(request, Some("sk-x".into()), None);
     assert!(
         matches!(r(BrokerRequest::Info).await, BrokerResponse::Info(i) if i.provider == "openai")
     );
@@ -140,7 +140,7 @@ async fn un_backend_ollama_listo_tambien_se_arma() {
         },
     );
     assert!(matches!(
-        state.handle(BrokerRequest::Models, None).await,
+        state.handle(BrokerRequest::Models, None, None).await,
         BrokerResponse::Models(Err(_))
     ));
 }
@@ -155,7 +155,7 @@ async fn con_la_config_rechazada_todo_da_no_disponible_con_el_motivo() {
     }
     let reason = rejection.reason.as_str();
 
-    let r = |request| state.handle(request, None);
+    let r = |request| state.handle(request, None, None);
     assert_eq!(
         r(BrokerRequest::Info).await,
         BrokerResponse::Info(rejection.info.clone())
@@ -221,6 +221,7 @@ async fn serve_contesta_un_sobre_enmarcado_por_el_par_de_sockets() {
 
     let envelope = BrokerEnvelope {
         api_key: None,
+        key_base_url: None,
         request: BrokerRequest::Chat { messages: hello() },
     };
     write_frame(&mut client_end, &envelope).await.unwrap();
@@ -276,6 +277,7 @@ async fn run_atiende_una_conexion_por_el_socket_y_sigue_aceptando() {
         let mut stream = UnixStream::connect(&path).await.unwrap();
         let envelope = BrokerEnvelope {
             api_key: None,
+            key_base_url: None,
             request: BrokerRequest::Models,
         };
         write_frame(&mut stream, &envelope).await.unwrap();
@@ -286,4 +288,104 @@ async fn run_atiende_una_conexion_por_el_socket_y_sigue_aceptando() {
 
     task.abort();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── La clave sólo viaja si es para la dirección de la config ─────────────────
+
+/// La dirección base normalizada de la config del broker en `ready()`.
+fn base_of(server: &FakeServer) -> String {
+    crate::config::normalize_url(&server.url("/v1"))
+        .unwrap()
+        .to_string()
+}
+
+fn authorization(server: &FakeServer) -> Vec<Option<String>> {
+    server
+        .captured()
+        .iter()
+        .map(|c| c.header("authorization").map(str::to_owned))
+        .collect()
+}
+
+#[tokio::test]
+async fn la_clave_se_usa_si_key_base_url_es_la_direccion_de_la_config() {
+    let (server, state) = ready().await;
+    let base = base_of(&server);
+
+    state
+        .handle(BrokerRequest::Models, Some("sk-buena".into()), Some(base))
+        .await;
+
+    assert_eq!(authorization(&server), [Some("Bearer sk-buena".to_owned())]);
+}
+
+#[tokio::test]
+async fn la_clave_se_descarta_si_key_base_url_es_de_otra_direccion_o_falta() {
+    let (server, state) = ready().await;
+
+    for other in [Some("https://otro.example/v1/".to_owned()), None] {
+        state
+            .handle(BrokerRequest::Models, Some("sk-ajena".into()), other)
+            .await;
+    }
+
+    // El pedido salió igual, pero sin clave: nunca con la de otro proveedor.
+    assert_eq!(authorization(&server), [None, None]);
+}
+
+#[tokio::test]
+async fn el_destino_sale_de_la_config_y_nunca_de_key_base_url() {
+    let (server, state) = ready().await;
+    let decoy = FakeServer::start(|_| Reply::json(MODELS)).await;
+
+    // `key_base_url` apunta al señuelo: no se conecta ahí, ni con ni sin clave.
+    state
+        .handle(
+            BrokerRequest::Models,
+            Some("sk-x".into()),
+            Some(base_of(&decoy)),
+        )
+        .await;
+
+    assert!(decoy.captured().is_empty(), "el broker conectó al señuelo");
+    assert_eq!(server.captured().len(), 1);
+    assert_eq!(authorization(&server), [None]);
+}
+
+// ── WRITE_TIMEOUT ─────────────────────────────────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn serve_no_se_cuelga_con_un_cliente_que_manda_el_pedido_y_no_lee() {
+    // Una respuesta más grande que el búfer del socket: la escritura se traba
+    // mientras el cliente no lea.
+    let reason = "x".repeat(400 * 1024);
+    let state = State::from_resolved(
+        client(),
+        Resolved::Rejected(Rejection {
+            info: ModelInfo {
+                provider: "raro".into(),
+                name: String::new(),
+                local: true,
+                host: String::new(),
+            },
+            reason,
+        }),
+    );
+    let (mut client_end, server_end) = UnixStream::pair().unwrap();
+    let envelope = BrokerEnvelope {
+        api_key: None,
+        key_base_url: None,
+        request: BrokerRequest::Models,
+    };
+    write_frame(&mut client_end, &envelope).await.unwrap();
+
+    let started = tokio::time::Instant::now();
+    // El plazo externo hace fallar la prueba (en vez de colgarla) si `serve`
+    // no tiene su propio plazo de escritura.
+    let result = tokio::time::timeout(Duration::from_secs(120), serve(server_end, &state)).await;
+
+    assert!(matches!(result, Ok(Ok(()))), "serve no terminó: {result:?}");
+    assert!(started.elapsed() >= Duration::from_secs(10));
+    assert!(started.elapsed() < Duration::from_secs(11));
+    drop(client_end);
 }

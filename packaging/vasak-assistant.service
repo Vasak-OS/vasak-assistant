@@ -73,6 +73,12 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
+# `RestrictAddressFamilies=AF_UNIX` no alcanza por sí solo: con io_uring un
+# demonio comprometido puede abrir un socket IP con `IORING_OP_SOCKET` sin pasar
+# por la syscall `socket()` que esa directiva filtra. Se bloquea io_uring entero
+# (esta segunda línea con `~` resta de lo ya permitido por `@system-service`); el
+# demonio no lo usa. El broker sí tiene red, así que allá no hace falta.
+SystemCallFilter=~@io_uring
 SystemCallErrorNumber=EPERM
 
 # Un volcado de memoria tendría conversaciones, la llave de la memoria y, con

@@ -303,72 +303,14 @@ impl SecretSource for FixedKey {
 
 // ── Captura del registro ──────────────────────────────────────────────────────
 
-/// Lo que se escribió en el registro mientras dura la captura, de cualquier
-/// módulo y en cualquier nivel (hasta `trace`), sin colores.
-#[derive(Clone, Default)]
-pub struct LogCapture(Arc<Mutex<Vec<u8>>>);
-
-impl LogCapture {
-    /// Todo el texto capturado hasta ahora.
-    pub fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock()).into_owned()
-    }
-}
+// La infraestructura de la captura la comparten el broker y el demonio
+// ([`vasak_assistant_ipc::test_support`]); acá sólo se le pasa el filtro de
+// bibliotecas del broker.
+pub use vasak_assistant_ipc::test_support::{CaptureGuard, LogCapture};
 
 /// Captura el registro del hilo actual hasta que se suelta el guardián, con el
 /// mismo filtro de bibliotecas que el broker ([`crate::logging::library_filter`])
 /// y todo lo del broker hasta `trace`.
 pub fn capture_logs() -> (LogCapture, CaptureGuard) {
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::Layer;
-    static INSTALL: std::sync::Once = std::sync::Once::new();
-    INSTALL.call_once(|| {
-        let subscriber = tracing_subscriber::registry().with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(|| CurrentCapture)
-                .with_ansi(false)
-                .with_filter(crate::logging::library_filter()),
-        );
-        let _ = tracing::subscriber::set_global_default(subscriber);
-    });
-    let log = LogCapture::default();
-    let previous = CAPTURE.with(|current| current.replace(Some(log.clone())));
-    (log, CaptureGuard { previous })
-}
-
-thread_local! {
-    /// La captura activa de este hilo, si hay.
-    static CAPTURE: std::cell::RefCell<Option<LogCapture>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Mientras vive, lo que se registra en este hilo va a su captura. Al soltarse
-/// vuelve la que hubiera antes.
-pub struct CaptureGuard {
-    previous: Option<LogCapture>,
-}
-
-impl Drop for CaptureGuard {
-    fn drop(&mut self) {
-        let previous = self.previous.take();
-        CAPTURE.with(|current| *current.borrow_mut() = previous);
-    }
-}
-
-/// El escritor del suscriptor global: va a la captura activa del hilo, o a
-/// ningún lado.
-struct CurrentCapture;
-
-impl std::io::Write for CurrentCapture {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        CAPTURE.with(|current| {
-            if let Some(log) = &*current.borrow() {
-                log.0.lock().extend_from_slice(buf);
-            }
-        });
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
+    vasak_assistant_ipc::test_support::capture_logs(crate::logging::library_filter())
 }

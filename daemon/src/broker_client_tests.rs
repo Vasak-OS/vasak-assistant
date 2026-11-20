@@ -3,6 +3,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::io::AsyncWriteExt;
@@ -315,4 +316,22 @@ async fn una_respuesta_de_otra_variante_se_trata_como_puente_caido() {
     assert!(is_unavailable(client.active_model().await));
     assert!(is_unavailable(client.active_supports_tools().await));
     assert!(is_unavailable(client.chat_tools(&thread(), &tools()).await));
+}
+
+#[tokio::test(start_paused = true)]
+async fn un_broker_que_acepta_y_nunca_responde_da_no_disponible_tras_el_plazo() {
+    let broker = FakeBrokerSocket::raw(|mut stream| async move {
+        let _ = read_frame::<_, BrokerEnvelope>(&mut stream).await;
+        // Conectado, con el pedido recibido, y en silencio para siempre.
+        std::future::pending::<()>().await;
+    })
+    .await;
+    let client = broker.client("ollama", None);
+
+    let started = tokio::time::Instant::now();
+    let result = client.chat(&user("hola")).await;
+
+    assert!(is_unavailable(result));
+    assert!(started.elapsed() >= Duration::from_secs(330));
+    assert!(started.elapsed() < Duration::from_secs(331));
 }

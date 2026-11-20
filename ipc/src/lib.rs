@@ -17,7 +17,16 @@ pub mod backend;
 // que arma la URL y abre el socket) y el demonio (que sirve `info()` de su
 // propia config y lee la clave por la misma dirección base normalizada).
 pub mod config;
+// El armado del registro y las piezas del llavero (la clave y de dónde sale),
+// compartidos por el demonio y el broker con el mismo código.
+pub mod keyring;
+pub mod logging;
 pub mod wire;
+
+// Ayudantes de prueba compartidos (la captura del registro). Sólo con la bandera
+// `test-support`, que las pruebas de los dos crates encienden.
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 use std::path::PathBuf;
 
@@ -31,9 +40,14 @@ pub use backend::{
 };
 pub use wire::{BrokerEnvelope, BrokerRequest, BrokerResponse};
 
-/// El nombre del socket del broker dentro de `$XDG_RUNTIME_DIR`. Ahí, y no en
-/// `/tmp`, porque esa carpeta la crea systemd con permisos sólo para el usuario
-/// (`0700`) y se limpia al cerrar la sesión.
+/// El subdirectorio del asistente dentro de `$XDG_RUNTIME_DIR`. Lo crea systemd
+/// con `RuntimeDirectory=vasak-assistant` (modo `0700`): escribible aun con
+/// `ProtectHome=read-only`, que deja `/run/user/<uid>` de sólo lectura.
+pub const RUNTIME_SUBDIR: &str = "vasak-assistant";
+
+/// El nombre del socket del broker dentro de [`RUNTIME_SUBDIR`]. En
+/// `$XDG_RUNTIME_DIR`, y no en `/tmp`, porque esa carpeta la crea systemd con
+/// permisos sólo para el usuario (`0700`) y se limpia al cerrar la sesión.
 pub const SOCKET_NAME: &str = "vasak-assistant-broker.sock";
 
 /// El tope del cuerpo de cualquier respuesta de un backend. El broker corta la
@@ -47,14 +61,16 @@ pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 /// agrega llaves. Un marco más grande se rechaza antes de reservar la memoria.
 pub const MAX_FRAME_BYTES: usize = MAX_RESPONSE_BYTES * 2;
 
-/// La ruta del socket del broker: `$XDG_RUNTIME_DIR/vasak-assistant-broker.sock`.
-/// `None` si no hay `XDG_RUNTIME_DIR` (fuera de una sesión de usuario).
+/// La ruta del socket del broker:
+/// `$XDG_RUNTIME_DIR/vasak-assistant/vasak-assistant-broker.sock`. `None` si no
+/// hay `XDG_RUNTIME_DIR` (fuera de una sesión de usuario). El subdirectorio lo
+/// crea systemd (`RuntimeDirectory=`) para el broker; el demonio sólo conecta.
 pub fn socket_path() -> Option<PathBuf> {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")?;
     if dir.is_empty() {
         return None;
     }
-    Some(PathBuf::from(dir).join(SOCKET_NAME))
+    Some(PathBuf::from(dir).join(RUNTIME_SUBDIR).join(SOCKET_NAME))
 }
 
 /// Escribe un valor como un marco: `u32` big-endian con el largo del cuerpo,
@@ -105,6 +121,7 @@ mod tests {
     async fn un_marco_va_y_vuelve_igual() {
         let envelope = BrokerEnvelope {
             api_key: Some("sk-x".into()),
+            key_base_url: None,
             request: BrokerRequest::Chat {
                 messages: vec![vasak_assistant_protocol::Message {
                     role: vasak_assistant_protocol::Role::User,

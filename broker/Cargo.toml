@@ -22,8 +22,9 @@ path = "src/main.rs"
 [features]
 # Expone `test_support` a quien depende del broker en sus pruebas (el demonio,
 # cuyas pruebas de integración manejan un backend real contra un servidor de
-# mentira). Fuera de las pruebas no se compila.
-test-support = []
+# mentira). Arrastra la captura del registro compartida del crate `ipc`. Fuera
+# de las pruebas no se compila.
+test-support = ["vasak-assistant-ipc/test-support"]
 
 [dependencies]
 vasak-assistant-protocol.workspace = true
@@ -45,3 +46,5 @@ parking_lot = "0.12"
 [dev-dependencies]
 # Reloj pausado: probar el plazo de lectura de 10 s sin esperarlo.
 tokio = { workspace = true, features = ["test-util"] }
+# Las pruebas del broker usan la captura del registro compartida del crate `ipc`.
+vasak-assistant-ipc = { workspace = true, features = ["test-support"] }

@@ -94,25 +94,82 @@ fn directives(file: &str) -> Vec<String> {
         .collect()
 }
 
-/// Las familias de `RestrictAddressFamilies=` de la unit.
-fn address_families(file: &str) -> Vec<String> {
-    let line = directives(file)
+/// Cada asignación de `RestrictAddressFamilies=` de la unit, en orden. systemd
+/// acumula las asignaciones y una vacía **reinicia** la lista: por eso no basta
+/// con mirar la primera.
+fn address_family_assignments(file: &str) -> Vec<Vec<String>> {
+    directives(file)
         .into_iter()
-        .find_map(|line| {
+        .filter_map(|line| {
             line.strip_prefix("RestrictAddressFamilies=")
-                .map(str::to_owned)
+                .map(|v| v.split_whitespace().map(str::to_owned).collect())
         })
-        .unwrap_or_else(|| panic!("{file} debe llevar RestrictAddressFamilies="));
-    line.split_whitespace().map(str::to_owned).collect()
+        .collect()
+}
+
+/// Las familias efectivas: se aplica cada asignación en orden (vacía = reinicia).
+fn effective_families(assignments: Vec<Vec<String>>) -> Vec<String> {
+    let mut effective: Vec<String> = Vec::new();
+    for assignment in assignments {
+        if assignment.is_empty() {
+            effective.clear();
+        } else {
+            effective.extend(assignment);
+        }
+    }
+    effective
+}
+
+fn address_families(file: &str) -> Vec<String> {
+    effective_families(address_family_assignments(file))
 }
 
 #[test]
 fn el_demonio_solo_puede_abrir_sockets_unix() {
-    let families = address_families("vasak-assistant.service");
+    let assignments = address_family_assignments("vasak-assistant.service");
     assert_eq!(
-        families,
-        ["AF_UNIX"],
-        "el demonio no debe tener AF_INET ni AF_INET6"
+        assignments,
+        [["AF_UNIX"]],
+        "debe haber una sola asignación, AF_UNIX: otra (vacía o con AF_INET) la anularía"
+    );
+    assert_eq!(address_families("vasak-assistant.service"), ["AF_UNIX"]);
+}
+
+#[test]
+fn una_asignacion_vacia_reinicia_las_familias_efectivas() {
+    // Guarda del ayudante: un unit con `RestrictAddressFamilies=` vacío después
+    // de AF_UNIX queda sin restricción, y eso no debe leerse como «AF_UNIX».
+    let unix = vec!["AF_UNIX".to_owned()];
+    assert!(effective_families(vec![unix.clone(), vec![]]).is_empty());
+    assert_eq!(
+        effective_families(vec![unix.clone(), vec![], unix.clone()]),
+        ["AF_UNIX"]
+    );
+    assert_eq!(
+        effective_families(vec![unix, vec!["AF_INET".to_owned()]]),
+        ["AF_UNIX", "AF_INET"]
+    );
+}
+
+#[test]
+fn el_demonio_no_puede_usar_io_uring() {
+    let lines = directives("vasak-assistant.service");
+    assert!(lines
+        .iter()
+        .any(|l| l == "SystemCallFilter=@system-service"));
+    assert!(
+        lines.iter().any(|l| l == "SystemCallFilter=~@io_uring"),
+        "falta SystemCallFilter=~@io_uring en el demonio"
+    );
+}
+
+#[test]
+fn el_broker_crea_su_subdirectorio_de_runtime_donde_vive_el_socket() {
+    let lines = directives("vasak-assistant-broker.service");
+    let expected = format!("RuntimeDirectory={}", vasak_assistant_ipc::RUNTIME_SUBDIR);
+    assert!(
+        lines.contains(&expected),
+        "el broker debe llevar {expected}: el socket vive en ese subdirectorio"
     );
 }
 

@@ -2238,10 +2238,12 @@ name = "vasak-assistant-ipc"
 version = "0.3.29"
 dependencies = [
  "dirs",
+ "parking_lot",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
  "vasak-assistant-protocol",

@@ -25,6 +25,12 @@ use vasak_assistant_ipc::{
 /// puede tardar: envuelve sólo la lectura del sobre, no `handle`.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Cuánto se espera para escribir la respuesta antes de cerrar la conexión. Acota
+/// al cliente que manda el pedido y después no lee: sin esto, la escritura (y el
+/// permiso de conexión) quedarían colgados hasta que el otro lado leyera. No
+/// cubre la llamada al modelo, que ya terminó cuando se escribe la respuesta.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Tope de conexiones a la vez. El cliente legítimo (el demonio) hace pocas; el
 /// tope frena a un proceso del mismo usuario que intente abrir muchas de golpe.
 const MAX_CONNECTIONS: usize = 32;
@@ -83,7 +89,18 @@ impl State {
 
     /// El backend para un pedido. Se arma por pedido porque la clave de OpenAI
     /// llega en el sobre; la dirección sale siempre de la configuración.
-    fn backend(&self, api_key: Option<String>) -> Option<Arc<dyn ModelBackend>> {
+    ///
+    /// `key_base_url` es la dirección para la que el demonio resolvió la clave: el
+    /// broker la **compara** con la suya y sólo usa la clave si coinciden, para que
+    /// —si la config cambió y reinició uno solo de los dos procesos— la clave del
+    /// proveedor nuevo no viaje a la URL del viejo. El destino lo sigue decidiendo
+    /// sólo la config del broker (`selection.url`); nunca se encamina por
+    /// `key_base_url`.
+    fn backend(
+        &self,
+        api_key: Option<String>,
+        key_base_url: Option<String>,
+    ) -> Option<Arc<dyn ModelBackend>> {
         let Resolved::Ready {
             selection,
             allow_remote,
@@ -97,16 +114,29 @@ impl State {
                 selection.clone(),
                 *allow_remote,
             )),
-            BackendKind::OpenAi => Arc::new(OpenAiBackend::new(
-                self.client.clone(),
-                selection.clone(),
-                Arc::new(RequestKey::new(api_key)),
-            )),
+            BackendKind::OpenAi => {
+                let key = match key_base_url {
+                    Some(url) if url == selection.url.as_str() => api_key,
+                    // Sin dirección, o para otra: la clave no se usa (pedido sin
+                    // clave). No se manda nada hacia la URL de `key_base_url`.
+                    _ => None,
+                };
+                Arc::new(OpenAiBackend::new(
+                    self.client.clone(),
+                    selection.clone(),
+                    Arc::new(RequestKey::new(key)),
+                ))
+            }
         })
     }
 
-    pub async fn handle(&self, request: BrokerRequest, api_key: Option<String>) -> BrokerResponse {
-        match self.backend(api_key) {
+    pub async fn handle(
+        &self,
+        request: BrokerRequest,
+        api_key: Option<String>,
+        key_base_url: Option<String>,
+    ) -> BrokerResponse {
+        match self.backend(api_key, key_base_url) {
             Some(backend) => dispatch(backend.as_ref(), request).await,
             None => {
                 let Resolved::Rejected(rejection) = &self.resolved else {
@@ -171,8 +201,15 @@ pub async fn serve(mut stream: UnixStream, state: &State) -> std::io::Result<()>
             // task colgada. La llamada al modelo, abajo, no tiene este plazo.
             Err(_elapsed) => return Ok(()),
         };
-    let response = state.handle(envelope.request, envelope.api_key).await;
-    write_frame(&mut stream, &response).await
+    let response = state
+        .handle(envelope.request, envelope.api_key, envelope.key_base_url)
+        .await;
+    // Un cliente que mandó el pedido y no lee la respuesta no retiene el permiso
+    // de conexión: la escritura tiene su propio plazo, como la lectura de arriba.
+    match tokio::time::timeout(WRITE_TIMEOUT, write_frame(&mut stream, &response)).await {
+        Ok(result) => result,
+        Err(_elapsed) => Ok(()),
+    }
 }
 
 /// El bucle de aceptación: una task por conexión, acotada por [`MAX_CONNECTIONS`],

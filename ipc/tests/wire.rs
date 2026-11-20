@@ -94,6 +94,7 @@ fn ningun_pedido_al_broker_transporta_un_destino() {
 fn el_sobre_solo_agrega_la_clave_y_ningun_destino() {
     let envelope = BrokerEnvelope {
         api_key: Some("sk-x".into()),
+        key_base_url: None,
         request: BrokerRequest::Models,
     };
     let json = serde_json::to_value(&envelope).unwrap();
@@ -106,6 +107,7 @@ fn el_sobre_solo_agrega_la_clave_y_ningun_destino() {
 fn el_debug_del_sobre_no_imprime_la_clave() {
     let envelope = BrokerEnvelope {
         api_key: Some("sk-ultra-secreta-123".into()),
+        key_base_url: None,
         request: BrokerRequest::Chat {
             messages: messages(),
         },
@@ -126,7 +128,40 @@ fn el_debug_del_sobre_no_imprime_la_clave() {
 fn el_debug_del_sobre_sin_clave_no_dice_oculta() {
     let envelope = BrokerEnvelope {
         api_key: None,
+        key_base_url: None,
         request: BrokerRequest::Models,
     };
     assert!(!format!("{envelope:?}").contains("<oculta>"));
+}
+
+#[test]
+fn el_sobre_con_clave_lleva_la_direccion_de_la_clave_y_ninguna_otra_cosa_de_destino() {
+    let envelope = BrokerEnvelope {
+        api_key: Some("sk-x".into()),
+        key_base_url: Some("https://api.openai.com/v1/".into()),
+        request: BrokerRequest::Models,
+    };
+    let json = serde_json::to_value(&envelope).unwrap();
+    let mut top: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
+    top.sort();
+    assert_eq!(top, ["api_key", "key_base_url", "request"]);
+    // La dirección es sólo la marca de la clave: el pedido sigue sin destino.
+    let mut found = Vec::new();
+    keys(&json["request"], &mut found);
+    assert!(found.is_empty(), "{found:?}");
+
+    let back: BrokerEnvelope = serde_json::from_value(json).unwrap();
+    assert_eq!(back, envelope);
+}
+
+#[test]
+fn el_debug_del_sobre_oculta_la_clave_aunque_lleve_su_direccion() {
+    let envelope = BrokerEnvelope {
+        api_key: Some("sk-ultra-secreta-123".into()),
+        key_base_url: Some("https://api.openai.com/v1/".into()),
+        request: BrokerRequest::Models,
+    };
+    let text = format!("{envelope:?}");
+    assert!(!text.contains("sk-ultra-secreta-123"), "{text}");
+    assert!(text.contains("<oculta>"));
 }

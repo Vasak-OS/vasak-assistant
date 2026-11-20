@@ -15,6 +15,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::UnixStream;
 
@@ -24,6 +25,13 @@ use vasak_assistant_protocol::{Message, ModelInfo};
 use crate::backend::{BackendError, BoxFuture, ChatMessage, ModelBackend, ModelTurn, ToolDef};
 use crate::config::{BackendKind, Selection};
 use crate::keyring::SecretSource;
+
+/// El plazo del intercambio con el broker. Cubre `CHAT_TIMEOUT` (300 s, el tope
+/// de una respuesta del modelo en el broker) con margen: si el broker queda
+/// conectado pero no responde, el `read` no vuelve nunca y el permiso de
+/// `Limited` se retendría. Al expirar es «puente no disponible»; no se reintenta,
+/// porque el pedido ya pudo haber salido hacia el modelo.
+const IPC_TIMEOUT: Duration = Duration::from_secs(330);
 
 /// El puente al broker. `info()` sale de la propia configuración (sin ir al
 /// broker); todo lo demás es un viaje de ida y vuelta por el socket.
@@ -47,32 +55,49 @@ impl BrokerClient {
         }
     }
 
-    /// La clave a mandar en el sobre: sólo para OpenAI, leída por la dirección
-    /// base ya normalizada (la misma con que se guardó).
-    async fn envelope_key(&self) -> Option<String> {
+    /// La clave a mandar en el sobre y la dirección para la que se resolvió: sólo
+    /// para OpenAI, leída por la dirección base ya normalizada (la misma con que
+    /// se guardó). El broker compara esa dirección con la suya antes de usar la
+    /// clave, así la clave del proveedor nuevo no viaja a la URL del viejo si la
+    /// config cambió y reinició uno solo de los dos procesos.
+    async fn envelope_key(&self) -> (Option<String>, Option<String>) {
         if self.selection.kind != BackendKind::OpenAi {
-            return None;
+            return (None, None);
         }
-        self.secrets
+        let key = self
+            .secrets
             .api_key(self.selection.url.as_str())
             .await
-            .map(|key| key.expose().to_owned())
+            .map(|key| key.expose().to_owned());
+        let base = key.as_ref().map(|_| self.selection.url.as_str().to_owned());
+        (key, base)
     }
 
     /// Un viaje de ida y vuelta: conecta, manda el sobre, devuelve la respuesta.
-    /// Cualquier falla de E/S es el puente caído.
+    /// Cualquier falla de E/S es el puente caído. El intercambio entero va con un
+    /// plazo ([`IPC_TIMEOUT`]): un broker conectado que no responde no cuelga la
+    /// llamada ni retiene el permiso de `Limited`.
     async fn request(&self, request: BrokerRequest) -> Result<BrokerResponse, BackendError> {
+        let (api_key, key_base_url) = self.envelope_key().await;
         let envelope = BrokerEnvelope {
-            api_key: self.envelope_key().await,
+            api_key,
+            key_base_url,
             request,
         };
-        let mut stream = UnixStream::connect(&self.socket)
-            .await
-            .map_err(|_| bridge_down())?;
-        write_frame(&mut stream, &envelope)
-            .await
-            .map_err(|_| bridge_down())?;
-        read_frame(&mut stream).await.map_err(|_| bridge_down())
+        let exchange = async {
+            let mut stream = UnixStream::connect(&self.socket)
+                .await
+                .map_err(|_| bridge_down())?;
+            write_frame(&mut stream, &envelope)
+                .await
+                .map_err(|_| bridge_down())?;
+            read_frame(&mut stream).await.map_err(|_| bridge_down())
+        };
+        match tokio::time::timeout(IPC_TIMEOUT, exchange).await {
+            Ok(result) => result,
+            // No se reintenta: el pedido ya pudo haber llegado al modelo.
+            Err(_elapsed) => Err(bridge_down()),
+        }
     }
 }
 

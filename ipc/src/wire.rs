@@ -45,10 +45,22 @@ pub enum BrokerRequest {
 /// el sobre y no dentro de [`BrokerRequest`] para que el pedido no tenga ningún
 /// campo que nombre un destino ni cargue un secreto; el broker la usa sólo si su
 /// configuración resuelve a un proveedor que la pide.
+///
+/// `key_base_url` es la dirección base (normalizada) **para la que el demonio
+/// resolvió la clave**: a qué proveedor corresponde. No es un destino —el broker
+/// jamás encamina por ella, el destino lo sigue decidiendo sólo su propia
+/// configuración—; el broker sólo la **compara** con su propia URL antes de usar
+/// la clave. Si no coinciden (la config cambió y reinició uno solo de los dos
+/// procesos), la clave del proveedor nuevo no viaja a la URL del viejo: el
+/// broker trata el pedido como sin clave.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrokerEnvelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// La dirección base para la que el demonio resolvió `api_key`. El broker la
+    /// compara con la suya; nunca encamina por ella.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_base_url: Option<String>,
     pub request: BrokerRequest,
 }
 
@@ -59,6 +71,7 @@ impl std::fmt::Debug for BrokerEnvelope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BrokerEnvelope")
             .field("api_key", &self.api_key.as_ref().map(|_| "<oculta>"))
+            .field("key_base_url", &self.key_base_url)
             .field("request", &self.request)
             .finish()
     }
