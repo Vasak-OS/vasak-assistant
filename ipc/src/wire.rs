@@ -1,10 +1,17 @@
 //! El protocolo del puente de red: un pedido por método del rasgo
 //! [`crate::backend::ModelBackend`], y su respuesta.
 //!
-//! **Regla dura de seguridad:** ningún [`BrokerRequest`] lleva URL ni host. El
-//! demonio no puede nombrar un destino; el único que arma la dirección es el
-//! broker, desde su propia configuración. Así, ante una inyección de
-//! instrucciones, no hay a dónde desviar el pedido.
+//! **Regla dura de seguridad:** ningún pedido **de modelo** lleva URL ni host. El
+//! demonio no puede nombrar un destino para la conversación; el único que arma la
+//! dirección del modelo es el broker, desde su propia configuración. Así, ante una
+//! inyección de instrucciones, no hay a dónde desviar el pedido del modelo.
+//!
+//! La **única excepción sancionada** es [`BrokerRequest::WebFetch`], la habilidad
+//! web: ahí el demonio sí nombra una URL, pero el broker **no la obedece a ciegas**
+//! —la valida contra un allowlist de hosts de su propia configuración y una defensa
+//! SSRF (resuelve el host, rechaza IPs internas y fija la conexión a la IP ya
+//! verificada) antes de salir—. Es sólo lectura: GET, sin credenciales ni cuerpo.
+//! El contenido web es público; un host fuera del allowlist no sale.
 
 use serde::{Deserialize, Serialize};
 
@@ -12,9 +19,11 @@ use vasak_assistant_protocol::{Message, ModelInfo};
 
 use crate::backend::{BackendError, ChatMessage, ModelTurn, ToolDef};
 
-/// Un pedido al broker: una variante por método del rasgo `ModelBackend`.
-/// Ninguna nombra un destino. La clave del proveedor viaja aparte, en
-/// [`BrokerEnvelope`].
+/// Un pedido al broker: una variante por método del rasgo `ModelBackend`, más
+/// [`BrokerRequest::WebFetch`] (la habilidad web). Ninguna de las de **modelo**
+/// nombra un destino; `WebFetch` sí lleva una URL, la excepción explícita que el
+/// broker valida con allowlist + SSRF (ver el encabezado del módulo). La clave del
+/// proveedor viaja aparte, en [`BrokerEnvelope`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum BrokerRequest {
     /// Lo que el demonio sirve de su propia config; el broker igual sabe
@@ -38,6 +47,24 @@ pub enum BrokerRequest {
         messages: Vec<ChatMessage>,
         tools: Vec<ToolDef>,
     },
+    /// La habilidad web: leer una página. **No es un pedido de modelo**: no pasa
+    /// por ningún `ModelBackend`. Lleva la URL (la excepción a la regla «sin
+    /// destino»), que el broker valida contra su allowlist y la defensa SSRF antes
+    /// de salir. Sólo lectura: GET, sin credenciales ni cuerpo.
+    WebFetch {
+        url: String,
+    },
+}
+
+/// Lo que trae una lectura web: la dirección final (sin redirecciones, igual a la
+/// pedida), el tipo de contenido declarado por el servidor y el cuerpo ya recortado
+/// a [`crate::MAX_RESPONSE_BYTES`] (ver `read_capped` del broker). El cuerpo es
+/// texto; un binario llega como su mejor interpretación UTF-8.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WebContent {
+    pub final_url: String,
+    pub content_type: String,
+    pub body: String,
 }
 
 /// Lo que el demonio escribe en el socket: el pedido y, sólo si el proveedor la
@@ -93,4 +120,7 @@ pub enum BrokerResponse {
     Text(Result<String, BackendError>),
     /// `chat_tools` y `chat_tools_local_only`.
     Turn(Result<ModelTurn, BackendError>),
+    /// `web_fetch`: el contenido de la página, o por qué no se pudo (host fuera del
+    /// allowlist, IP interna, esquema inválido, el servidor falló).
+    Web(Result<WebContent, BackendError>),
 }

@@ -16,6 +16,7 @@ pub mod logging;
 pub mod ollama;
 pub mod openai;
 pub mod server;
+pub mod web;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

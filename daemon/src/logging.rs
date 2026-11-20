@@ -390,6 +390,7 @@ mod startup_tests {
             share_contacts_with_remote: false,
             share_files_with_remote: false,
             lince_files_roots: Vec::new(),
+            web_allowed_hosts: Vec::new(),
         }
     }
 

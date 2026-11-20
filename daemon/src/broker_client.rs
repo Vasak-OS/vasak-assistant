@@ -19,12 +19,15 @@ use std::time::Duration;
 
 use tokio::net::UnixStream;
 
-use vasak_assistant_ipc::{read_frame, write_frame, BrokerEnvelope, BrokerRequest, BrokerResponse};
+use vasak_assistant_ipc::{
+    read_frame, write_frame, BrokerEnvelope, BrokerRequest, BrokerResponse, WebContent,
+};
 use vasak_assistant_protocol::{Message, ModelInfo};
 
 use crate::backend::{BackendError, BoxFuture, ChatMessage, ModelBackend, ModelTurn, ToolDef};
 use crate::config::{BackendKind, Selection};
 use crate::keyring::SecretSource;
+use crate::skills::web::WebFetcher;
 
 /// El plazo del intercambio con el broker. Cubre `CHAT_TIMEOUT` (300 s, el tope
 /// de una respuesta del modelo en el broker) con margen: si el broker queda
@@ -98,6 +101,21 @@ impl BrokerClient {
             // No se reintenta: el pedido ya pudo haber llegado al modelo.
             Err(_elapsed) => Err(bridge_down()),
         }
+    }
+}
+
+/// La habilidad web le pide la lectura al broker por el mismo socket: el demonio no
+/// tiene red, el broker sí (y es quien valida la URL con allowlist + SSRF). No es un
+/// método de `ModelBackend`; el `url` viaja en el pedido (la excepción sancionada a
+/// la regla «sin destino», ver [`BrokerRequest::WebFetch`]). Respeta [`IPC_TIMEOUT`].
+impl WebFetcher for BrokerClient {
+    fn web_fetch(&self, url: String) -> BoxFuture<'_, Result<WebContent, BackendError>> {
+        Box::pin(async move {
+            match self.request(BrokerRequest::WebFetch { url }).await? {
+                BrokerResponse::Web(result) => result,
+                _ => Err(mismatched()),
+            }
+        })
     }
 }
 
