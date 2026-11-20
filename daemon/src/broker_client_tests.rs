@@ -147,6 +147,11 @@ async fn well_behaved() -> FakeBrokerSocket {
                 arguments: serde_json::json!({}),
             }])))
         }
+        BrokerRequest::WebFetch { .. } => BrokerResponse::Web(Ok(WebContent {
+            final_url: "https://ejemplo.com/".into(),
+            content_type: "text/html".into(),
+            body: "web".into(),
+        })),
     })
     .await
 }
@@ -334,4 +339,45 @@ async fn un_broker_que_acepta_y_nunca_responde_da_no_disponible_tras_el_plazo() 
     assert!(is_unavailable(result));
     assert!(started.elapsed() >= Duration::from_secs(330));
     assert!(started.elapsed() < Duration::from_secs(331));
+}
+
+// ── Web ───────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn web_fetch_viaja_con_la_url_y_devuelve_lo_que_contesta_el_broker() {
+    let broker = well_behaved().await;
+    let client = broker.client("ollama", None);
+    let content = client
+        .web_fetch("https://ejemplo.com/a?q=1".into())
+        .await
+        .unwrap();
+    assert_eq!(content.body, "web");
+    assert_eq!(content.final_url, "https://ejemplo.com/");
+    let seen = broker.seen.lock();
+    assert!(matches!(
+        &seen[0].request,
+        BrokerRequest::WebFetch { url } if url == "https://ejemplo.com/a?q=1"
+    ));
+}
+
+#[tokio::test]
+async fn web_fetch_devuelve_el_error_del_broker_y_trata_otra_variante_como_puente_caido() {
+    let denied = FakeBrokerSocket::start(|_| {
+        BrokerResponse::Web(Err(BackendError::NotAllowed("no habilitado".into())))
+    })
+    .await;
+    assert_eq!(
+        denied
+            .client("ollama", None)
+            .web_fetch("https://x.org/".into())
+            .await,
+        Err(BackendError::NotAllowed("no habilitado".into()))
+    );
+    let wrong = FakeBrokerSocket::start(|_| BrokerResponse::Text(Ok("x".into()))).await;
+    assert!(is_unavailable(
+        wrong
+            .client("ollama", None)
+            .web_fetch("https://x.org/".into())
+            .await
+    ));
 }

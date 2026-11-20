@@ -84,6 +84,13 @@ pub struct Settings {
     /// disponible). Nunca todo el disco por defecto. El recurso `files` de
     /// `vasak-permissions` es el on/off grueso; esto es qué puede ver.
     pub lince_files_roots: Vec<String>,
+    /// Los hosts web que Lince puede leer (el alcance fino de la habilidad web).
+    /// El **broker** —el único con red— es el dueño de este destino: lee esta lista
+    /// y rechaza cualquier host que no sea una entrada ni su subdominio. Por omisión
+    /// **ninguno**: sin un host configurado, Lince no sale a la web (la capacidad se
+    /// ve no disponible). Nunca toda la web por defecto. El recurso `web` de
+    /// `vasak-permissions` es el on/off grueso; esto es a qué sitios puede llegar.
+    pub web_allowed_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -376,6 +383,7 @@ mod tests {
             share_contacts_with_remote: false,
             share_files_with_remote: false,
             lince_files_roots: Vec::new(),
+            web_allowed_hosts: Vec::new(),
         }
     }
 

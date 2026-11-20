@@ -38,7 +38,7 @@ pub use backend::{
     flatten_messages, BackendError, BoxFuture, ChatMessage, ModelBackend, ModelTurn, ToolCall,
     ToolDef, METADATA_BUSY, NOT_LOCAL, REMOTE_AFTER_SEND,
 };
-pub use wire::{BrokerEnvelope, BrokerRequest, BrokerResponse};
+pub use wire::{BrokerEnvelope, BrokerRequest, BrokerResponse, WebContent};
 
 /// El subdirectorio del asistente dentro de `$XDG_RUNTIME_DIR`. Lo crea systemd
 /// con `RuntimeDirectory=vasak-assistant` (modo `0700`): escribible aun con

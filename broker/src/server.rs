@@ -45,17 +45,23 @@ pub enum Resolved {
     Rejected(Rejection),
 }
 
-/// Lo que comparten todas las conexiones: el cliente HTTP (uno solo) y lo que se
-/// resolvió de la configuración.
+/// Lo que comparten todas las conexiones: el cliente HTTP (uno solo), lo que se
+/// resolvió de la configuración del modelo y el allowlist de la habilidad web.
 pub struct State {
     client: reqwest::Client,
     resolved: Resolved,
+    /// Los hosts que la habilidad web puede leer (de `vasak.conf`). El broker es el
+    /// dueño del destino web, igual que lo es del destino del modelo: la lista no
+    /// viene en el pedido. Vacía, no sale nada ([`crate::web::host_allowed`]).
+    web_allowed: Vec<String>,
 }
 
 impl State {
     /// Arma el estado desde la configuración: elige el backend (y registra cuál)
-    /// o guarda el rechazo para contestar «no disponible».
+    /// o guarda el rechazo para contestar «no disponible». El allowlist web sale de
+    /// la misma config.
     pub fn from_settings(client: reqwest::Client, settings: &Settings) -> Self {
+        let web_allowed = settings.web_allowed_hosts.clone();
         let resolved = match crate::config::select_backend(settings) {
             Ok(selection) => {
                 let info = selection.info();
@@ -78,13 +84,29 @@ impl State {
                 Resolved::Rejected(rejection)
             }
         };
-        Self { client, resolved }
+        Self {
+            client,
+            resolved,
+            web_allowed,
+        }
     }
 
-    /// Para las pruebas: arma el estado con un `Resolved` ya decidido.
+    /// Para las pruebas: arma el estado con un `Resolved` ya decidido y sin hosts
+    /// web habilitados.
     #[cfg(any(test, feature = "test-support"))]
     pub fn from_resolved(client: reqwest::Client, resolved: Resolved) -> Self {
-        Self { client, resolved }
+        Self {
+            client,
+            resolved,
+            web_allowed: Vec::new(),
+        }
+    }
+
+    /// Para las pruebas: fija el allowlist web del estado.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_web_allowed(mut self, hosts: Vec<String>) -> Self {
+        self.web_allowed = hosts;
+        self
     }
 
     /// El backend para un pedido. Se arma por pedido porque la clave de OpenAI
@@ -136,6 +158,13 @@ impl State {
         api_key: Option<String>,
         key_base_url: Option<String>,
     ) -> BrokerResponse {
+        // La habilidad web no pasa por ningún `ModelBackend`: sale por el cliente
+        // HTTP del broker con su propia defensa (allowlist + SSRF). Se atiende acá,
+        // antes de `backend()`, para que no dependa de que la config del modelo sea
+        // usable: se puede leer la web aunque el backend del modelo esté rechazado.
+        if let BrokerRequest::WebFetch { url } = request {
+            return BrokerResponse::Web(crate::web::fetch(&self.web_allowed, &url).await);
+        }
         match self.backend(api_key, key_base_url) {
             Some(backend) => dispatch(backend.as_ref(), request).await,
             None => {
@@ -168,6 +197,11 @@ async fn dispatch(backend: &dyn ModelBackend, request: BrokerRequest) -> BrokerR
         BrokerRequest::ChatToolsLocalOnly { messages, tools } => {
             BrokerResponse::Turn(backend.chat_tools_local_only(&messages, &tools).await)
         }
+        // `WebFetch` no es un pedido de modelo: `handle` lo atiende antes de llegar
+        // acá (no usa un `ModelBackend`).
+        BrokerRequest::WebFetch { .. } => {
+            unreachable!("WebFetch se atiende en handle, antes del despacho al modelo")
+        }
     }
 }
 
@@ -188,6 +222,9 @@ fn rejected_response(request: &BrokerRequest, rejection: &Rejection) -> BrokerRe
         BrokerRequest::ChatTools { .. } | BrokerRequest::ChatToolsLocalOnly { .. } => {
             BrokerResponse::Turn(Err(unavailable()))
         }
+        // `WebFetch` no llega acá (lo atiende `handle` antes de `backend()`); el
+        // brazo existe para el `match` exhaustivo. Si llegara, «no disponible».
+        BrokerRequest::WebFetch { .. } => BrokerResponse::Web(Err(unavailable())),
     }
 }
 

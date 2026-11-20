@@ -2715,3 +2715,243 @@ mod files_bus {
         drop(server);
     }
 }
+
+// ── Web ─────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod web {
+    use super::*;
+    use crate::skills::web::{WebFetcher, WebSkill};
+    use vasak_assistant_ipc::WebContent;
+    use vasak_assistant_protocol::DOMAIN_WEB;
+
+    /// Un broker de mentira: contesta lo guionado y anota cada URL pedida.
+    struct FakeFetcher {
+        reply: Result<WebContent, BackendError>,
+        urls: Mutex<Vec<String>>,
+    }
+
+    impl FakeFetcher {
+        fn new(reply: Result<WebContent, BackendError>) -> Arc<Self> {
+            Arc::new(Self {
+                reply,
+                urls: Mutex::default(),
+            })
+        }
+
+        fn page() -> Arc<Self> {
+            Self::new(Ok(WebContent {
+                final_url: "https://ejemplo.com/a".into(),
+                content_type: "text/html".into(),
+                body: "contenido-de-la-pagina".into(),
+            }))
+        }
+    }
+
+    impl WebFetcher for FakeFetcher {
+        fn web_fetch(&self, url: String) -> BoxFuture<'_, Result<WebContent, BackendError>> {
+            self.urls.lock().push(url);
+            let reply = self.reply.clone();
+            Box::pin(async move { reply })
+        }
+    }
+
+    fn skill(fetcher: &Arc<FakeFetcher>, hosts: &[&str]) -> Arc<WebSkill> {
+        Arc::new(WebSkill::new(
+            fetcher.clone(),
+            hosts.iter().map(|h| (*h).to_owned()).collect(),
+        ))
+    }
+
+    fn rig(
+        backend: Arc<ToolBackend>,
+        skill: Arc<WebSkill>,
+        grant: bool,
+    ) -> (AssistantService, Arc<FakePerm>, String) {
+        let perm = FakePerm::new(grant);
+        let chat = Arc::new(MailChat {
+            skills: SkillRegistry::new(vec![skill as Arc<dyn Skill>]),
+            permission: perm.clone(),
+            pending: Mutex::new(PendingActions::default()),
+            ..MailChat::default()
+        });
+        let service = build(backend, chat, false);
+        let conversation = service.conversations.lock().create(OWNER, false).unwrap();
+        (service, perm, conversation)
+    }
+
+    async fn turn(service: &AssistantService, conversation: &str) {
+        service
+            .chat_turn_with(OWNER, conversation, "leé la página", true)
+            .await
+            .unwrap();
+    }
+
+    fn results(backend: &ToolBackend) -> String {
+        format!("{:?}", backend.threads.lock())
+    }
+
+    #[tokio::test]
+    async fn web_fetch_devuelve_el_contenido_con_el_permiso_concedido() {
+        let fetcher = FakeFetcher::page();
+        let backend = ToolBackend::new(vec![
+            call("web_fetch", json!({"url": "https://ejemplo.com/a"})),
+            text("listo"),
+        ]);
+        let (service, perm, conversation) =
+            rig(backend.clone(), skill(&fetcher, &["ejemplo.com"]), true);
+        turn(&service, &conversation).await;
+        assert_eq!(fetcher.urls.lock().as_slice(), ["https://ejemplo.com/a"]);
+        assert!(results(&backend).contains("contenido-de-la-pagina"));
+        let asked: Vec<_> = perm.asked.lock().iter().map(|(r, _)| r.clone()).collect();
+        assert_eq!(asked, [PERMISSION_WEB]);
+    }
+
+    #[tokio::test]
+    async fn sin_el_permiso_web_la_herramienta_no_se_ejecuta() {
+        let fetcher = FakeFetcher::page();
+        let backend = ToolBackend::new(vec![
+            call("web_fetch", json!({"url": "https://ejemplo.com/a"})),
+            text("listo"),
+        ]);
+        let (service, _perm, conversation) =
+            rig(backend.clone(), skill(&fetcher, &["ejemplo.com"]), false);
+        turn(&service, &conversation).await;
+        assert!(fetcher.urls.lock().is_empty(), "no debió llegar al broker");
+        let seen = results(&backend);
+        assert!(seen.contains("no concedió el permiso «web»"), "{seen}");
+        assert!(!seen.contains("contenido-de-la-pagina"));
+    }
+
+    #[tokio::test]
+    async fn un_error_del_broker_vuelve_al_modelo_con_su_motivo() {
+        let fetcher = FakeFetcher::new(Err(BackendError::NotAllowed(
+            "«x» no está habilitado".into(),
+        )));
+        let backend = ToolBackend::new(vec![
+            call("web_fetch", json!({"url": "https://x.org/"})),
+            text("listo"),
+        ]);
+        let (service, _perm, conversation) =
+            rig(backend.clone(), skill(&fetcher, &["a.com"]), true);
+        turn(&service, &conversation).await;
+        assert!(results(&backend).contains("no está habilitado"));
+    }
+
+    #[tokio::test]
+    async fn web_fetch_sin_url_o_una_herramienta_ajena_da_argumentos_invalidos() {
+        let skill = skill(&FakeFetcher::page(), &["ejemplo.com"]);
+        let ctx = SkillCtx {
+            conversation_id: "c".into(),
+        };
+        let missing = skill.call("web_fetch", &json!({}), &ctx).await;
+        assert!(matches!(missing, Err(Error::InvalidArgs(_))));
+        let other = skill.call("otra", &json!({}), &ctx).await;
+        assert!(matches!(other, Err(Error::InvalidArgs(_))));
+    }
+
+    #[test]
+    fn la_habilidad_web_declara_su_dominio_permiso_y_herramienta() {
+        let skill = skill(&FakeFetcher::page(), &[]);
+        assert_eq!(skill.domain(), DOMAIN_WEB);
+        assert_eq!(skill.permission(), PERMISSION_WEB);
+        assert_eq!(PERMISSION_WEB, "web");
+        let names: Vec<_> = skill.tools().into_iter().map(|t| t.name).collect();
+        assert_eq!(names, ["web_fetch"]);
+    }
+
+    #[test]
+    fn la_web_se_comparte_con_un_remoto_sin_consentimiento_aparte() {
+        assert!(MailChat::default().shares_with_remote(DOMAIN_WEB));
+    }
+
+    #[tokio::test]
+    async fn con_un_remoto_la_web_se_ofrece_y_se_ejecuta() {
+        let fetcher = FakeFetcher::page();
+        let backend = ToolBackend::remote(vec![
+            call("web_fetch", json!({"url": "https://ejemplo.com/a"})),
+            text("listo"),
+        ]);
+        let (service, _perm, conversation) =
+            rig(backend.clone(), skill(&fetcher, &["ejemplo.com"]), true);
+        turn(&service, &conversation).await;
+        assert_eq!(backend.offered_tools.lock()[0], 1);
+        assert_eq!(fetcher.urls.lock().len(), 1);
+    }
+
+    // ── web_capability ──
+
+    async fn capability(
+        backend: Arc<ToolBackend>,
+        skill: Option<Arc<WebSkill>>,
+        confined: bool,
+    ) -> vasak_assistant_protocol::Capability {
+        let chat = Arc::new(MailChat {
+            skills: SkillRegistry::new(skill.into_iter().map(|s| s as Arc<dyn Skill>).collect()),
+            permission: FakePerm::new(true),
+            ..MailChat::default()
+        });
+        build(backend, chat, false).web_capability(confined).await
+    }
+
+    #[tokio::test]
+    async fn la_capacidad_web_esta_disponible_con_habilidad_allowlist_y_modelo_con_herramientas() {
+        let fetcher = FakeFetcher::page();
+        for backend in [ToolBackend::new(vec![]), ToolBackend::remote(vec![])] {
+            let cap = capability(backend, Some(skill(&fetcher, &["ejemplo.com"])), false).await;
+            assert_eq!(cap.domain, DOMAIN_WEB);
+            assert!(cap.available && cap.reason.is_empty(), "{}", cap.reason);
+        }
+    }
+
+    #[tokio::test]
+    async fn la_capacidad_web_no_esta_disponible_con_motivo_en_cada_caso_que_falta() {
+        let fetcher = FakeFetcher::page();
+        let good = || Some(skill(&fetcher, &["ejemplo.com"]));
+        let unreachable = ToolBackend::new(vec![]);
+        *unreachable.active_model_error.lock() = Some(BackendError::Unavailable("caído".into()));
+        let denied = ToolBackend::new(vec![]);
+        *denied.active_model_error.lock() = Some(BackendError::NotAllowed("nube".into()));
+        let cases = [
+            (
+                "confinado",
+                capability(ToolBackend::new(vec![]), good(), true).await,
+            ),
+            (
+                "sin habilidad",
+                capability(ToolBackend::new(vec![]), None, false).await,
+            ),
+            (
+                "sin herramientas",
+                capability(ToolBackend::without_tools(), good(), false).await,
+            ),
+            (
+                "sin allowlist",
+                capability(ToolBackend::new(vec![]), Some(skill(&fetcher, &[])), false).await,
+            ),
+            (
+                "allowlist en blanco",
+                capability(
+                    ToolBackend::new(vec![]),
+                    Some(skill(&fetcher, &["  "])),
+                    false,
+                )
+                .await,
+            ),
+            ("modelo caído", capability(unreachable, good(), false).await),
+            (
+                "modelo no permitido",
+                capability(denied, good(), false).await,
+            ),
+        ];
+        let mut reasons = std::collections::HashSet::new();
+        for (name, cap) in cases {
+            assert_eq!(cap.domain, DOMAIN_WEB, "{name}");
+            assert!(!cap.available, "{name}");
+            assert!(!cap.reason.is_empty(), "{name}");
+            reasons.insert(cap.reason);
+        }
+        // «sin allowlist» y «allowlist en blanco» comparten motivo.
+        assert_eq!(reasons.len(), 6);
+    }
+}
