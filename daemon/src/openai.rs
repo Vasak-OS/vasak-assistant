@@ -16,7 +16,9 @@ use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use vasak_assistant_protocol::{Message, ModelInfo};
 
-use crate::backend::{BackendError, BoxFuture, ModelBackend};
+use crate::backend::{
+    BackendError, BoxFuture, ChatMessage, ModelBackend, ModelTurn, ToolCall, ToolDef,
+};
 use crate::config::Selection;
 use crate::http::{self, CHAT_TIMEOUT, LIST_TIMEOUT};
 use crate::keyring::{SecretSource, ITEM_SERVICE};
@@ -126,14 +128,32 @@ impl OpenAiBackend {
         let response = self.send(request, "chat/completions").await?;
         parse_chat(&http::read_capped(self.base(), response).await?)
     }
+
+    /// Un turno con herramientas: igual que [`Self::send_chat`] pero manda las
+    /// `tools` y lee `message.tool_calls`. La dirección y el modelo son fijos, así
+    /// que la localidad la decide el rasgo (`chat_tools_local_only` sobre
+    /// [`Self::info`]), no este método.
+    async fn send_chat_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDef],
+    ) -> Result<ModelTurn, BackendError> {
+        let model = self.resolve_model().await?;
+        let request = self
+            .client
+            .post(http::endpoint(self.base(), "chat/completions")?)
+            .timeout(CHAT_TIMEOUT)
+            .json(&ToolsChatRequest {
+                model: &model,
+                messages: messages.iter().map(openai_message).collect(),
+                stream: false,
+                tools: tools.iter().map(tool_spec).collect(),
+            });
+        let response = self.send(request, "chat/completions").await?;
+        parse_chat_tools(&http::read_capped(self.base(), response).await?)
+    }
 }
 
-// PR1: el camino de herramientas es Ollama. Este backend **no** sobrescribe
-// `supports_tools`/`chat_tools`, así que usa el `default` del rasgo, que ignora
-// las herramientas y recae en `chat`: con un proveedor remoto se chatea en
-// texto, sin acciones (no disponible, nunca roto —decisión 2—). El tool-calling
-// de OpenAI (`tools`/`tool_calls` en `/chat/completions`) queda para un
-// follow-up.
 impl ModelBackend for OpenAiBackend {
     fn info(&self) -> ModelInfo {
         self.selection.info()
@@ -166,6 +186,23 @@ impl ModelBackend for OpenAiBackend {
 
     fn chat<'a>(&'a self, messages: &'a [Message]) -> BoxFuture<'a, Result<String, BackendError>> {
         Box::pin(self.send_chat(messages))
+    }
+
+    fn supports_tools(&self) -> bool {
+        // Cualquier servidor que habla la API de OpenAI acepta `tools` en
+        // `/chat/completions`. No hay un endpoint estándar para saber si el
+        // modelo concreto las admite (Ollama lo mira con `/api/show`): se le
+        // ofrecen igual, y si no sabe usarlas responde texto —o, si las rechaza,
+        // el pedido queda «no disponible», nunca roto (decisión 2).
+        true
+    }
+
+    fn chat_tools<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        tools: &'a [ToolDef],
+    ) -> BoxFuture<'a, Result<ModelTurn, BackendError>> {
+        Box::pin(self.send_chat_tools(messages, tools))
     }
 }
 
@@ -221,6 +258,141 @@ pub fn parse_models(body: &[u8]) -> Result<Vec<String>, BackendError> {
     serde_json::from_slice::<ModelsResponse>(body)
         .map(|models| models.data.into_iter().map(|model| model.id).collect())
         .map_err(|_| BackendError::Failed("lista de modelos ilegible".into()))
+}
+
+// ── Las herramientas (tool calling) ─────────────────────────────────────────────
+
+/// El pedido a `/chat/completions` con herramientas. Los mensajes van como JSON
+/// (llevan el rol `tool` y las `tool_calls` del asistente, que [`Message`] no
+/// tiene).
+#[derive(Serialize)]
+struct ToolsChatRequest<'a> {
+    model: &'a str,
+    messages: Vec<serde_json::Value>,
+    stream: bool,
+    tools: Vec<serde_json::Value>,
+}
+
+/// Un mensaje del hilo en el formato de OpenAI. A diferencia de Ollama, los
+/// argumentos de una `tool_call` van como **texto** (JSON serializado) y el
+/// resultado de una herramienta se aparea por `tool_call_id`.
+fn openai_message(message: &ChatMessage) -> serde_json::Value {
+    use serde_json::json;
+    match message {
+        ChatMessage::System(content) => json!({"role": "system", "content": content}),
+        ChatMessage::User(content) => json!({"role": "user", "content": content}),
+        ChatMessage::Assistant { text, calls } if calls.is_empty() => {
+            json!({"role": "assistant", "content": text})
+        }
+        ChatMessage::Assistant { text, calls } => json!({
+            "role": "assistant",
+            "content": text,
+            "tool_calls": calls
+                .iter()
+                .map(|call| json!({
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": call.arguments.to_string(),
+                    },
+                }))
+                .collect::<Vec<_>>(),
+        }),
+        ChatMessage::Tool { id, content } => {
+            json!({"role": "tool", "tool_call_id": id, "content": content})
+        }
+    }
+}
+
+/// Una herramienta en el formato de OpenAI (`type: function`).
+fn tool_spec(tool: &ToolDef) -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+        },
+    })
+}
+
+#[derive(Deserialize)]
+struct ToolsChatResponse {
+    choices: Vec<ToolsChoice>,
+}
+
+#[derive(Deserialize)]
+struct ToolsChoice {
+    message: ToolsMessage,
+}
+
+#[derive(Deserialize)]
+struct ToolsMessage {
+    /// Puede venir `null` cuando el turno es sólo llamadas a herramientas.
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<OpenAiToolCall>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiToolCall {
+    /// OpenAI lo manda; un servidor compatible que no lo haga recibe uno generado.
+    #[serde(default)]
+    id: String,
+    function: OpenAiToolFunction,
+}
+
+#[derive(Deserialize)]
+struct OpenAiToolFunction {
+    name: String,
+    /// OpenAI manda los argumentos como texto (JSON serializado), no como objeto.
+    #[serde(default)]
+    arguments: String,
+}
+
+/// La respuesta de `/chat/completions` con herramientas: o el texto de la
+/// primera opción, o las llamadas que pidió el modelo.
+pub fn parse_chat_tools(body: &[u8]) -> Result<ModelTurn, BackendError> {
+    let response = serde_json::from_slice::<ToolsChatResponse>(body)
+        .map_err(|_| BackendError::Failed("respuesta del modelo ilegible".into()))?;
+    let message = response
+        .choices
+        .into_iter()
+        .next()
+        .map(|choice| choice.message)
+        .ok_or_else(|| BackendError::Failed("el modelo respondió sin texto".into()))?;
+    if message.tool_calls.is_empty() {
+        let text = message
+            .content
+            .ok_or_else(|| BackendError::Failed("el modelo respondió sin texto".into()))?;
+        return Ok(ModelTurn::Text(text));
+    }
+    Ok(ModelTurn::Calls(
+        message
+            .tool_calls
+            .into_iter()
+            .map(|call| ToolCall {
+                id: if call.id.is_empty() {
+                    uuid::Uuid::new_v4().to_string()
+                } else {
+                    call.id
+                },
+                name: call.function.name,
+                arguments: parse_arguments(&call.function.arguments),
+            })
+            .collect(),
+    ))
+}
+
+/// Los argumentos de una `tool_call` de OpenAI vienen como texto JSON. Vacío o
+/// ilegible → objeto vacío: la habilidad reportará lo que falte (nunca roto).
+fn parse_arguments(raw: &str) -> serde_json::Value {
+    if raw.trim().is_empty() {
+        return serde_json::json!({});
+    }
+    serde_json::from_str(raw).unwrap_or_else(|_| serde_json::json!({}))
 }
 
 #[cfg(test)]
@@ -499,3 +671,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "openai_tools_tests.rs"]
+mod tools_tests;
