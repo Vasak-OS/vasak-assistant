@@ -725,10 +725,11 @@ async fn confirmar_un_movimiento_informa_que_el_archivo_se_movio() {
 }
 
 #[tokio::test]
-async fn confirmar_la_creacion_de_un_evento_o_un_contacto_lo_informa() {
+async fn confirmar_la_creacion_de_un_evento_una_tarea_o_un_contacto_lo_informa() {
     for (kind, mensaje) in [
         ("create_event", "Evento creado"),
         ("create_contact", "Contacto creado"),
+        ("create_task", "Tarea creada"),
     ] {
         let r = rig(vec![], true);
         let created = Arc::new(AtomicUsize::new(0));
