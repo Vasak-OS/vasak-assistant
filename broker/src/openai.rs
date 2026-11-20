@@ -13,12 +13,13 @@
 use std::sync::Arc;
 
 use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use vasak_assistant_protocol::{Message, ModelInfo};
 
-use crate::backend::{
+use vasak_assistant_ipc::{
     BackendError, BoxFuture, ChatMessage, ModelBackend, ModelTurn, ToolCall, ToolDef,
 };
+
 use crate::config::Selection;
 use crate::http::{self, CHAT_TIMEOUT, LIST_TIMEOUT};
 use crate::keyring::{SecretSource, ITEM_SERVICE};
@@ -120,7 +121,7 @@ impl OpenAiBackend {
             .client
             .post(http::endpoint(self.base(), "chat/completions")?)
             .timeout(CHAT_TIMEOUT)
-            .json(&ChatRequest {
+            .json(&http::ChatRequest {
                 model: &model,
                 messages,
                 stream: false,
@@ -143,11 +144,11 @@ impl OpenAiBackend {
             .client
             .post(http::endpoint(self.base(), "chat/completions")?)
             .timeout(CHAT_TIMEOUT)
-            .json(&ToolsChatRequest {
+            .json(&http::ToolsChatRequest {
                 model: &model,
                 messages: messages.iter().map(openai_message).collect(),
                 stream: false,
-                tools: tools.iter().map(tool_spec).collect(),
+                tools: tools.iter().map(http::tool_spec).collect(),
             });
         let response = self.send(request, "chat/completions").await?;
         parse_chat_tools(&http::read_capped(self.base(), response).await?)
@@ -208,13 +209,6 @@ impl ModelBackend for OpenAiBackend {
 
 // ── Lo que va y viene ─────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
-struct ChatRequest<'a> {
-    model: &'a str,
-    messages: &'a [Message],
-    stream: bool,
-}
-
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
@@ -262,17 +256,6 @@ pub fn parse_models(body: &[u8]) -> Result<Vec<String>, BackendError> {
 
 // ── Las herramientas (tool calling) ─────────────────────────────────────────────
 
-/// El pedido a `/chat/completions` con herramientas. Los mensajes van como JSON
-/// (llevan el rol `tool` y las `tool_calls` del asistente, que [`Message`] no
-/// tiene).
-#[derive(Serialize)]
-struct ToolsChatRequest<'a> {
-    model: &'a str,
-    messages: Vec<serde_json::Value>,
-    stream: bool,
-    tools: Vec<serde_json::Value>,
-}
-
 /// Un mensaje del hilo en el formato de OpenAI. A diferencia de Ollama, los
 /// argumentos de una `tool_call` van como **texto** (JSON serializado) y el
 /// resultado de una herramienta se aparea por `tool_call_id`.
@@ -303,18 +286,6 @@ fn openai_message(message: &ChatMessage) -> serde_json::Value {
             json!({"role": "tool", "tool_call_id": id, "content": content})
         }
     }
-}
-
-/// Una herramienta en el formato de OpenAI (`type: function`).
-fn tool_spec(tool: &ToolDef) -> serde_json::Value {
-    serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": tool.parameters,
-        },
-    })
 }
 
 #[derive(Deserialize)]

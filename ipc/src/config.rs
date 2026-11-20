@@ -1,0 +1,835 @@
+//! Con qué backend responder, según `vasak.conf`.
+//!
+//! La configuración vive en la misma `vasak.conf` que el resto del sistema
+//! (`~/.config/vasak/vasak.conf`, o `VASAK_CONFIG_PATH`), en la sección
+//! `assistant`. Ahí la va a escribir el panel de Configuración (fase 3); hasta
+//! entonces se edita a mano. Se lee al arrancar: un cambio pide
+//! `systemctl --user restart vasak-assistant`.
+//!
+//! ```json
+//! {
+//!   "assistant": {
+//!     "backend": "openai",
+//!     "url": "https://api.openai.com/v1",
+//!     "model": "gpt-4o-mini",
+//!     "allow_remote": true,
+//!     "share_memory_with_remote": false
+//!   }
+//! }
+//! ```
+//!
+//! Sin la sección, o con un archivo ilegible, queda lo de siempre: Ollama en
+//! `127.0.0.1:11434`, local. **La clave del proveedor nunca va acá**: se lee de
+//! `vasak-keyring` (ver [`crate::keyring`]).
+
+use std::net::IpAddr;
+use std::path::PathBuf;
+
+use serde::Deserialize;
+use url::Url;
+use vasak_assistant_protocol::{ModelInfo, PROVIDER_OLLAMA, PROVIDER_OPENAI};
+
+pub const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
+/// llama.cpp server escucha ahí por omisión; es el compatible con OpenAI más
+/// probable en la máquina.
+pub const DEFAULT_OPENAI_URL: &str = "http://127.0.0.1:8080/v1";
+
+/// La sección `assistant` de `vasak.conf`, tal cual. Lo que falta toma el valor
+/// por omisión.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    /// `ollama` (por omisión) u `openai`.
+    pub backend: Option<String>,
+    /// La dirección base. Por omisión, la local de cada backend.
+    pub url: Option<String>,
+    /// El modelo. Por omisión, el primero que tenga el backend; un remoto lo
+    /// exige.
+    pub model: Option<String>,
+    /// Si se permite un backend remoto (un host que no es de loopback). Por
+    /// omisión no: la conversación no sale de la máquina sin que la persona lo
+    /// haya elegido.
+    pub allow_remote: bool,
+    /// Si la memoria del asistente se usa también con un backend remoto (se
+    /// manda en el contexto y se aprende de esas conversaciones). Por omisión
+    /// no: con un remoto, la memoria no se lee ni se escribe.
+    pub share_memory_with_remote: bool,
+    /// Si el correo (lo que leen las herramientas) se comparte con un backend
+    /// remoto. Es una decisión propia, aparte de la de la memoria: la de la
+    /// memoria NO la satisface. Por omisión no: en operación normal, con un
+    /// remoto no se ofrecen sus herramientas ni le llega su contenido. Queda un
+    /// caso de borde: si un modelo local reapunta a un runner remoto a mitad de
+    /// pedido, un resultado de correo ya pudo haber salido en esa consulta; el
+    /// servicio lo avisa después de hecho (`UNSAFE_REMOTE_AFTER_SEND`). No es,
+    /// entonces, una garantía dura.
+    pub share_mail_with_remote: bool,
+    /// Si el calendario (lo que leen sus herramientas) se comparte con un backend
+    /// remoto. Decisión propia, aparte de la del correo y la de la memoria:
+    /// ninguna la satisface. Por omisión no, con el mismo alcance y el mismo caso
+    /// de borde que [`Settings::share_mail_with_remote`].
+    pub share_calendar_with_remote: bool,
+    /// Si los contactos (lo que leen sus herramientas) se comparten con un backend
+    /// remoto. Decisión propia, aparte de las demás: ninguna la satisface. Por
+    /// omisión no, con el mismo alcance que [`Settings::share_mail_with_remote`]
+    /// (los contactos son sólo lectura, así que no tienen el caso del envío).
+    pub share_contacts_with_remote: bool,
+    /// Si los archivos (lo que leen sus herramientas) se comparten con un backend
+    /// remoto. Decisión propia, aparte de las demás. Por omisión no: con un
+    /// remoto, el contenido de los archivos no se le manda ni se ofrecen sus
+    /// herramientas.
+    pub share_files_with_remote: bool,
+    /// Las carpetas que Lince puede leer (el alcance fino de la habilidad de
+    /// archivos). Rutas absolutas, o con `~/` inicial. Por omisión **ninguna**:
+    /// sin configurar una carpeta, Lince no ve archivos (la capacidad se ve no
+    /// disponible). Nunca todo el disco por defecto. El recurso `files` de
+    /// `vasak-permissions` es el on/off grueso; esto es qué puede ver.
+    pub lince_files_roots: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    Ollama,
+    OpenAi,
+}
+
+/// El backend elegido, ya validado.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selection {
+    pub kind: BackendKind,
+    /// La dirección base, terminada siempre en `/` para que `join` agregue la
+    /// ruta en vez de reemplazar el último tramo (`.../v1` + `models`).
+    pub url: Url,
+    pub model: Option<String>,
+    /// El host es de loopback. Sale de la dirección, no de lo que alguien
+    /// declare.
+    pub local: bool,
+}
+
+impl Selection {
+    pub fn info(&self) -> ModelInfo {
+        ModelInfo {
+            provider: provider_name(self.kind).into(),
+            name: self.model.clone().unwrap_or_default(),
+            local: self.local,
+            host: self.url.host_str().unwrap_or_default().into(),
+        }
+    }
+}
+
+/// Por qué la configuración no se puede usar, con lo que se sabe del backend
+/// para que el estado lo muestre.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rejection {
+    pub info: ModelInfo,
+    pub reason: String,
+}
+
+pub fn provider_name(kind: BackendKind) -> &'static str {
+    match kind {
+        BackendKind::Ollama => PROVIDER_OLLAMA,
+        BackendKind::OpenAi => PROVIDER_OPENAI,
+    }
+}
+
+/// Si el host de la dirección es la propia máquina: `localhost` o una IP de
+/// loopback. Cualquier otro nombre cuenta como remoto, aunque resuelva a
+/// loopback: ante la duda, se trata como que sale de la caja.
+pub fn is_local(url: &Url) -> bool {
+    // `host_str` da las IPv6 entre corchetes (`[::1]`).
+    let host = url.host_str().unwrap_or_default();
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Decide el backend a partir de la configuración. Es pura: no lee archivos ni
+/// habla con nadie.
+///
+/// - El backend tiene que ser `ollama` u `openai`.
+/// - La dirección, `http` o `https`, sin usuario ni contraseña.
+/// - Local (host de loopback): `http` o `https`; el modelo puede faltar.
+/// - Remoto: sólo con `allow_remote`, sólo por `https` (la conversación y la
+///   clave no viajan en claro) y con el modelo explícito (elegir solo el
+///   primero de un proveedor remoto podría ser cualquiera, y cobrarse).
+pub fn select_backend(settings: &Settings) -> Result<Selection, Rejection> {
+    let backend = clean(settings.backend.as_deref()).unwrap_or(PROVIDER_OLLAMA);
+    let model = clean(settings.model.as_deref()).map(str::to_owned);
+    let kind = match backend {
+        PROVIDER_OLLAMA => BackendKind::Ollama,
+        PROVIDER_OPENAI => BackendKind::OpenAi,
+        other => {
+            return Err(Rejection {
+                info: ModelInfo {
+                    provider: other.into(),
+                    name: model.unwrap_or_default(),
+                    local: true,
+                    host: String::new(),
+                },
+                reason: format!(
+                    "El backend «{other}» no existe: tiene que ser «{PROVIDER_OLLAMA}» u «{PROVIDER_OPENAI}»."
+                ),
+            })
+        }
+    };
+    let raw_url = clean(settings.url.as_deref()).unwrap_or(match kind {
+        BackendKind::Ollama => DEFAULT_OLLAMA_URL,
+        BackendKind::OpenAi => DEFAULT_OPENAI_URL,
+    });
+    // Mientras no haya una dirección legible no se habla con nadie: cuenta
+    // como local.
+    let reject_unparsed = |reason: String| Rejection {
+        info: ModelInfo {
+            provider: provider_name(kind).into(),
+            name: model.clone().unwrap_or_default(),
+            local: true,
+            host: String::new(),
+        },
+        reason,
+    };
+    let url = normalize_url(raw_url).map_err(reject_unparsed)?;
+
+    // Un modelo `:cloud`/`-cloud` de Ollama corre en ollama.com aunque se le
+    // hable al Ollama local: su conversación (y, fase 4, la memoria) sale de la
+    // máquina. Cuenta como remoto para el permiso, pero no para el transporte —
+    // el salto al loopback sigue siendo http y el cifrado hacia la nube lo pone
+    // Ollama—, así que no se le exige https ni modelo explícito.
+    let transport_local = is_local(&url);
+    let cloud = kind == BackendKind::Ollama && model.as_deref().is_some_and(is_ollama_cloud_model);
+    let selection = Selection {
+        kind,
+        local: transport_local && !cloud,
+        url,
+        model,
+    };
+    if selection.local {
+        return Ok(selection);
+    }
+    if !settings.allow_remote {
+        let reason = if cloud {
+            format!(
+                "El modelo «{}» de Ollama corre en la nube: la conversación saldría de la máquina. Para usarlo hay que permitirlo con «allow_remote».",
+                selection.model.as_deref().unwrap_or_default()
+            )
+        } else {
+            let host = selection.url.host_str().unwrap_or_default();
+            format!(
+                "«{host}» es un proveedor remoto: la conversación saldría de la máquina. Para usarlo hay que permitirlo con «allow_remote»."
+            )
+        };
+        return Err(Rejection {
+            info: selection.info(),
+            reason,
+        });
+    }
+    // Exigencias de transporte: sólo para un host remoto de verdad.
+    if !transport_local {
+        let host = selection.url.host_str().unwrap_or_default().to_owned();
+        let reason = if selection.url.scheme() != "https" {
+            format!("«{host}» es un proveedor remoto y sólo se le habla por https.")
+        } else if selection.model.is_none() {
+            format!("Con un proveedor remoto («{host}») hay que elegir el modelo.")
+        } else {
+            return Ok(selection);
+        };
+        return Err(Rejection {
+            info: selection.info(),
+            reason,
+        });
+    }
+    Ok(selection)
+}
+
+/// Un modelo de Ollama con sufijo `:cloud` o `-cloud` corre en ollama.com
+/// aunque se le hable al Ollama local: su conversación sale de la máquina.
+/// Sin distinguir mayúsculas: el gate decide si la conversación sale de la
+/// caja, no se apoya en que Ollama normalice los nombres.
+///
+/// Es sólo lo que dice el nombre, lo único que hay al leer la configuración:
+/// un alias sin sufijo lo detecta el backend por `remote_host` (`is_remote` del
+/// broker) en cada pedido.
+pub fn is_ollama_cloud_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.ends_with(":cloud") || model.ends_with("-cloud")
+}
+
+/// La dirección base de un backend, normalizada: `http` o `https`, con host,
+/// sin usuario ni contraseña, sin consulta ni fragmento y terminada en `/`
+/// para que `join` agregue la ruta en vez de reemplazar el último tramo
+/// (`.../v1` + `models`).
+///
+/// Es también el atributo `url` del ítem de la clave en el llavero
+/// ([`crate::keyring`]): quien guarda la clave y quien la lee tienen que
+/// normalizar igual, o no se encuentran. `Err` lleva el motivo para la
+/// persona, sin la dirección (podría traer una contraseña).
+pub fn normalize_url(raw: &str) -> Result<Url, String> {
+    let mut url = Url::parse(raw.trim())
+        .map_err(|error| format!("La dirección del modelo es inválida: {error}."))?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err("La dirección del modelo tiene que ser http o https.".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(
+            "La dirección del modelo no puede llevar usuario ni contraseña: la clave va en el llavero."
+                .into(),
+        );
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err("La dirección del modelo no tiene host.".into());
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    if !url.path().ends_with('/') {
+        let path = format!("{}/", url.path());
+        url.set_path(&path);
+    }
+    Ok(url)
+}
+
+fn clean(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// La sección `assistant` del contenido de `vasak.conf`. Un archivo ilegible, sin
+/// la sección o con tipos que no cuadran da lo de siempre (local), que es lo
+/// seguro; `Err` lleva el motivo para el registro.
+pub fn settings_from_json(content: &str) -> Result<Settings, String> {
+    let config: serde_json::Value = serde_json::from_str(content)
+        .map_err(|error| format!("vasak.conf ilegible ({})", where_and_what(&error)))?;
+    match config.get("assistant") {
+        None => Ok(Settings::default()),
+        Some(section) => Settings::deserialize(section).map_err(|error| {
+            format!(
+                "la sección «assistant» de vasak.conf no cuadra ({})",
+                where_and_what(&error)
+            )
+        }),
+    }
+}
+
+/// Lo que se cuenta de un error de serde: la línea, la columna y la clase. El
+/// texto puede repetir el valor (una clave pegada por error en un campo
+/// booleano, por ejemplo), y este motivo se registra.
+fn where_and_what(error: &serde_json::Error) -> String {
+    let class = match error.classify() {
+        serde_json::error::Category::Io => "E/S",
+        serde_json::error::Category::Syntax => "sintaxis",
+        serde_json::error::Category::Data => "tipo o valor que no cuadra",
+        serde_json::error::Category::Eof => "termina antes de tiempo",
+    };
+    if error.line() == 0 {
+        class.to_owned()
+    } else {
+        format!(
+            "línea {}, columna {}: {class}",
+            error.line(),
+            error.column()
+        )
+    }
+}
+
+/// La ruta de `vasak.conf`. `VASAK_CONFIG_PATH` la pisa, como en el resto del
+/// sistema.
+pub fn config_path() -> Option<PathBuf> {
+    if let Some(set) = std::env::var_os("VASAK_CONFIG_PATH") {
+        if !set.is_empty() {
+            return Some(PathBuf::from(set));
+        }
+    }
+    dirs::home_dir().map(|home| home.join(".config/vasak/vasak.conf"))
+}
+
+/// Lee `vasak.conf`. Si no está, o no se puede usar, lo de siempre.
+pub fn read_settings() -> Settings {
+    let Some(path) = config_path() else {
+        return Settings::default();
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Settings::default();
+    };
+    settings_from_json(&content).unwrap_or_else(|reason| {
+        tracing::warn!("{reason}; se usa el backend local por omisión");
+        Settings::default()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Quien lee o cambia variables de entorno del proceso toma este candado:
+    /// las pruebas corren en paralelo y el entorno es de todo el proceso.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn settings(backend: &str, url: &str, model: &str, allow_remote: bool) -> Settings {
+        let some = |text: &str| (!text.is_empty()).then(|| text.to_owned());
+        Settings {
+            backend: some(backend),
+            url: some(url),
+            model: some(model),
+            allow_remote,
+            share_memory_with_remote: false,
+            share_mail_with_remote: false,
+            share_calendar_with_remote: false,
+            share_contacts_with_remote: false,
+            share_files_with_remote: false,
+            lince_files_roots: Vec::new(),
+        }
+    }
+
+    fn rejected(settings: &Settings) -> Rejection {
+        select_backend(settings).expect_err("la configuración se rechaza")
+    }
+
+    fn url(text: &str) -> Url {
+        Url::parse(text).unwrap()
+    }
+
+    #[test]
+    fn sin_configuracion_queda_ollama_local_en_el_puerto_de_siempre() {
+        let selection = select_backend(&Settings::default()).unwrap();
+        assert_eq!(selection.kind, BackendKind::Ollama);
+        assert_eq!(selection.url.as_str(), "http://127.0.0.1:11434/");
+        assert_eq!(selection.model, None);
+        assert!(selection.local);
+    }
+
+    #[test]
+    fn openai_sin_direccion_usa_la_local_de_llama_cpp() {
+        let selection = select_backend(&settings("openai", "", "", false)).unwrap();
+        assert_eq!(selection.kind, BackendKind::OpenAi);
+        assert_eq!(selection.url.as_str(), "http://127.0.0.1:8080/v1/");
+        assert!(selection.local);
+    }
+
+    #[test]
+    fn los_campos_en_blanco_cuentan_como_omitidos() {
+        let selection = select_backend(&settings("  ", "   ", "  ", false)).unwrap();
+        assert_eq!(selection.kind, BackendKind::Ollama);
+        assert_eq!(selection.url.as_str(), "http://127.0.0.1:11434/");
+        assert_eq!(selection.model, None);
+    }
+
+    #[test]
+    fn el_modelo_se_recorta() {
+        let selection = select_backend(&settings("", "", "  llama3.2  ", false)).unwrap();
+        assert_eq!(selection.model.as_deref(), Some("llama3.2"));
+    }
+
+    #[test]
+    fn is_ollama_cloud_model_reconoce_los_dos_sufijos() {
+        assert!(is_ollama_cloud_model("gpt-oss:120b-cloud"));
+        assert!(is_ollama_cloud_model("qwen3:cloud"));
+        // Las mayúsculas no lo salvan del gate.
+        assert!(is_ollama_cloud_model("Qwen3:Cloud"));
+        assert!(is_ollama_cloud_model("GPT-OSS:120B-CLOUD"));
+        assert!(!is_ollama_cloud_model("llama3.2"));
+        assert!(!is_ollama_cloud_model("qwen2.5:7b"));
+        // Sin el separador no es el sufijo.
+        assert!(!is_ollama_cloud_model("micloud"));
+    }
+
+    /// #14: un modelo `cloud` de Ollama corre en la nube aunque se hable al
+    /// Ollama local; sin `allow_remote` la conversación no puede salir de la
+    /// máquina.
+    #[test]
+    fn un_modelo_cloud_de_ollama_sin_allow_remote_se_rechaza() {
+        let rejection = rejected(&settings("ollama", "", "qwen3:cloud", false));
+        assert!(rejection.reason.contains("nube"), "{}", rejection.reason);
+        assert!(rejection.reason.contains("allow_remote"));
+        assert!(!rejection.info.local, "un modelo cloud no es local");
+    }
+
+    /// Con `allow_remote` el modelo `cloud` se acepta, y por http al loopback:
+    /// el salto a la nube lo cifra Ollama, no hay que exigirle https al
+    /// localhost ni repetir el modelo (ya es explícito).
+    #[test]
+    fn un_modelo_cloud_de_ollama_con_allow_remote_se_acepta_por_http_local() {
+        let selection = select_backend(&settings("ollama", "", "qwen3:cloud", true)).unwrap();
+        assert!(!selection.local, "un modelo cloud no es local");
+        assert_eq!(selection.url.scheme(), "http");
+        assert_eq!(selection.model.as_deref(), Some("qwen3:cloud"));
+    }
+
+    #[test]
+    fn un_modelo_local_de_ollama_no_es_cloud() {
+        let selection = select_backend(&settings("ollama", "", "llama3.2", false)).unwrap();
+        assert!(selection.local);
+    }
+
+    /// El sufijo `cloud` es cosa de Ollama: en otro backend local no cambia nada.
+    #[test]
+    fn el_sufijo_cloud_solo_cuenta_en_ollama() {
+        let selection = select_backend(&settings(
+            "openai",
+            "http://localhost:8080/v1",
+            "algo-cloud",
+            false,
+        ))
+        .unwrap();
+        assert!(selection.local);
+    }
+
+    #[test]
+    fn un_backend_desconocido_se_rechaza_nombrandolo() {
+        let rejection = rejected(&settings("claude", "", "m", false));
+        assert!(rejection.reason.contains("«claude» no existe"));
+        assert_eq!(rejection.info.provider, "claude");
+        assert_eq!(rejection.info.name, "m");
+        assert!(rejection.info.local);
+        assert!(rejection.info.host.is_empty());
+    }
+
+    #[test]
+    fn un_esquema_que_no_es_http_se_rechaza() {
+        for raw in ["ftp://127.0.0.1/", "file:///etc/passwd", "ws://127.0.0.1/"] {
+            let rejection = rejected(&settings("ollama", raw, "", true));
+            assert!(rejection.reason.contains("http o https"), "{raw}");
+            assert!(rejection.info.local, "{raw}");
+        }
+    }
+
+    #[test]
+    fn una_direccion_ilegible_se_rechaza() {
+        let rejection = rejected(&settings("ollama", "esto no es una url", "", false));
+        assert!(rejection.reason.contains("inválida"));
+        assert_eq!(rejection.info.provider, "ollama");
+    }
+
+    #[test]
+    fn una_direccion_con_usuario_o_contrasena_se_rechaza() {
+        for raw in [
+            "http://usuario@127.0.0.1:11434",
+            "http://usuario:clave@127.0.0.1:11434",
+            "https://:clave@api.openai.com/v1",
+        ] {
+            let rejection = rejected(&settings("openai", raw, "gpt", true));
+            assert!(rejection.reason.contains("usuario ni contraseña"), "{raw}");
+            // La clave de la dirección no debe quedar en lo que se muestra.
+            assert!(!rejection.reason.contains("clave@"), "{raw}");
+            assert!(rejection.info.host.is_empty(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn un_remoto_sin_allow_remote_se_rechaza_y_dice_adonde_iria() {
+        let rejection = rejected(&settings(
+            "openai",
+            "https://api.openai.com/v1",
+            "gpt-4o-mini",
+            false,
+        ));
+        assert!(rejection.reason.contains("allow_remote"));
+        assert!(rejection.reason.contains("api.openai.com"));
+        assert!(!rejection.info.local);
+        assert_eq!(rejection.info.host, "api.openai.com");
+        assert_eq!(rejection.info.name, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn un_remoto_por_http_se_rechaza_aunque_este_permitido() {
+        let rejection = rejected(&settings("openai", "http://api.ejemplo.com/v1", "m", true));
+        assert!(rejection.reason.contains("https"));
+        assert!(!rejection.info.local);
+    }
+
+    #[test]
+    fn un_remoto_sin_modelo_se_rechaza_aunque_este_permitido() {
+        for model in ["", "   "] {
+            let rejection = rejected(&settings(
+                "openai",
+                "https://api.openai.com/v1",
+                model,
+                true,
+            ));
+            assert!(rejection.reason.contains("elegir el modelo"), "{model:?}");
+        }
+    }
+
+    #[test]
+    fn sin_allow_remote_el_rechazo_pesa_mas_que_http_y_que_el_modelo() {
+        let rejection = rejected(&settings("openai", "http://api.ejemplo.com/v1", "", false));
+        assert!(rejection.reason.contains("allow_remote"));
+    }
+
+    #[test]
+    fn un_remoto_permitido_por_https_y_con_modelo_se_acepta() {
+        let selection = select_backend(&settings(
+            "openai",
+            "https://api.openai.com/v1",
+            "gpt-4o-mini",
+            true,
+        ))
+        .unwrap();
+        assert!(!selection.local);
+        assert_eq!(selection.url.as_str(), "https://api.openai.com/v1/");
+        let info = selection.info();
+        assert_eq!(info.provider, "openai");
+        assert_eq!(info.name, "gpt-4o-mini");
+        assert_eq!(info.host, "api.openai.com");
+        assert!(!info.local);
+    }
+
+    #[test]
+    fn un_local_no_necesita_allow_remote_ni_modelo_y_acepta_https() {
+        let selection =
+            select_backend(&settings("openai", "https://localhost:8443/v1", "", false)).unwrap();
+        assert!(selection.local);
+        assert_eq!(selection.model, None);
+    }
+
+    #[test]
+    fn un_nombre_que_resuelve_a_loopback_igual_cuenta_como_remoto() {
+        let rejection = rejected(&settings(
+            "ollama",
+            "http://localhost.evil.com:11434",
+            "",
+            false,
+        ));
+        assert!(rejection.reason.contains("allow_remote"));
+    }
+
+    #[test]
+    fn la_direccion_se_normaliza_sin_consulta_ni_fragmento_y_con_barra_final() {
+        let casos = [
+            ("http://127.0.0.1:8080/v1", "http://127.0.0.1:8080/v1/"),
+            ("http://127.0.0.1:8080/v1/", "http://127.0.0.1:8080/v1/"),
+            ("http://localhost:1234", "http://localhost:1234/"),
+            (
+                "http://127.0.0.1:8080/v1?token=1#parte",
+                "http://127.0.0.1:8080/v1/",
+            ),
+        ];
+        for (raw, expected) in casos {
+            let selection = select_backend(&settings("openai", raw, "", false)).unwrap();
+            assert_eq!(selection.url.as_str(), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn la_ruta_se_agrega_a_la_direccion_base_sin_pisar_el_ultimo_tramo() {
+        let selection =
+            select_backend(&settings("openai", "http://127.0.0.1:8080/v1", "", false)).unwrap();
+        assert_eq!(
+            selection.url.join("models").unwrap().as_str(),
+            "http://127.0.0.1:8080/v1/models"
+        );
+    }
+
+    #[test]
+    fn is_local_reconoce_el_loopback_y_nada_mas() {
+        for raw in [
+            "http://localhost",
+            "http://LOCALHOST:11434",
+            "http://127.0.0.1",
+            "http://127.5.5.5:80",
+            "http://[::1]:11434",
+            "https://[::1]/v1",
+        ] {
+            assert!(is_local(&url(raw)), "{raw} debería ser local");
+        }
+        for raw in [
+            "https://api.openai.com/v1",
+            "http://192.168.1.5:11434",
+            "http://0.0.0.0:11434",
+            "http://[2001:db8::1]",
+            "http://localhost.evil.com",
+            "http://127.0.0.1.evil.com",
+            "http://milocalhost",
+        ] {
+            assert!(!is_local(&url(raw)), "{raw} debería ser remoto");
+        }
+    }
+
+    #[test]
+    fn el_nombre_del_proveedor_sale_del_contrato() {
+        assert_eq!(provider_name(BackendKind::Ollama), PROVIDER_OLLAMA);
+        assert_eq!(provider_name(BackendKind::OpenAi), PROVIDER_OPENAI);
+    }
+
+    #[test]
+    fn el_json_sin_la_seccion_assistant_da_lo_de_siempre() {
+        assert_eq!(
+            settings_from_json(r#"{"theme": "dark"}"#).unwrap(),
+            Settings::default()
+        );
+    }
+
+    #[test]
+    fn la_seccion_assistant_se_lee_y_lo_que_falta_toma_el_valor_por_omision() {
+        let settings = settings_from_json(
+            r#"{"theme":"dark","assistant":{"backend":"openai","model":"m","otra_cosa":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.backend.as_deref(), Some("openai"));
+        assert_eq!(settings.model.as_deref(), Some("m"));
+        assert_eq!(settings.url, None);
+        assert!(!settings.allow_remote);
+    }
+
+    #[test]
+    fn un_json_ilegible_o_con_tipos_que_no_cuadran_da_error() {
+        assert!(settings_from_json("{no es json")
+            .unwrap_err()
+            .contains("ilegible"));
+        let error = settings_from_json(r#"{"assistant":{"allow_remote":"si"}}"#).unwrap_err();
+        assert!(error.contains("no cuadra"));
+    }
+
+    #[test]
+    fn una_configuracion_rota_cae_en_el_backend_local_por_omision() {
+        let _env = ENV_LOCK.lock();
+        let dir = std::env::temp_dir().join(format!("vasak-assistant-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, content: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, content).unwrap();
+            path
+        };
+
+        let valid = write(
+            "valida.conf",
+            r#"{"assistant":{"backend":"openai","allow_remote":true}}"#,
+        );
+        std::env::set_var("VASAK_CONFIG_PATH", &valid);
+        assert_eq!(config_path(), Some(valid));
+        let read = read_settings();
+        assert_eq!(read.backend.as_deref(), Some("openai"));
+        assert!(read.allow_remote);
+
+        for broken in [
+            write("rota.conf", "{esto no es json"),
+            write("tipos.conf", r#"{"assistant":{"allow_remote":"si"}}"#),
+            dir.join("no-existe.conf"),
+        ] {
+            std::env::set_var("VASAK_CONFIG_PATH", &broken);
+            let settings = read_settings();
+            assert_eq!(settings, Settings::default(), "{}", broken.display());
+            let selection = select_backend(&settings).unwrap();
+            assert_eq!(selection.kind, BackendKind::Ollama);
+            assert!(selection.local);
+        }
+
+        // Vacía, la variable no cuenta: se usa la ruta de siempre.
+        std::env::set_var("VASAK_CONFIG_PATH", "");
+        if let Some(path) = config_path() {
+            assert!(path.ends_with(".config/vasak/vasak.conf"));
+        }
+        std::env::remove_var("VASAK_CONFIG_PATH");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn normalize_url_acepta_http_y_https_y_deja_la_barra_final_sin_consulta_ni_fragmento() {
+        let casos = [
+            ("http://127.0.0.1:8080/v1", "http://127.0.0.1:8080/v1/"),
+            ("https://api.openai.com/v1/", "https://api.openai.com/v1/"),
+            ("https://api.openai.com", "https://api.openai.com/"),
+            (
+                "  https://api.openai.com/v1  ",
+                "https://api.openai.com/v1/",
+            ),
+            (
+                "https://api.openai.com/v1?k=1#x",
+                "https://api.openai.com/v1/",
+            ),
+            ("http://[::1]:11434", "http://[::1]:11434/"),
+        ];
+        for (raw, expected) in casos {
+            assert_eq!(normalize_url(raw).unwrap().as_str(), expected, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn normalize_url_rechaza_lo_que_no_sirve_de_direccion_base() {
+        let casos = [
+            ("esto no es una url", "inválida"),
+            ("", "inválida"),
+            ("ftp://127.0.0.1/", "http o https"),
+            ("file:///etc/passwd", "http o https"),
+            ("http://usuario@127.0.0.1", "usuario ni contraseña"),
+            ("https://:clave@api.openai.com/v1", "usuario ni contraseña"),
+            ("http://", "inválida"),
+        ];
+        for (raw, motivo) in casos {
+            let error = normalize_url(raw).expect_err(raw);
+            assert!(error.contains(motivo), "{raw:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn el_error_de_normalize_url_no_repite_la_contrasena_de_la_direccion() {
+        let error = normalize_url("https://usuario:SECRETO-123@api.openai.com/v1").unwrap_err();
+        assert!(!error.contains("SECRETO-123"), "{error}");
+        assert!(!error.contains("usuario:"), "{error}");
+    }
+
+    #[test]
+    fn select_backend_y_normalize_url_dan_la_misma_direccion() {
+        for raw in [
+            "http://127.0.0.1:8080/v1",
+            "https://localhost:8443/v1?x=1#y",
+        ] {
+            let selection = select_backend(&settings("openai", raw, "", false)).unwrap();
+            assert_eq!(selection.url, normalize_url(raw).unwrap(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn la_seccion_assistant_con_el_nombre_del_asistente_no_hace_rechazar_la_configuracion() {
+        let settings = settings_from_json(
+            r#"{"assistant":{"name":"Lince","backend":"openai","url":"http://127.0.0.1:8080/v1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.backend.as_deref(), Some("openai"));
+        assert_eq!(settings.url.as_deref(), Some("http://127.0.0.1:8080/v1"));
+        assert!(select_backend(&settings).is_ok());
+    }
+
+    // ── El motivo no repite el valor ─────────────────────────────────────────
+
+    #[test]
+    fn un_valor_sensible_en_un_campo_de_tipo_equivocado_no_se_repite_en_el_motivo() {
+        for content in [
+            r#"{"assistant":{"allow_remote":"sk-clavecanariaqzx"}}"#,
+            r#"{"assistant":{"share_memory_with_remote":"sk-clavecanariaqzx"}}"#,
+            r#"{"assistant":{"url":["sk-clavecanariaqzx"]}}"#,
+            r#"{"assistant":{"model":{"clave":"sk-clavecanariaqzx"}}}"#,
+            r#"{"assistant":"sk-clavecanariaqzx"}"#,
+            r#"{"assistant":{"allow_remote":123456789}}"#,
+        ] {
+            let reason = settings_from_json(content).unwrap_err();
+            assert!(!reason.contains("clavecanariaqzx"), "{content}: {reason}");
+            assert!(!reason.contains("123456789"), "{content}: {reason}");
+            assert!(reason.contains("vasak.conf"), "{reason}");
+            assert!(
+                reason.contains("línea 1, columna") || reason.contains("tipo o valor"),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn un_json_roto_dice_linea_columna_y_clase_sin_el_texto() {
+        let content = "{\n  \"assistant\": {\"url\": \"sk-clavecanariaqzx\" \"model\": 1}\n}";
+        let reason = settings_from_json(content).unwrap_err();
+        assert!(reason.contains("línea 2, columna"), "{reason}");
+        assert!(reason.contains("sintaxis"), "{reason}");
+        assert!(!reason.contains("clavecanariaqzx"), "{reason}");
+
+        let eof = settings_from_json("{\"assistant\": {\"url\": \"sk-clavecanariaqzx").unwrap_err();
+        assert!(
+            eof.contains("termina antes de tiempo") && !eof.contains("clavecanariaqzx"),
+            "{eof}"
+        );
+    }
+
+    #[test]
+    fn una_configuracion_buena_sigue_leyendose() {
+        let settings = settings_from_json(r#"{"assistant":{"allow_remote":true}}"#).unwrap();
+        assert!(settings.allow_remote);
+        assert_eq!(settings_from_json("{}").unwrap(), Settings::default());
+    }
+}

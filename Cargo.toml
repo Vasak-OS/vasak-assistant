@@ -2,12 +2,16 @@
 # y las aplicaciones —que viven en otros repositorios— puedan depender del
 # contrato sin arrastrar nada de lo que el servicio necesita para su trabajo
 # (el cliente HTTP, el runtime, los backends de modelo).
+#
+# El servicio, a su vez, corre en dos procesos: el demonio (con los datos de la
+# persona, sin `AF_INET` por el unit) y el broker (el único que habla con el
+# modelo por TCP). El contrato interno entre ambos vive en `ipc`.
 [workspace]
 resolver = "2"
-members = ["protocol", "daemon"]
+members = ["protocol", "ipc", "daemon", "broker"]
 
 [workspace.package]
-version = "0.3.28"
+version = "0.3.29"
 edition = "2021"
 authors = ["Vasak Group", "Joaquin (Pato) Decima"]
 license = "GPL-3.0-or-later"
@@ -15,6 +19,7 @@ repository = "https://github.com/Vasak-OS/vasak-assistant"
 
 [workspace.dependencies]
 vasak-assistant-protocol = { path = "protocol" }
+vasak-assistant-ipc = { path = "ipc" }
 serde = { version = "1", features = ["derive"] }
 # El rasgo `tokio` hace que zbus corra los métodos de la interfaz sobre el
 # runtime de Tokio. Sin él se ejecutan sobre el ejecutor propio de zbus, donde

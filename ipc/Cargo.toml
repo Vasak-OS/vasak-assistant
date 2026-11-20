@@ -1,0 +1,41 @@
+# El crate compartido entre el demonio y el broker: el rasgo `ModelBackend`, su
+# error, los tipos de herramientas y el protocolo IPC (pedido/respuesta y el
+# enmarcado). No va en `protocol` —que se publica y es mínimo— porque esto es
+# interno al servicio: nadie de afuera depende del puente de red.
+[package]
+name = "vasak-assistant-ipc"
+description = "Contrato interno del asistente entre el demonio y el broker de red"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vasak-assistant-protocol.workspace = true
+serde = { workspace = true }
+serde_json = "1"
+# `AsyncReadExt`/`AsyncWriteExt` para el enmarcado, y `rt`/`macros` para las
+# pruebas del enmarcado; el runtime de verdad lo traen el demonio y el broker.
+tokio = { version = "1", features = ["io-util", "rt", "macros"] }
+# Sólo para parsear y normalizar la dirección base en `config` (es el mismo
+# tipo que `reqwest::Url`, que reexporta este crate). Sin reqwest acá: el crate
+# compartido no abre ninguna conexión.
+url = "2"
+# Los directorios base XDG para la ruta de `vasak.conf`, como en el demonio.
+dirs = "6"
+# Una línea de aviso cuando `vasak.conf` no se puede leer (`read_settings`) y el
+# armado del registro que comparten el demonio y el broker (`logging`).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Sólo con la bandera `test-support`: el mutex de la captura del registro.
+parking_lot = { version = "0.12", optional = true }
+
+[features]
+# Expone `test_support` (la captura del registro) a las pruebas del demonio y del
+# broker. Fuera de las pruebas no se compila.
+test-support = ["dep:parking_lot"]
+
+[dev-dependencies]
+# La prueba de configuración rota arma una carpeta temporal única.
+uuid = { version = "1", features = ["v4"] }

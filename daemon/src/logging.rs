@@ -20,98 +20,48 @@
 //! que ven los cuerpos (el bus, HTTP, TLS) no pasan de `info` aunque `RUST_LOG`
 //! pida más.
 
-use std::io::IsTerminal;
 use std::time::Instant;
 
-use tracing::level_filters::LevelFilter;
-use tracing_subscriber::filter::{EnvFilter, FilterExt, Targets};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::Layer;
 use vasak_assistant_protocol::Error;
 use zbus::message::Header;
 use zbus::DBusError;
 
-/// Arma el registro del proceso.
-///
-/// - Nivel `info` por omisión para este crate; `RUST_LOG` lo sube o lo baja.
-/// - Las bibliotecas que ven los cuerpos se quedan en `info` pase lo que pase.
-/// - Sin colores si stderr no es una terminal (el journal), y sin la hora
-///   propia si stderr va al journal (`JOURNAL_STREAM`): journald pone la suya.
+// El aviso de pánico lo instala `init` (en `ipc`); el demonio sólo referencia
+// estas funciones en sus pruebas.
+#[cfg(test)]
+pub use vasak_assistant_ipc::logging::{install_panic_hook, panic_report};
+
+/// Los objetivos de biblioteca propios del demonio (el bus): en `debug`/`trace`
+/// vuelcan mensajes del bus. Se suman a los de HTTP/TLS de
+/// [`vasak_assistant_ipc::logging::library_filter`].
+const DAEMON_LIBRARY_TARGETS: &[&str] = &["zbus", "zvariant"];
+
+/// Arma el registro del demonio ([`vasak_assistant_ipc::logging::init`]), con
+/// `zbus`/`zvariant` sumados al filtro de bibliotecas.
 pub fn init() {
-    // El nombre del crate lo pone el compilador: el binario es
-    // `vasak-assistant` pero el paquete es `vasak-assistant-daemon`.
-    let env = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| format!("{}=info", env!("CARGO_CRATE_NAME")).into());
-    let libraries = library_filter();
-    let ansi = std::io::stderr().is_terminal();
-    let journal = std::env::var_os("JOURNAL_STREAM").is_some();
-    let layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_ansi(ansi);
-    let filter = env.and(libraries);
-    let registry = tracing_subscriber::registry();
-    if journal {
-        registry
-            .with(layer.without_time().with_filter(filter))
-            .init();
-    } else {
-        registry.with(layer.with_filter(filter)).init();
-    }
-    install_panic_hook();
+    // El nombre del crate lo pone el compilador: el binario es `vasak-assistant`
+    // pero el paquete es `vasak-assistant-daemon`.
+    vasak_assistant_ipc::logging::init(env!("CARGO_CRATE_NAME"), DAEMON_LIBRARY_TARGETS);
 }
 
-/// Instala el aviso de pánico: una línea `error` sólo con dónde ocurrió
-/// ([`panic_report`]), nunca con el mensaje. El de Rust por omisión escribe el
-/// mensaje en stderr, que va al journal, y ese mensaje puede llevar un valor.
-/// Si todavía no hay registro, la misma línea va directo a stderr.
-pub fn install_panic_hook() {
-    std::panic::set_hook(Box::new(|info| {
-        let report = panic_report(info.location());
-        if tracing::dispatcher::has_been_set() {
-            tracing::error!("{report}");
-        } else {
-            eprintln!("{report}");
-        }
-    }));
+/// El filtro de bibliotecas del demonio (las de HTTP/TLS más el bus), para la
+/// captura del registro de las pruebas ([`crate::test_support::capture_logs`]).
+#[cfg(test)]
+pub fn library_filter() -> tracing_subscriber::filter::Targets {
+    vasak_assistant_ipc::logging::library_filter(DAEMON_LIBRARY_TARGETS)
 }
 
-/// Lo que se cuenta de un pánico: el archivo y la línea donde ocurrió.
-pub fn panic_report(location: Option<&std::panic::Location<'_>>) -> String {
-    match location {
-        Some(location) => format!("pánico en {}:{}", location.file(), location.line()),
-        None => "pánico en un lugar desconocido".to_owned(),
-    }
-}
-
-/// Las bibliotecas que ven los cuerpos (el bus, HTTP, TLS) no pasan de `info`:
-/// en `debug` o `trace` vuelcan mensajes del bus, conversaciones y la cabecera
-/// con la clave. Va aparte del filtro del entorno, así que nada en `RUST_LOG`
-/// lo afloja; las pruebas lo usan igual (`test_support::capture_logs`).
-pub fn library_filter() -> Targets {
-    Targets::new()
-        .with_default(LevelFilter::TRACE)
-        .with_targets(
-            [
-                "zbus",
-                "zvariant",
-                "hyper",
-                "hyper_util",
-                "h2",
-                "reqwest",
-                "rustls",
-                "tower",
-            ]
-            .map(|target| (target, LevelFilter::INFO)),
-        )
+/// Esquema, host y puerto: lo único que se puede mostrar de una dirección.
+fn origin(url: &url::Url) -> String {
+    url.origin().ascii_serialization()
 }
 
 /// Lo que se puede registrar de una dirección: esquema, host y puerto, sin
 /// usuario, contraseña, ruta, consulta ni fragmento. Una dirección que no se
 /// entiende, o que no tiene host, no se muestra.
 pub fn redact_url(raw: &str) -> String {
-    match reqwest::Url::parse(raw.trim()) {
-        Ok(url) if url.host_str().is_some() => crate::http::origin(&url),
+    match url::Url::parse(raw.trim()) {
+        Ok(url) if url.host_str().is_some() => origin(&url),
         _ => "(dirección ilegible)".into(),
     }
 }
@@ -258,7 +208,7 @@ pub fn backend_summary(selection: &crate::config::Selection) -> String {
     format!(
         "backend elegido: {} en {} ({}), modelo {}",
         crate::config::provider_name(selection.kind),
-        crate::http::origin(&selection.url),
+        origin(&selection.url),
         if selection.local { "local" } else { "remoto" },
         selection
             .model
@@ -425,7 +375,8 @@ mod tests {
 mod startup_tests {
     use super::*;
     use crate::config::Settings;
-    use crate::test_support::{local_selection, model_info};
+    use crate::test_support::model_info;
+    use vasak_assistant_broker::test_support::local_selection;
 
     fn settings(allow_remote: bool, share: bool) -> Settings {
         Settings {
@@ -546,7 +497,7 @@ mod startup_tests {
 
         let mut remote = local_selection("openai", server, Some("gpt"));
         remote.local = false;
-        remote.url = reqwest::Url::parse("https://api.ejemplo.com/v1/").unwrap();
+        remote.url = url::Url::parse("https://api.ejemplo.com/v1/").unwrap();
         let line = backend_summary(&remote);
         assert_eq!(
             line,
@@ -557,7 +508,7 @@ mod startup_tests {
     #[test]
     fn el_backend_elegido_no_repite_usuario_clave_ruta_ni_consulta() {
         let mut selection = local_selection("openai", "http://127.0.0.1:8080/v1/", Some("gpt"));
-        selection.url = reqwest::Url::parse(
+        selection.url = url::Url::parse(
             "https://usuariocanario:clavecanaria@api.ejemplo.com:8443/v1/cuentacanaria?token=consultacanaria#frag",
         )
         .unwrap();

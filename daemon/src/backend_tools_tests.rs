@@ -7,6 +7,7 @@ use vasak_assistant_protocol::Role;
 
 use super::*;
 use crate::test_support::{model_info, FakeBackend, ScriptedBackend};
+use vasak_assistant_ipc::flatten_messages;
 
 fn thread() -> Vec<ChatMessage> {
     vec![

@@ -10,9 +10,10 @@ use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use vasak_assistant_protocol::{Message, ModelInfo};
 
-use crate::backend::{
+use vasak_assistant_ipc::{
     BackendError, BoxFuture, ChatMessage, ModelBackend, ModelTurn, ToolCall, ToolDef,
 };
+
 use crate::config::Selection;
 use crate::http::{self, CHAT_TIMEOUT, LIST_TIMEOUT};
 
@@ -111,36 +112,40 @@ impl OllamaBackend {
         Ok((model, remote))
     }
 
-    /// Una sola resolución del modelo para decidir y mandar. Con
-    /// `require_local`, si el modelo resuelto no es local (`cloud`, o una
-    /// dirección remota) no se manda nada.
-    async fn send_chat(
-        &self,
-        messages: &[Message],
-        require_local: bool,
-    ) -> Result<String, BackendError> {
+    /// Resuelve el modelo del pedido y aplica `require_local`: la selección y no
+    /// `info`, así decide con la resolución de este pedido y no con la última de
+    /// cualquiera. Si se pide local y el modelo resuelto no lo es (`cloud`, o
+    /// una dirección remota), no se manda nada ([`BackendError::NotLocal`]).
+    async fn resolve_for(&self, require_local: bool) -> Result<String, BackendError> {
         let (model, remote) = self.resolve_model().await?;
-        // La selección y no `info`: ésta decide con la resolución de este
-        // pedido, no con la última de cualquiera.
         if require_local && !(self.selection.local && !remote) {
             return Err(BackendError::NotLocal);
         }
+        Ok(model)
+    }
+
+    /// Manda el pedido ya armado a `/api/chat`, registra la respuesta, mira el
+    /// status y lee el cuerpo con tope; descarta la respuesta de un modelo que
+    /// cambió a remoto en el medio, sin dejar el host en el registro. Lo
+    /// comparten el chat común y el de herramientas.
+    async fn post_api_chat(
+        &self,
+        model: &str,
+        body: &impl Serialize,
+        require_local: bool,
+    ) -> Result<ChatResponse, BackendError> {
         let response = self
             .client
             .post(http::endpoint(self.base(), "api/chat")?)
             .timeout(CHAT_TIMEOUT)
-            .json(&ChatRequest {
-                model: &model,
-                messages,
-                stream: false,
-            })
+            .json(body)
             .send()
             .await
             .map_err(|error| http::map_error(self.base(), error))?;
         tracing::debug!(
             backend = "ollama",
             operation = "api/chat",
-            model = model.as_str(),
+            model,
             status = response.status().as_u16(),
             "respuesta HTTP"
         );
@@ -148,7 +153,7 @@ impl OllamaBackend {
             status if status.is_success() => {}
             // Ollama contesta 404 cuando el modelo no está: se pudo borrar entre
             // la lista y el pedido.
-            StatusCode::NOT_FOUND => return Err(model_missing(&model)),
+            StatusCode::NOT_FOUND => return Err(model_missing(model)),
             status => {
                 return Err(BackendError::Failed(format!(
                     "Ollama respondió {status} al pedido de chat"
@@ -169,9 +174,32 @@ impl OllamaBackend {
             return Err(if self.allow_remote {
                 BackendError::RemoteAfterSend
             } else {
-                remote_not_allowed(&model)
+                remote_not_allowed(model)
             });
         }
+        Ok(reply)
+    }
+
+    /// Una sola resolución del modelo para decidir y mandar. Con
+    /// `require_local`, si el modelo resuelto no es local (`cloud`, o una
+    /// dirección remota) no se manda nada.
+    async fn send_chat(
+        &self,
+        messages: &[Message],
+        require_local: bool,
+    ) -> Result<String, BackendError> {
+        let model = self.resolve_for(require_local).await?;
+        let reply = self
+            .post_api_chat(
+                &model,
+                &http::ChatRequest {
+                    model: &model,
+                    messages,
+                    stream: false,
+                },
+                require_local,
+            )
+            .await?;
         Ok(reply.message.content)
     }
 
@@ -184,55 +212,14 @@ impl OllamaBackend {
         tools: &[ToolDef],
         require_local: bool,
     ) -> Result<ModelTurn, BackendError> {
-        let (model, remote) = self.resolve_model().await?;
-        if require_local && !(self.selection.local && !remote) {
-            return Err(BackendError::NotLocal);
-        }
-        let payload = ToolsChatRequest {
+        let model = self.resolve_for(require_local).await?;
+        let payload = http::ToolsChatRequest {
             model: &model,
             messages: messages.iter().map(ollama_message).collect(),
             stream: false,
-            tools: tools.iter().map(tool_spec).collect(),
+            tools: tools.iter().map(http::tool_spec).collect(),
         };
-        let response = self
-            .client
-            .post(http::endpoint(self.base(), "api/chat")?)
-            .timeout(CHAT_TIMEOUT)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|error| http::map_error(self.base(), error))?;
-        tracing::debug!(
-            backend = "ollama",
-            operation = "api/chat",
-            model = model.as_str(),
-            status = response.status().as_u16(),
-            "respuesta HTTP"
-        );
-        match response.status() {
-            status if status.is_success() => {}
-            StatusCode::NOT_FOUND => return Err(model_missing(&model)),
-            status => {
-                return Err(BackendError::Failed(format!(
-                    "Ollama respondió {status} al pedido de chat"
-                )))
-            }
-        }
-        let reply = parse_chat(&http::read_capped(self.base(), response).await?)?;
-        // La misma defensa que `send_chat`: si la respuesta vino de un modelo
-        // remoto (reapuntado en el medio), se descarta sin dejar el host en el
-        // registro.
-        if !reply.remote_host.is_empty() && (require_local || !self.allow_remote) {
-            tracing::warn!(
-                backend = "ollama",
-                "el modelo cambió a uno remoto durante el pedido"
-            );
-            return Err(if self.allow_remote {
-                BackendError::RemoteAfterSend
-            } else {
-                remote_not_allowed(&model)
-            });
-        }
+        let reply = self.post_api_chat(&model, &payload, require_local).await?;
         if reply.message.tool_calls.is_empty() {
             Ok(ModelTurn::Text(reply.message.content))
         } else {
@@ -316,16 +303,6 @@ impl ModelBackend for OllamaBackend {
     }
 }
 
-/// El pedido a `/api/chat` con herramientas. Los mensajes van como JSON (llevan
-/// el rol `tool` y las `tool_calls` del asistente, que [`Message`] no tiene).
-#[derive(Serialize)]
-struct ToolsChatRequest<'a> {
-    model: &'a str,
-    messages: Vec<serde_json::Value>,
-    stream: bool,
-    tools: Vec<serde_json::Value>,
-}
-
 /// Un mensaje del hilo en el formato de Ollama.
 fn ollama_message(message: &ChatMessage) -> serde_json::Value {
     use serde_json::json;
@@ -347,26 +324,7 @@ fn ollama_message(message: &ChatMessage) -> serde_json::Value {
     }
 }
 
-/// Una herramienta en el formato de Ollama (`type: function`).
-fn tool_spec(tool: &ToolDef) -> serde_json::Value {
-    serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": tool.parameters,
-        },
-    })
-}
-
 // ── Lo que va y viene ─────────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-struct ChatRequest<'a> {
-    model: &'a str,
-    messages: &'a [Message],
-    stream: bool,
-}
 
 /// El pedido a `/api/show`: sólo el nombre del modelo.
 #[derive(Serialize)]

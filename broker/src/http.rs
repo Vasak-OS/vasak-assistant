@@ -11,8 +11,10 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use reqwest::{redirect, Client, Response, Url};
+use serde::Serialize;
 
-use crate::backend::BackendError;
+use vasak_assistant_ipc::{BackendError, ToolDef, MAX_RESPONSE_BYTES};
+use vasak_assistant_protocol::Message;
 
 /// Cuánto se espera para abrir la conexión.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -21,8 +23,6 @@ pub const LIST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cuánto se espera una respuesta del modelo. Generoso: un modelo local en una
 /// máquina modesta, cargándose por primera vez, tarda.
 pub const CHAT_TIMEOUT: Duration = Duration::from_secs(300);
-/// El tope del cuerpo de cualquier respuesta de un backend.
-pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
 /// El cliente que comparten todos los backends.
 pub fn client() -> reqwest::Result<Client> {
@@ -64,6 +64,40 @@ pub fn map_error(base: &Url, error: reqwest::Error) -> BackendError {
 /// Esquema, host y puerto: lo que se puede mostrar de una dirección.
 pub fn origin(url: &Url) -> String {
     url.origin().ascii_serialization()
+}
+
+/// El pedido de chat sin herramientas: el modelo, la conversación y `stream`
+/// apagado. Lo arman igual los dos backends (Ollama `/api/chat`, OpenAI
+/// `/chat/completions`).
+#[derive(Serialize)]
+pub struct ChatRequest<'a> {
+    pub model: &'a str,
+    pub messages: &'a [Message],
+    pub stream: bool,
+}
+
+/// El pedido de chat con herramientas. Los mensajes van como JSON (llevan el rol
+/// `tool` y las `tool_calls` del asistente, que [`Message`] no tiene); cada
+/// backend arma ese JSON a su formato con su propio `*_message`. La forma del
+/// pedido es común.
+#[derive(Serialize)]
+pub struct ToolsChatRequest<'a> {
+    pub model: &'a str,
+    pub messages: Vec<serde_json::Value>,
+    pub stream: bool,
+    pub tools: Vec<serde_json::Value>,
+}
+
+/// Una herramienta en el formato `type: function`, igual para Ollama y OpenAI.
+pub fn tool_spec(tool: &ToolDef) -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+        },
+    })
 }
 
 /// Lee el cuerpo entero, cortando en cuanto pasa [`MAX_RESPONSE_BYTES`]: un

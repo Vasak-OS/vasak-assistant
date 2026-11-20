@@ -2919,8 +2919,8 @@ mod gate_tests {
     #[tokio::test]
     async fn compartiendo_con_remotos_un_modelo_cloud_sin_allow_remote_sigue_no_disponible_por_el_bus(
     ) {
-        use crate::ollama::OllamaBackend;
-        use crate::test_support::{client, local_selection, FakeServer, Reply};
+        use vasak_assistant_broker::ollama::OllamaBackend;
+        use vasak_assistant_broker::test_support::{client, local_selection, FakeServer, Reply};
 
         let server = FakeServer::start(|pedido| match pedido.path.as_str() {
             "/api/tags" => Reply::json(r#"{"models":[{"name":"gpt-oss:120b-cloud"}]}"#),
@@ -3370,8 +3370,8 @@ mod effective_model_tests {
 
     #[tokio::test]
     async fn compartiendo_con_remotos_un_modelo_cloud_sin_allow_remote_no_esta_disponible() {
-        use crate::ollama::OllamaBackend;
-        use crate::test_support::{client, local_selection, FakeServer, Reply};
+        use vasak_assistant_broker::ollama::OllamaBackend;
+        use vasak_assistant_broker::test_support::{client, local_selection, FakeServer, Reply};
 
         let server = FakeServer::start(|pedido| match pedido.path.as_str() {
             "/api/tags" => Reply::json(r#"{"models":[{"name":"gpt-oss:120b-cloud"}]}"#),
@@ -3394,7 +3394,9 @@ mod effective_model_tests {
     #[tokio::test]
     async fn si_la_respuesta_de_ollama_llega_con_remote_host_sin_allow_remote_da_error_no_se_reintenta_ni_se_aprende(
     ) {
-        use crate::test_support::{ollama_backend, FakeServer, Reply, REMOTE_HOST};
+        use vasak_assistant_broker::test_support::{
+            ollama_backend, FakeServer, Reply, REMOTE_HOST,
+        };
 
         let chat = serde_json::json!({
             "message": {"role": "assistant", "content": "Hola."},
@@ -3455,7 +3457,9 @@ mod effective_model_tests {
     #[tokio::test]
     async fn con_allow_remote_una_respuesta_con_remote_host_se_reintenta_sin_notas_y_no_se_aprende()
     {
-        use crate::test_support::{ollama_backend, FakeServer, Reply, REMOTE_HOST};
+        use vasak_assistant_broker::test_support::{
+            ollama_backend, FakeServer, Reply, REMOTE_HOST,
+        };
 
         // Cada pedido recibe un texto distinto: el primero, con `remote_host`,
         // se descarta; el segundo es el que la persona tiene que ver.
@@ -3517,7 +3521,9 @@ mod effective_model_tests {
 
     #[tokio::test]
     async fn un_alias_con_remote_host_y_allow_remote_sin_compartir_no_ve_la_memoria() {
-        use crate::test_support::{ollama_backend, remote_tags, FakeServer, Reply};
+        use vasak_assistant_broker::test_support::{
+            ollama_backend, remote_tags, FakeServer, Reply,
+        };
 
         let tags = remote_tags("mio:latest");
         let server = FakeServer::start(move |pedido| match pedido.path.as_str() {
@@ -3563,8 +3569,8 @@ mod effective_model_tests {
     #[tokio::test]
     async fn un_ollama_con_modelo_por_omision_cloud_sin_allow_remote_explica_el_motivo_en_el_estado(
     ) {
-        use crate::ollama::OllamaBackend;
-        use crate::test_support::{client, local_selection, FakeServer, Reply};
+        use vasak_assistant_broker::ollama::OllamaBackend;
+        use vasak_assistant_broker::test_support::{client, local_selection, FakeServer, Reply};
 
         let server = FakeServer::start(|pedido| match pedido.path.as_str() {
             "/api/tags" => Reply::json(r#"{"models":[{"name":"gpt-oss:120b-cloud"}]}"#),
@@ -3589,8 +3595,9 @@ mod effective_model_tests {
     #[tokio::test]
     async fn un_unavailable_con_el_texto_de_no_local_no_reintenta_sin_notas() {
         let inner = ScriptedBackend::new(["Hola."]);
-        *inner.reject_local_only.lock() =
-            Some(BackendError::Unavailable(crate::backend::NOT_LOCAL.into()));
+        *inner.reject_local_only.lock() = Some(BackendError::Unavailable(
+            vasak_assistant_ipc::NOT_LOCAL.into(),
+        ));
         let rig = rig(inner.clone(), false).await;
         let id = rig.service.open(OWNER).unwrap();
 
@@ -4648,11 +4655,10 @@ mod privacy_tests {
     use super::*;
     use crate::backend::Limited;
     use crate::memory::{learn::Extraction, learn::Item, schema::MemoryKind};
-    use crate::ollama::OllamaBackend;
-    use crate::openai::OpenAiBackend;
-    use crate::test_support::{
-        capture_logs, client, local_selection, FakeServer, FixedKey, FixedLabel, Reply, TempDir,
-    };
+    use crate::test_support::{capture_logs, FixedKey, FixedLabel, TempDir};
+    use vasak_assistant_broker::ollama::OllamaBackend;
+    use vasak_assistant_broker::openai::OpenAiBackend;
+    use vasak_assistant_broker::test_support::{client, local_selection, FakeServer, Reply};
 
     const OWNER: &str = ":1.7";
     const TAGS: &str = r#"{"models":[{"name":"llama3.2:latest"}]}"#;
@@ -4795,10 +4801,14 @@ mod privacy_tests {
         seeded(&memory).await;
         let service = AssistantService {
             mail: Default::default(),
+            // El backend real de OpenAI toma la clave por el rasgo angosto del
+            // broker; el `keys` del servicio es el llavero del demonio (memoria y
+            // SetProviderKey). En producción la clave va por el IPC; acá se la da
+            // directo para probar que no se filtra al registro.
             backend: Arc::new(Limited::new(Arc::new(OpenAiBackend::new(
                 client(),
                 local_selection("openai", &server.url("/v1"), Some("modelo-a")),
-                keys.clone(),
+                vasak_assistant_broker::test_support::FixedKey::new(Some("sk-clavecanariaqzx")),
             )))),
             conversations: Arc::default(),
             remote_allowed: false,
@@ -5236,7 +5246,7 @@ mod owner_chat_limit_tests {
     fn to_dbus_decide_por_variante_y_no_por_el_texto() {
         assert!(matches!(
             to_dbus(BackendError::NotLocal),
-            Error::Unavailable(text) if text == crate::backend::NOT_LOCAL
+            Error::Unavailable(text) if text == vasak_assistant_ipc::NOT_LOCAL
         ));
         assert!(matches!(
             to_dbus(BackendError::NotAllowed("en la nube".into())),
@@ -5244,7 +5254,7 @@ mod owner_chat_limit_tests {
         ));
         assert!(matches!(
             to_dbus(BackendError::RemoteAfterSend),
-            Error::Unavailable(text) if text == crate::backend::REMOTE_AFTER_SEND
+            Error::Unavailable(text) if text == vasak_assistant_ipc::REMOTE_AFTER_SEND
         ));
         // El texto del cupo lleno en un `Unavailable` no es el cupo lleno.
         assert!(matches!(
