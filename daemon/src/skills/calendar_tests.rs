@@ -354,6 +354,18 @@ async fn un_evento_de_dia_entero_va_como_fecha_con_value_date() {
 }
 
 #[tokio::test]
+async fn un_dia_bisiesto_valido_se_acepta() {
+    let (skill, log, _server) = store().await;
+    let mut args = event_args();
+    // 2028 es bisiesto: el 29 de febrero existe y no se rechaza.
+    args["start"] = json!("2028-02-29");
+    args["end"] = json!("2028-03-01");
+    args["all_day"] = json!(true);
+    let payload = put_payload(&skill, &log, args).await;
+    assert_eq!(payload["start"]["value"], "20280229");
+}
+
+#[tokio::test]
 async fn la_fraccion_de_segundo_de_la_hora_utc_se_recorta() {
     let (skill, log, _server) = store().await;
     let mut args = event_args();
@@ -372,9 +384,23 @@ async fn una_fecha_invalida_en_create_event_es_invalid_args_y_no_deja_accion() {
         ("end", json!("2026-12-01T10:00:00"), false),
         // Hora mal formada.
         ("start", json!("mañana a las nueve Z"), false),
+        // Relleno en vez de los dos puntos: no se compacta a una hora válida.
+        ("start", json!("2026-12-01T09x00x00Z"), false),
+        // Fracción de segundo que no es numérica.
+        ("start", json!("2026-12-01T09:00:00.xyzZ"), false),
+        // Hora fuera de rango.
+        ("start", json!("2026-12-01T29:00:00Z"), false),
+        // Minuto fuera de rango.
+        ("end", json!("2026-12-01T10:70:00Z"), false),
         // Día entero con una hora, o con la fecha rota.
         ("start", json!("2026-12-01T09:00:00Z"), true),
         ("end", json!("2026-12"), true),
+        // Día entero imposible (febrero no tiene 30).
+        ("start", json!("2026-02-30"), true),
+        // Día entero con un separador fuera de lugar.
+        ("end", json!("2026--2-01"), true),
+        // Día entero no bisiesto: 2026 no tiene 29 de febrero.
+        ("start", json!("2026-02-29"), true),
     ];
     for (campo, valor, all_day) in casos {
         let mut args = event_args();

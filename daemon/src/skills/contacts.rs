@@ -12,8 +12,8 @@ use serde_json::{json, Value};
 use zbus::Connection;
 
 use super::dbus::{
-    call_with_timeout, opt_string_arg, store_alive, store_proxy, string_arg, string_array_arg,
-    CALL_TIMEOUT,
+    call_with_timeout, opt_string_arg, store_alive, store_create, store_proxy, string_arg,
+    string_array_arg, CALL_TIMEOUT,
 };
 use super::{Skill, SkillCtx, ToolOutcome, PERMISSION_CONTACTS};
 use crate::backend::{BoxFuture, ToolDef};
@@ -203,34 +203,18 @@ impl ContactsSkill {
         }
         let payload = payload.to_string();
 
-        let action = PendingAction {
-            id: uuid::Uuid::new_v4().to_string(),
-            conversation_id: ctx.conversation_id.clone(),
-            kind: "create_contact".into(),
-            summary: format!("Crear el contacto «{full_name}» en la libreta «{address_book_id}»"),
-            // Campos de correo: vacíos para una acción de contactos.
-            to: String::new(),
-            subject: String::new(),
-            body_preview: String::new(),
-        };
-
-        let connection = self.connection.clone();
-        let execute = Box::new(move || -> BoxFuture<'static, Result<(), Error>> {
-            Box::pin(async move {
-                let proxy = store_proxy(&connection).await?;
-                // `if_match` vacío: crear. Devuelve `{contact_id}`, que no se usa.
-                let _created: String = call_with_timeout(
-                    CALL_TIMEOUT,
-                    proxy.call(
-                        "PutContact",
-                        &(account_id, address_book_id, payload, String::new()),
-                    ),
-                )
-                .await?;
-                Ok(())
-            })
-        });
-
+        let action = PendingAction::simple(
+            uuid::Uuid::new_v4().to_string(),
+            ctx.conversation_id.clone(),
+            "create_contact",
+            format!("Crear el contacto «{full_name}» en la libreta «{address_book_id}»"),
+        );
+        // `if_match` vacío: crear. Se ejecuta recién al confirmar.
+        let execute = store_create(
+            self.connection.clone(),
+            "PutContact",
+            (account_id, address_book_id, payload, String::new()),
+        );
         Ok(ToolOutcome::Pending { action, execute })
     }
 }

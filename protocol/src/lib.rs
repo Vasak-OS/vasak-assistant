@@ -185,6 +185,29 @@ pub struct PendingAction {
     pub body_preview: String,
 }
 
+impl PendingAction {
+    /// Una acción que no es de correo (mover un archivo, crear un evento o un
+    /// contacto): `to`, `subject` y `body_preview` van vacíos —el `summary` lo
+    /// dice todo, y la vista de confirmación rica es otra rebanada—. El `id` (un
+    /// UUID) y el resumen los pone quien la crea.
+    pub fn simple(
+        id: String,
+        conversation_id: String,
+        kind: impl Into<String>,
+        summary: String,
+    ) -> Self {
+        Self {
+            id,
+            conversation_id,
+            kind: kind.into(),
+            summary,
+            to: String::new(),
+            subject: String::new(),
+            body_preview: String::new(),
+        }
+    }
+}
+
 /// La respuesta de un turno de [`Assistant::chat_turn`]: el texto del asistente
 /// y, si corresponde, la acción que propone para que la persona la confirme.
 /// Firma `(sa(sssssss))`.

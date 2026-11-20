@@ -57,6 +57,27 @@ pub(crate) async fn store_proxy(connection: &Connection) -> Result<zbus::Proxy<'
         .map_err(backend_error)
 }
 
+/// El `execute` de una creación por el almacén: arma un proxy nuevo, llama
+/// `method` con `args` —los cuatro textos que toman `PutEvent`/`PutContact`:
+/// cuenta, colección, payload e `if_match`— y descarta el JSON de vuelta. Lo
+/// comparten crear un evento y crear un contacto; se corre recién al confirmar.
+pub(crate) fn store_create(
+    connection: Connection,
+    method: &'static str,
+    args: (String, String, String, String),
+) -> super::SendAction {
+    Box::new(
+        move || -> crate::backend::BoxFuture<'static, Result<(), Error>> {
+            Box::pin(async move {
+                let proxy = store_proxy(&connection).await?;
+                let _created: String =
+                    call_with_timeout(CALL_TIMEOUT, proxy.call(method, &args)).await?;
+                Ok(())
+            })
+        },
+    )
+}
+
 /// Si el almacén de cuentas responde a `GetStatus`: para informar la capacidad.
 /// `GetStatus` no abre ningún diálogo ni pide permiso: si contesta, el almacén
 /// está en pie. Ante cualquier duda, `false` (la capacidad se ve no disponible,

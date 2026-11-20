@@ -12,8 +12,8 @@ use serde_json::{json, Value};
 use zbus::Connection;
 
 use super::dbus::{
-    bool_arg, call_with_timeout, opt_string_arg, store_alive, store_proxy, string_arg,
-    string_array_arg, CALL_TIMEOUT,
+    bool_arg, call_with_timeout, opt_string_arg, store_alive, store_create, store_proxy,
+    string_arg, string_array_arg, CALL_TIMEOUT,
 };
 use super::{Skill, SkillCtx, ToolOutcome, PERMISSION_CALENDAR};
 use crate::backend::{BoxFuture, ToolDef};
@@ -240,35 +240,18 @@ impl CalendarSkill {
         }
         let payload = payload.to_string();
 
-        let action = PendingAction {
-            id: uuid::Uuid::new_v4().to_string(),
-            conversation_id: ctx.conversation_id.clone(),
-            kind: "create_event".into(),
-            summary: format!("Crear el evento «{summary}» en el calendario «{calendar_id}»"),
-            // Campos de correo: vacíos para una acción de calendario. El resumen
-            // lo dice todo; la vista de confirmación rica es otra rebanada.
-            to: String::new(),
-            subject: String::new(),
-            body_preview: String::new(),
-        };
-
-        let connection = self.connection.clone();
-        let execute = Box::new(move || -> BoxFuture<'static, Result<(), Error>> {
-            Box::pin(async move {
-                let proxy = store_proxy(&connection).await?;
-                // `if_match` vacío: crear. Devuelve `{event_id}`, que no se usa.
-                let _created: String = call_with_timeout(
-                    CALL_TIMEOUT,
-                    proxy.call(
-                        "PutEvent",
-                        &(account_id, calendar_id, payload, String::new()),
-                    ),
-                )
-                .await?;
-                Ok(())
-            })
-        });
-
+        let action = PendingAction::simple(
+            uuid::Uuid::new_v4().to_string(),
+            ctx.conversation_id.clone(),
+            "create_event",
+            format!("Crear el evento «{summary}» en el calendario «{calendar_id}»"),
+        );
+        // `if_match` vacío: crear. Se ejecuta recién al confirmar.
+        let execute = store_create(
+            self.connection.clone(),
+            "PutEvent",
+            (account_id, calendar_id, payload, String::new()),
+        );
         Ok(ToolOutcome::Pending { action, execute })
     }
 }
@@ -278,39 +261,101 @@ impl CalendarSkill {
 /// fecha `YYYY-MM-DD` → `YYYYMMDD` con `VALUE=DATE`; uno con hora, una marca
 /// RFC 3339 en UTC (`...Z`) → la forma básica `YYYYMMDDTHHMMSSZ`. Se exige UTC:
 /// una hora con huso (`+01:00`) necesitaría un `TZID`, que es otra rebanada, y se
-/// rechaza para no guardar una hora ambigua. Una fecha mal formada da
-/// `InvalidArgs` para que el modelo la corrija, nunca un valor inventado.
+/// rechaza para no guardar una hora ambigua.
+///
+/// La fecha se parsea entera y se validan los campos reales (mes 1–12, día del
+/// mes con años bisiestos, hora/minuto/segundo en rango): una fecha imposible
+/// (`2026-02-30`), un separador fuera de lugar (`2026--2-01`) o un carácter de
+/// relleno (`2026-12-01T09x00x00Z`) dan `InvalidArgs`, nunca un valor inventado.
 fn ical_datetime(input: &str, all_day: bool) -> Result<(String, Vec<String>), Error> {
     let input = input.trim();
     if all_day {
-        // `YYYY-MM-DD`: diez caracteres, sólo dígitos y guiones, ocho dígitos.
-        let digits: String = input.chars().filter(char::is_ascii_digit).collect();
-        let only_date = input.chars().all(|c| c.is_ascii_digit() || c == '-');
-        if digits.len() != 8 || !only_date {
-            return Err(Error::InvalidArgs(format!(
+        let (y, m, d) = parse_date(input).ok_or_else(|| {
+            Error::InvalidArgs(format!(
                 "la fecha de un evento de día entero es «YYYY-MM-DD»: «{input}»"
-            )));
-        }
-        return Ok((digits, vec!["VALUE=DATE".into()]));
+            ))
+        })?;
+        return Ok((format!("{y:04}{m:02}{d:02}"), vec!["VALUE=DATE".into()]));
     }
-    // Con hora: RFC 3339 en UTC. Se recorta la fracción de segundo si viene.
-    let Some(body) = input.strip_suffix('Z').or_else(|| input.strip_suffix('z')) else {
-        return Err(Error::InvalidArgs(format!(
-            "la hora tiene que estar en UTC y terminar en «Z»: «{input}»"
-        )));
-    };
-    let body = body.split('.').next().unwrap_or(body);
-    let compact: String = body
-        .chars()
-        .filter(|c| c.is_ascii_digit() || *c == 'T')
-        .collect();
-    // `YYYYMMDD` + `T` + `HHMMSS` = 15, con la `T` en el medio.
-    if compact.len() != 15 || compact.as_bytes()[8] != b'T' {
-        return Err(Error::InvalidArgs(format!(
+    // Con hora: RFC 3339 en UTC, `YYYY-MM-DDTHH:MM:SS` con una fracción de
+    // segundo opcional, y la `Z` final.
+    let invalid = || {
+        Error::InvalidArgs(format!(
             "la hora es una marca RFC 3339 en UTC, p. ej. «2026-01-01T09:00:00Z»: «{input}»"
-        )));
+        ))
+    };
+    let body = input
+        .strip_suffix('Z')
+        .or_else(|| input.strip_suffix('z'))
+        .ok_or_else(invalid)?;
+    // Se recorta la fracción de segundo si viene; tiene que ser dígitos.
+    let clock = match body.split_once('.') {
+        Some((clock, frac)) if !frac.is_empty() && frac.bytes().all(|c| c.is_ascii_digit()) => {
+            clock
+        }
+        Some(_) => return Err(invalid()),
+        None => body,
+    };
+    let (date, time) = clock.split_once('T').ok_or_else(invalid)?;
+    let (y, m, d) = parse_date(date).ok_or_else(invalid)?;
+    let (hh, mm, ss) = parse_time(time).ok_or_else(invalid)?;
+    Ok((
+        format!("{y:04}{m:02}{d:02}T{hh:02}{mm:02}{ss:02}Z"),
+        Vec::new(),
+    ))
+}
+
+/// Parsea un `YYYY-MM-DD` exacto y valida los campos (mes 1–12, día del mes con
+/// bisiestos). `None` si la forma o la fecha no son válidas.
+fn parse_date(s: &str) -> Option<(u16, u8, u8)> {
+    let b = s.as_bytes();
+    if s.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
     }
-    Ok((format!("{compact}Z"), Vec::new()))
+    let y: u16 = two_or_four_digits(&s[0..4])?;
+    let m: u8 = two_or_four_digits(&s[5..7])? as u8;
+    let d: u8 = two_or_four_digits(&s[8..10])? as u8;
+    if m < 1 || m > 12 || d < 1 || d > days_in_month(y, m) {
+        return None;
+    }
+    Some((y, m, d))
+}
+
+/// Parsea un `HH:MM:SS` exacto y valida los campos (hora 0–23, minuto 0–59,
+/// segundo 0–60: el 60 es el segundo intercalar de RFC 3339). `None` si no.
+fn parse_time(s: &str) -> Option<(u8, u8, u8)> {
+    let b = s.as_bytes();
+    if s.len() != 8 || b[2] != b':' || b[5] != b':' {
+        return None;
+    }
+    let hh = two_or_four_digits(&s[0..2])? as u8;
+    let mm = two_or_four_digits(&s[3..5])? as u8;
+    let ss = two_or_four_digits(&s[6..8])? as u8;
+    if hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    Some((hh, mm, ss))
+}
+
+/// Un grupo de dígitos ASCII a número. Sólo dígitos: `str::parse` aceptaría un
+/// signo (`+026`), que no es una fecha. `None` si hay algo que no es un dígito.
+fn two_or_four_digits(s: &str) -> Option<u16> {
+    if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// Cuántos días tiene el mes `m` del año `y` (con bisiestos). `m` fuera de 1–12
+/// da 0, que rechaza cualquier día.
+fn days_in_month(y: u16, m: u8) -> u8 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 #[cfg(test)]
