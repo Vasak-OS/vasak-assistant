@@ -72,6 +72,27 @@ pub struct SkillCtx {
     pub conversation_id: String,
 }
 
+/// Arma un [`ToolDef`] envolviendo el esquema de parámetros: `properties` es el
+/// objeto de propiedades y `required` los obligatorios (vacío, ninguno). Evita
+/// repetir el andamiaje `{"type":"object","properties":…,"required":…}` en cada
+/// herramienta.
+pub(crate) fn tool(
+    name: &str,
+    description: &str,
+    properties: serde_json::Value,
+    required: &[&str],
+) -> ToolDef {
+    ToolDef {
+        name: name.into(),
+        description: description.into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": properties,
+            "required": required,
+        }),
+    }
+}
+
 /// Una habilidad del asistente.
 pub trait Skill: Send + Sync {
     /// El dominio que cubre (`DOMAIN_MAIL`).

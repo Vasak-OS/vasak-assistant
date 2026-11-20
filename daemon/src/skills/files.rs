@@ -273,21 +273,16 @@ impl FilesSkill {
                 "el origen y el destino son el mismo archivo".into(),
             ));
         }
-        let action = PendingAction {
-            id: uuid::Uuid::new_v4().to_string(),
-            conversation_id: ctx.conversation_id.clone(),
-            kind: "move_file".into(),
-            summary: format!(
+        let action = PendingAction::simple(
+            uuid::Uuid::new_v4().to_string(),
+            ctx.conversation_id.clone(),
+            "move_file",
+            format!(
                 "Mover «{}» a «{}»",
                 source.to_string_lossy(),
                 target.to_string_lossy()
             ),
-            // Campos de correo: vacíos para una acción de archivos. El resumen lo
-            // dice todo; la vista de confirmación rica es otra rebanada.
-            to: String::new(),
-            subject: String::new(),
-            body_preview: String::new(),
-        };
+        );
         // El `execute` no se queda con las rutas canónicas de recién: las vuelve a
         // resolver desde las crudas al confirmar. Entre proponer y confirmar (hasta
         // el TTL) un componente del camino pudo cambiar —p. ej. un ancestro

@@ -941,6 +941,8 @@ impl AssistantService {
         // no «Enviado»); un movimiento ya ocurrió cuando el `rename` volvió bien.
         Ok(match kind.as_str() {
             "move_file" => MOVED_FILE,
+            "create_event" => CREATED_EVENT,
+            "create_contact" => CREATED_CONTACT,
             _ => QUEUED_FOR_SEND,
         }
         .to_owned())
@@ -1091,8 +1093,11 @@ impl Drop for Turn<'_> {
 /// hacer y que nunca manda un correo sin que la persona lo confirme.
 const SYSTEM_PROMPT: &str = "Sos el asistente de VasakOS. Podés usar las herramientas de \
     correo para buscar y leer mensajes, y para preparar envíos. «send_mail» sólo prepara \
-    el correo: nunca se manda sin que la persona lo confirme. También tenés herramientas \
-    de calendario de sólo lectura para listar y leer eventos y tareas. Con los \
+    el correo: nunca se manda sin que la persona lo confirme. Con el calendario podés \
+    listar y leer calendarios, eventos y tareas, y preparar un evento: «create_event» sólo \
+    lo prepara, nunca lo crea sin que la persona lo confirme. Con los contactos podés \
+    buscar y leer contactos, listar las libretas, y preparar un contacto: «create_contact» \
+    sólo lo prepara, nunca lo crea sin que la persona lo confirme. Con los \
     archivos podés buscar y leer, y mover o renombrar: «move_file» sólo prepara el \
     movimiento, nunca mueve ni sobrescribe sin que la persona lo confirme. Usá las \
     herramientas sólo cuando hagan falta para responder.";
@@ -1121,6 +1126,8 @@ const TOO_MANY_STEPS: &str = "No pude completar la tarea en los pasos disponible
 /// no confirma la entrega real.
 const QUEUED_FOR_SEND: &str = "Puesto en cola para enviar";
 const MOVED_FILE: &str = "Archivo movido";
+const CREATED_EVENT: &str = "Evento creado";
+const CREATED_CONTACT: &str = "Contacto creado";
 
 /// Cuántas llamadas a herramienta puede ejecutar un turno en total, sumadas
 /// sobre todas las respuestas del modelo. [`MAX_TOOL_ITERATIONS`] sólo acota
