@@ -798,6 +798,51 @@ pub fn parse_url(text: &str) -> Url {
     Url::parse(text).expect("la dirección de prueba es válida")
 }
 
+// ── Habilidades: contexto y llamadas de prueba ──────────────────────────────────
+
+/// El contexto de turno que usan las pruebas de habilidades.
+pub fn skill_ctx() -> crate::skills::SkillCtx {
+    crate::skills::SkillCtx {
+        conversation_id: "conv-1".into(),
+    }
+}
+
+/// Llama una herramienta de lectura y devuelve su texto. Falla si deja una
+/// acción pendiente. Lo comparten las pruebas de todas las habilidades.
+pub async fn tool_result<S: crate::skills::Skill>(
+    skill: &S,
+    name: &str,
+    args: serde_json::Value,
+) -> Result<String, Error> {
+    match skill.call(name, &args, &skill_ctx()).await? {
+        crate::skills::ToolOutcome::Result(text) => Ok(text),
+        crate::skills::ToolOutcome::Pending { .. } => {
+            panic!("la herramienta no debía dejar una acción pendiente")
+        }
+    }
+}
+
+/// Llama una herramienta confirmable y devuelve la acción y su ejecución. Falla
+/// si devuelve un resultado directo.
+pub async fn tool_pending<S: crate::skills::Skill>(
+    skill: &S,
+    name: &str,
+    args: serde_json::Value,
+) -> Result<
+    (
+        vasak_assistant_protocol::PendingAction,
+        crate::skills::SendAction,
+    ),
+    Error,
+> {
+    match skill.call(name, &args, &skill_ctx()).await? {
+        crate::skills::ToolOutcome::Pending { action, execute } => Ok((action, execute)),
+        crate::skills::ToolOutcome::Result(_) => {
+            panic!("la herramienta debía dejar una acción pendiente")
+        }
+    }
+}
+
 // ── Un bus de verdad, privado ─────────────────────────────────────────────────
 
 /// Un `dbus-daemon` propio de la prueba, en un socket temporal: dos conexiones

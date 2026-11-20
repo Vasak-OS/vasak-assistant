@@ -86,17 +86,8 @@ async fn store() -> (CalendarSkill, Log, zbus::Connection) {
     (CalendarSkill::new(client), log, server)
 }
 
-fn ctx() -> SkillCtx {
-    SkillCtx {
-        conversation_id: "conv-1".into(),
-    }
-}
-
 async fn run(skill: &CalendarSkill, name: &str, args: Value) -> Result<String, Error> {
-    match skill.call(name, &args, &ctx()).await? {
-        ToolOutcome::Result(text) => Ok(text),
-        ToolOutcome::Pending { .. } => panic!("la herramienta no debía dejar una acción pendiente"),
-    }
+    crate::test_support::tool_result(skill, name, args).await
 }
 
 /// Llama a `create_event` y devuelve la acción pendiente con su ejecución.
@@ -104,10 +95,7 @@ async fn prepare(
     skill: &CalendarSkill,
     args: Value,
 ) -> Result<(PendingAction, crate::skills::SendAction), Error> {
-    match skill.call("create_event", &args, &ctx()).await? {
-        ToolOutcome::Pending { action, execute } => Ok((action, execute)),
-        ToolOutcome::Result(_) => panic!("create_event no debe devolver un resultado directo"),
-    }
+    crate::test_support::tool_pending(skill, "create_event", args).await
 }
 
 fn event_args() -> Value {

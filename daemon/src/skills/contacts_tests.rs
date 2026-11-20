@@ -81,17 +81,8 @@ async fn store() -> (ContactsSkill, Log, zbus::Connection) {
     (ContactsSkill::new(client), log, server)
 }
 
-fn ctx() -> SkillCtx {
-    SkillCtx {
-        conversation_id: "conv-1".into(),
-    }
-}
-
 async fn run(skill: &ContactsSkill, name: &str, args: Value) -> Result<String, Error> {
-    match skill.call(name, &args, &ctx()).await? {
-        ToolOutcome::Result(text) => Ok(text),
-        ToolOutcome::Pending { .. } => panic!("la herramienta no debía dejar una acción pendiente"),
-    }
+    crate::test_support::tool_result(skill, name, args).await
 }
 
 #[tokio::test]
@@ -206,10 +197,7 @@ async fn prepare(
     skill: &ContactsSkill,
     args: Value,
 ) -> Result<(PendingAction, crate::skills::SendAction), Error> {
-    match skill.call("create_contact", &args, &ctx()).await? {
-        ToolOutcome::Pending { action, execute } => Ok((action, execute)),
-        ToolOutcome::Result(_) => panic!("create_contact no debe devolver un resultado directo"),
-    }
+    crate::test_support::tool_pending(skill, "create_contact", args).await
 }
 
 #[tokio::test]
