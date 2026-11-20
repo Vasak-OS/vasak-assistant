@@ -56,6 +56,19 @@ impl FakeStore {
         "{\"event_id\":\"e1\"}".into()
     }
 
+    async fn put_task(
+        &self,
+        account_id: &str,
+        calendar_id: &str,
+        payload: &str,
+        if_match: &str,
+    ) -> String {
+        self.log.lock().push(format!(
+            "puttask {account_id} {calendar_id} {payload} [{if_match}]"
+        ));
+        "{\"task_id\":\"t1\"}".into()
+    }
+
     async fn get_event(&self, event_id: &str, occurrence_id: &str) -> String {
         self.log
             .lock()
@@ -131,7 +144,8 @@ async fn la_habilidad_ofrece_sus_herramientas_con_su_esquema() {
             "list_events",
             "read_event",
             "list_tasks",
-            "create_event"
+            "create_event",
+            "create_task"
         ]
     );
     for tool in &tools {
@@ -143,6 +157,14 @@ async fn la_habilidad_ofrece_sus_herramientas_con_su_esquema() {
         tools[4].parameters["required"],
         json!(["account_id", "calendar_id", "summary", "start", "end"])
     );
+    assert_eq!(
+        tools[5].parameters["required"],
+        json!(["account_id", "calendar_id", "summary"])
+    );
+    let props = &tools[5].parameters["properties"];
+    for campo in ["description", "due", "all_day", "status", "priority"] {
+        assert!(props.get(campo).is_some(), "falta {campo} en el esquema");
+    }
 }
 
 #[tokio::test]
@@ -412,6 +434,171 @@ async fn create_event_sin_argumentos_obligatorios_es_invalid_args() {
         let mut args = event_args();
         args.as_object_mut().unwrap().remove(campo);
         let result = prepare(&skill, args).await;
+        assert!(matches!(result, Err(Error::InvalidArgs(_))), "{campo}");
+    }
+}
+
+// ── create_task ─────────────────────────────────────────────────────────────
+
+async fn prepare_task(
+    skill: &CalendarSkill,
+    args: Value,
+) -> Result<(PendingAction, crate::skills::SendAction), Error> {
+    crate::test_support::tool_pending(skill, "create_task", args).await
+}
+
+fn task_args() -> Value {
+    json!({"account_id": "a1", "calendar_id": "c1", "summary": "Pagar la luz"})
+}
+
+/// Crea la tarea, la confirma y devuelve el payload que llegó a `PutTask`.
+async fn task_payload(skill: &CalendarSkill, log: &Log, args: Value) -> Value {
+    let (_action, execute) = prepare_task(skill, args).await.unwrap();
+    execute().await.unwrap();
+    let line = log.lock().last().cloned().unwrap();
+    let json = line
+        .strip_prefix("puttask a1 c1 ")
+        .and_then(|rest| rest.strip_suffix(" []"))
+        .unwrap_or_else(|| panic!("PutTask mal llamado: {line}"));
+    serde_json::from_str(json).unwrap()
+}
+
+#[tokio::test]
+async fn create_task_prepara_una_accion_y_no_escribe_hasta_confirmar() {
+    let (skill, log, _server) = store().await;
+    let (action, execute) = prepare_task(&skill, task_args()).await.unwrap();
+    assert_eq!(action.kind, "create_task");
+    assert_eq!(action.conversation_id, "conv-1");
+    assert!(
+        action.summary.contains("Pagar la luz"),
+        "{}",
+        action.summary
+    );
+    assert!(log.lock().is_empty(), "preparar no debe llamar a PutTask");
+    execute().await.unwrap();
+    assert_eq!(log.lock().len(), 1);
+}
+
+#[tokio::test]
+async fn al_confirmar_la_tarea_se_crea_con_if_match_vacio_y_solo_el_summary() {
+    let (skill, log, _server) = store().await;
+    let (_action, execute) = prepare_task(&skill, task_args()).await.unwrap();
+    execute().await.unwrap();
+    let expected = json!({"summary": "Pagar la luz"});
+    assert_eq!(
+        log.lock().as_slice(),
+        [format!("puttask a1 c1 {expected} []")]
+    );
+}
+
+#[tokio::test]
+async fn los_opcionales_de_la_tarea_van_al_payload_solo_si_vienen() {
+    let (skill, log, _server) = store().await;
+    let mut args = task_args();
+    args["description"] = json!("Antes del viernes");
+    args["status"] = json!("IN-PROCESS");
+    args["priority"] = json!(5);
+    let payload = task_payload(&skill, &log, args).await;
+    assert_eq!(payload["description"], "Antes del viernes");
+    assert_eq!(payload["status"], "IN-PROCESS");
+    assert_eq!(payload["priority"], 5);
+    assert!(payload.get("due").is_none(), "{payload}");
+
+    let mut args = task_args();
+    args["description"] = json!("");
+    let payload = task_payload(&skill, &log, args).await;
+    for campo in ["description", "due", "status", "priority"] {
+        assert!(payload.get(campo).is_none(), "{campo}: {payload}");
+    }
+}
+
+#[tokio::test]
+async fn el_vencimiento_de_dia_entero_va_como_fecha_con_value_date() {
+    let (skill, log, _server) = store().await;
+    let mut args = task_args();
+    args["due"] = json!("2026-12-24");
+    args["all_day"] = json!(true);
+    let payload = task_payload(&skill, &log, args).await;
+    assert_eq!(
+        payload["due"],
+        json!({"value": "20261224", "params": ["VALUE=DATE"]})
+    );
+}
+
+#[tokio::test]
+async fn el_vencimiento_con_hora_utc_va_en_forma_basica() {
+    let (skill, log, _server) = store().await;
+    let mut args = task_args();
+    args["due"] = json!("2026-12-24T09:30:00Z");
+    let payload = task_payload(&skill, &log, args).await;
+    assert_eq!(
+        payload["due"],
+        json!({"value": "20261224T093000Z", "params": []})
+    );
+}
+
+#[tokio::test]
+async fn un_status_desconocido_es_invalid_args_y_no_deja_accion() {
+    let (skill, log, _server) = store().await;
+    // Control: sin el campo malo los mismos argumentos sí se preparan, así el
+    // error de abajo es de la validación y no de otra cosa.
+    prepare_task(&skill, task_args()).await.unwrap();
+    for status in ["DONE", "needs-action", "pendiente"] {
+        let mut args = task_args();
+        args["status"] = json!(status);
+        let result = prepare_task(&skill, args).await;
+        assert!(matches!(result, Err(Error::InvalidArgs(_))), "{status}");
+    }
+    assert!(log.lock().is_empty());
+}
+
+#[tokio::test]
+async fn los_cuatro_status_validos_entran_al_payload() {
+    let (skill, log, _server) = store().await;
+    for status in ["NEEDS-ACTION", "IN-PROCESS", "COMPLETED", "CANCELLED"] {
+        let mut args = task_args();
+        args["status"] = json!(status);
+        let payload = task_payload(&skill, &log, args).await;
+        assert_eq!(payload["status"], status);
+    }
+}
+
+#[tokio::test]
+async fn una_priority_fuera_de_rango_o_no_entera_es_invalid_args() {
+    let (skill, log, _server) = store().await;
+    // Control: sin el campo malo los mismos argumentos sí se preparan, así el
+    // error de abajo es de la validación y no de otra cosa.
+    prepare_task(&skill, task_args()).await.unwrap();
+    for priority in [json!(10), json!(-1), json!(2.5), json!("alta"), json!(true)] {
+        let mut args = task_args();
+        args["priority"] = priority.clone();
+        let result = prepare_task(&skill, args).await;
+        assert!(matches!(result, Err(Error::InvalidArgs(_))), "{priority}");
+    }
+    assert!(log.lock().is_empty());
+}
+
+#[tokio::test]
+async fn una_priority_de_0_a_9_entra_al_payload() {
+    let (skill, log, _server) = store().await;
+    for priority in 0..=9 {
+        let mut args = task_args();
+        args["priority"] = json!(priority);
+        let payload = task_payload(&skill, &log, args).await;
+        assert_eq!(payload["priority"], priority);
+    }
+}
+
+#[tokio::test]
+async fn create_task_sin_argumentos_obligatorios_es_invalid_args() {
+    let (skill, _log, _server) = store().await;
+    // Control: sin el campo malo los mismos argumentos sí se preparan, así el
+    // error de abajo es de la validación y no de otra cosa.
+    prepare_task(&skill, task_args()).await.unwrap();
+    for campo in ["account_id", "calendar_id", "summary"] {
+        let mut args = task_args();
+        args.as_object_mut().unwrap().remove(campo);
+        let result = prepare_task(&skill, args).await;
         assert!(matches!(result, Err(Error::InvalidArgs(_))), "{campo}");
     }
 }

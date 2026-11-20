@@ -99,17 +99,30 @@ impl Skill for CalendarSkill {
                 "Prepara un evento nuevo en un calendario. No lo crea: la persona lo confirma \
                  antes. El calendario se nombra con «account_id» y «calendar_id», de \
                  list_calendars (uno que admita VEVENT).",
-                json!({
-                    "account_id": {"type": "string", "description": "La cuenta del calendario, de list_calendars."},
-                    "calendar_id": {"type": "string", "description": "El id del calendario, de list_calendars."},
+                calendar_props(json!({
                     "summary": {"type": "string", "description": "El título del evento."},
                     "start": {"type": "string", "description": "El comienzo. Con hora, una marca RFC 3339 en UTC («2026-01-01T09:00:00Z»); de día entero, una fecha «2026-01-01» con «all_day» en true."},
                     "end": {"type": "string", "description": "El fin, en el mismo formato que «start»."},
                     "all_day": {"type": "boolean", "description": "Si es un evento de día entero (fechas sin hora)."},
                     "description": {"type": "string", "description": "El detalle del evento; opcional."},
                     "location": {"type": "string", "description": "El lugar; opcional."}
-                }),
+                })),
                 &["account_id", "calendar_id", "summary", "start", "end"],
+            ),
+            tool(
+                "create_task",
+                "Prepara una tarea nueva en un calendario. No la crea: la persona la confirma \
+                 antes. El calendario se nombra con «account_id» y «calendar_id», de \
+                 list_calendars (uno que admita VTODO).",
+                calendar_props(json!({
+                    "summary": {"type": "string", "description": "El título de la tarea."},
+                    "description": {"type": "string", "description": "El detalle de la tarea; opcional."},
+                    "due": {"type": "string", "description": "El vencimiento; opcional. Con hora, una marca RFC 3339 en UTC («2026-01-01T09:00:00Z»); de día entero, una fecha «2026-01-01» con «all_day» en true."},
+                    "all_day": {"type": "boolean", "description": "Si el vencimiento es una fecha sin hora."},
+                    "status": {"type": "string", "description": "Estado; opcional: NEEDS-ACTION, IN-PROCESS, COMPLETED o CANCELLED."},
+                    "priority": {"type": "integer", "description": "Prioridad 0–9; opcional (0 es sin prioridad)."}
+                })),
+                &["account_id", "calendar_id", "summary"],
             ),
         ]
     }
@@ -127,6 +140,7 @@ impl Skill for CalendarSkill {
                 "read_event" => self.read_event(args).await,
                 "list_tasks" => self.list_tasks(args).await,
                 "create_event" => self.create_event(args, ctx).await,
+                "create_task" => self.create_task(args, ctx).await,
                 other => Err(Error::InvalidArgs(format!(
                     "el calendario no tiene una herramienta «{other}»"
                 ))),
@@ -236,6 +250,102 @@ impl CalendarSkill {
             (account_id, calendar_id, payload, String::new()),
         );
         Ok(ToolOutcome::Pending { action, execute })
+    }
+
+    /// Prepara una tarea para confirmar. Como [`Self::create_event`], pero contra
+    /// `PutTask`: valida los argumentos y, si cuadran, devuelve una acción
+    /// pendiente cuyo `execute` crea la tarea (con `if_match` vacío) al confirmar.
+    async fn create_task(&self, args: &Value, ctx: &SkillCtx) -> Result<ToolOutcome, Error> {
+        let account_id = string_arg(args, "account_id")?;
+        let calendar_id = string_arg(args, "calendar_id")?;
+        let summary = string_arg(args, "summary")?;
+        let description = opt_string_arg(args, "description")?;
+
+        // El payload de `PutTask`. Sin `id` (crear). Los opcionales sólo se
+        // incluyen si vienen: ausente no toca, y en una nueva eso es no fijarlo.
+        let mut payload = json!({ "summary": summary });
+        let map = payload.as_object_mut().expect("el payload es un objeto");
+        if !description.is_empty() {
+            map.insert("description".into(), json!(description));
+        }
+        // El vencimiento, si viene, va como `{value, params}` igual que las fechas
+        // de un evento.
+        let due = opt_string_arg(args, "due")?;
+        if !due.is_empty() {
+            let all_day = bool_arg(args, "all_day", false)?;
+            let (value, params) = ical_datetime(&due, all_day)?;
+            map.insert("due".into(), json!({"value": value, "params": params}));
+        }
+        if let Some(status) = opt_status(args)? {
+            map.insert("status".into(), json!(status));
+        }
+        if let Some(priority) = opt_priority(args)? {
+            map.insert("priority".into(), json!(priority));
+        }
+        let payload = payload.to_string();
+
+        let action = PendingAction::simple(
+            uuid::Uuid::new_v4().to_string(),
+            ctx.conversation_id.clone(),
+            "create_task",
+            format!("Crear la tarea «{summary}» en el calendario «{calendar_id}»"),
+        );
+        let execute = store_create(
+            self.connection.clone(),
+            "PutTask",
+            (account_id, calendar_id, payload, String::new()),
+        );
+        Ok(ToolOutcome::Pending { action, execute })
+    }
+}
+
+/// Las propiedades de una herramienta que crea en un calendario: la cuenta y el
+/// calendario (comunes a `create_event` y `create_task`) más las propias de
+/// `extra`. Evita repetir el esquema de `account_id`/`calendar_id` en cada una.
+fn calendar_props(extra: Value) -> Value {
+    let mut props = json!({
+        "account_id": {"type": "string", "description": "La cuenta del calendario, de list_calendars."},
+        "calendar_id": {"type": "string", "description": "El id del calendario, de list_calendars."}
+    });
+    if let (Some(base), Some(more)) = (props.as_object_mut(), extra.as_object()) {
+        for (key, value) in more {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+    props
+}
+
+/// Los estados que acepta una tarea (`VTODO`), tal como los nombra el contrato de
+/// cuentas.
+const TASK_STATUSES: [&str; 4] = ["NEEDS-ACTION", "IN-PROCESS", "COMPLETED", "CANCELLED"];
+
+/// El `status` de una tarea, si vino: tiene que ser uno de [`TASK_STATUSES`].
+/// `None` si falta; `InvalidArgs` si es un valor desconocido —el modelo lo
+/// corrige, no se manda algo que el almacén rechazaría—.
+fn opt_status(args: &Value) -> Result<Option<String>, Error> {
+    let status = opt_string_arg(args, "status")?;
+    if status.is_empty() {
+        return Ok(None);
+    }
+    if !TASK_STATUSES.contains(&status.as_str()) {
+        return Err(Error::InvalidArgs(format!(
+            "«status» es uno de {TASK_STATUSES:?}: «{status}»"
+        )));
+    }
+    Ok(Some(status))
+}
+
+/// La `priority` de una tarea, si vino: un entero de 0 a 9. `None` si falta;
+/// `InvalidArgs` si no es un entero en rango.
+fn opt_priority(args: &Value) -> Result<Option<i64>, Error> {
+    match args.get("priority") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => match value.as_i64() {
+            Some(priority) if (0..=9).contains(&priority) => Ok(Some(priority)),
+            _ => Err(Error::InvalidArgs(
+                "«priority» es un entero de 0 a 9".into(),
+            )),
+        },
     }
 }
 
