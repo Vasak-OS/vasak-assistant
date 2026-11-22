@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use crate::backend::{BoxFuture, ToolDef};
 use vasak_assistant_protocol::{
-    Error, PendingAction, DOMAIN_CALENDAR, DOMAIN_CONTACTS, DOMAIN_FILES, DOMAIN_MAIL,
+    Error, PendingAction, DOMAIN_CALENDAR, DOMAIN_CONTACTS, DOMAIN_FILES, DOMAIN_MAIL, DOMAIN_WEB,
 };
 
 pub mod calendar;
@@ -28,6 +28,7 @@ pub mod contacts;
 pub mod dbus;
 pub mod files;
 pub mod mail;
+pub mod web;
 
 /// El recurso de permiso del correo, el mismo que exige `AccountsStore`.
 pub const PERMISSION_EMAIL: &str = "store.email";
@@ -41,6 +42,11 @@ pub const PERMISSION_CONTACTS: &str = "store.contacts";
 /// El recurso de permiso de los archivos. A diferencia de los `store.*`, no lo
 /// sirve ningún demonio: es consentimiento y visibilidad, no una frontera.
 pub const PERMISSION_FILES: &str = "files";
+
+/// El recurso de permiso de la web. Como `files`, es consentimiento, no una
+/// frontera: la frontera dura es el allowlist + SSRF del broker. El recurso `web`
+/// lo sirve `vasak-permissions` (PR A del épico).
+pub const PERMISSION_WEB: &str = "web";
 
 /// Cuánto vive una acción pendiente antes de vencer. Pasado eso, confirmarla da
 /// `NotFound`: un borrador viejo no se manda por una confirmación tardía.
@@ -298,6 +304,11 @@ impl MailChat {
             DOMAIN_CALENDAR => self.share_calendar_with_remote,
             DOMAIN_CONTACTS => self.share_contacts_with_remote,
             DOMAIN_FILES => self.share_files_with_remote,
+            // El contenido web es público, y el allowlist + SSRF del broker acotan a
+            // qué hosts se llega: aun con un modelo remoto, sólo alcanza los sitios
+            // que la persona habilitó. Por eso la web se comparte siempre (no hay un
+            // `share_web_with_remote` que decidir).
+            DOMAIN_WEB => true,
             _ => false,
         }
     }

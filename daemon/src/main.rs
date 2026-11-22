@@ -80,16 +80,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // El demonio ya no habla con el modelo por TCP: le pide al broker por el
     // socket. Lee la configuración sólo para `info()` (local según config) y para
     // saber por qué dirección leer la clave; el destino real lo arma el broker.
+    // El mismo cliente del broker sirve a la habilidad web (`web_fetch`), así que se
+    // guarda un `Arc` aparte cuando hay con quién hablar; sin broker no hay web.
+    let mut web_broker: Option<Arc<BrokerClient>> = None;
     let backend: Arc<dyn ModelBackend> = match config::select_backend(&settings) {
         Ok(selection) => {
             match socket_path() {
                 Some(socket) => {
                     info!("{}", logging::backend_summary(&selection));
-                    Arc::new(Limited::new(Arc::new(BrokerClient::new(
-                        selection,
-                        secrets.clone(),
-                        socket,
-                    ))))
+                    let client = Arc::new(BrokerClient::new(selection, secrets.clone(), socket));
+                    web_broker = Some(client.clone());
+                    Arc::new(Limited::new(client))
                 }
                 None => {
                     warn!("sin XDG_RUNTIME_DIR: no se puede contactar al broker de red");
@@ -136,17 +137,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // verificador de permisos necesita ese otro bus: por el de sesión el nombre
     // no está y toda consulta de permiso fallaría.
     let permissions_bus = skills::dbus::permission_bus().await?;
+    let mut skill_list: Vec<Arc<dyn skills::Skill>> = vec![
+        Arc::new(skills::mail::MailSkill::new(skills_bus.clone())),
+        Arc::new(skills::calendar::CalendarSkill::new(skills_bus.clone())),
+        Arc::new(skills::contacts::ContactsSkill::new(skills_bus)),
+        // Los archivos no van por un servicio: se leen del filesystem directo
+        // dentro de las raíces que la persona configuró (ninguna por omisión).
+        Arc::new(skills::files::FilesSkill::new(
+            settings.lince_files_roots.clone(),
+        )),
+    ];
+    // La web va por el broker (el único con red); sin broker (socket caído o
+    // backend rechazado) no se registra, y la capacidad se ve no disponible.
+    if let Some(broker) = web_broker {
+        skill_list.push(Arc::new(skills::web::WebSkill::new(
+            broker,
+            settings.web_allowed_hosts.clone(),
+        )));
+    }
     let mail = Arc::new(skills::MailChat {
-        skills: skills::SkillRegistry::new(vec![
-            Arc::new(skills::mail::MailSkill::new(skills_bus.clone())),
-            Arc::new(skills::calendar::CalendarSkill::new(skills_bus.clone())),
-            Arc::new(skills::contacts::ContactsSkill::new(skills_bus)),
-            // Los archivos no van por un servicio: se leen del filesystem directo
-            // dentro de las raíces que la persona configuró (ninguna por omisión).
-            Arc::new(skills::files::FilesSkill::new(
-                settings.lince_files_roots.clone(),
-            )),
-        ]),
+        skills: skills::SkillRegistry::new(skill_list),
         permission: Arc::new(skills::mail::DbusPermission::new(permissions_bus)),
         pending: parking_lot::Mutex::new(skills::PendingActions::default()),
         share_mail_with_remote: settings.share_mail_with_remote,

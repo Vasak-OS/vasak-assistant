@@ -39,6 +39,9 @@ fn every_variant() -> Vec<BrokerRequest> {
             messages: thread,
             tools,
         },
+        BrokerRequest::WebFetch {
+            url: "https://ejemplo.com/pagina".into(),
+        },
     ];
     for request in &all {
         match request {
@@ -50,10 +53,20 @@ fn every_variant() -> Vec<BrokerRequest> {
             | BrokerRequest::Chat { .. }
             | BrokerRequest::ChatLocalOnly { .. }
             | BrokerRequest::ChatTools { .. }
-            | BrokerRequest::ChatToolsLocalOnly { .. } => {}
+            | BrokerRequest::ChatToolsLocalOnly { .. }
+            | BrokerRequest::WebFetch { .. } => {}
         }
     }
     all
+}
+
+/// Los pedidos de **modelo**: todas las variantes menos `WebFetch`, la excepción
+/// sancionada. Ninguno de estos puede nombrar un destino.
+fn model_requests() -> Vec<BrokerRequest> {
+    every_variant()
+        .into_iter()
+        .filter(|request| !matches!(request, BrokerRequest::WebFetch { .. }))
+        .collect()
 }
 
 /// Todas las claves de objeto de un JSON, a cualquier profundidad.
@@ -70,12 +83,13 @@ fn keys(value: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
+const DESTINATION_KEYS: [&str; 7] = [
+    "url", "uri", "host", "hostname", "endpoint", "addr", "address",
+];
+
 #[test]
-fn ningun_pedido_al_broker_transporta_un_destino() {
-    const DESTINATION_KEYS: [&str; 7] = [
-        "url", "uri", "host", "hostname", "endpoint", "addr", "address",
-    ];
-    for request in every_variant() {
+fn ningun_pedido_de_modelo_transporta_un_destino() {
+    for request in model_requests() {
         let json = serde_json::to_value(&request).unwrap();
         let mut found = Vec::new();
         keys(&json, &mut found);
@@ -84,9 +98,40 @@ fn ningun_pedido_al_broker_transporta_un_destino() {
         for key in DESTINATION_KEYS {
             assert!(
                 !found.iter().any(|k| k == key),
-                "{request:?} lleva el campo de destino «{key}»: el demonio no puede nombrar un host"
+                "{request:?} lleva el campo de destino «{key}»: un pedido de modelo no puede nombrar un host"
             );
         }
+    }
+}
+
+/// `WebFetch` es la **única** excepción a la regla: es la habilidad web, sólo
+/// lectura, y el broker valida la URL contra su allowlist + SSRF antes de salir. La
+/// prueba la fija como la única que lleva un destino, para que ninguna otra se cuele
+/// nombrando un host.
+#[test]
+fn solo_web_fetch_lleva_un_destino_y_es_la_excepcion_sancionada() {
+    let web = BrokerRequest::WebFetch {
+        url: "https://ejemplo.com/pagina".into(),
+    };
+    let json = serde_json::to_value(&web).unwrap();
+    let mut found = Vec::new();
+    keys(&json, &mut found);
+    assert!(
+        found.iter().any(|k| k == "url"),
+        "WebFetch debería llevar la URL: es la excepción sancionada"
+    );
+
+    // Y es la única: ningún otro pedido lleva un destino.
+    for request in model_requests() {
+        let json = serde_json::to_value(&request).unwrap();
+        let mut found = Vec::new();
+        keys(&json, &mut found);
+        assert!(
+            !DESTINATION_KEYS
+                .iter()
+                .any(|key| found.iter().any(|k| k == key)),
+            "{request:?} no puede nombrar un destino: sólo WebFetch puede"
+        );
     }
 }
 

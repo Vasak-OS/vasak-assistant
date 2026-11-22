@@ -2191,7 +2191,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vasak-assistant-broker"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "parking_lot",
  "reqwest",
@@ -2207,7 +2207,7 @@ dependencies = [
 
 [[package]]
 name = "vasak-assistant-daemon"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "dirs",
  "futures-util",
@@ -2235,7 +2235,7 @@ dependencies = [
 
 [[package]]
 name = "vasak-assistant-ipc"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "dirs",
  "parking_lot",
@@ -2251,7 +2251,7 @@ dependencies = [
 
 [[package]]
 name = "vasak-assistant-protocol"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "serde",
  "tokio",

@@ -389,3 +389,71 @@ async fn serve_no_se_cuelga_con_un_cliente_que_manda_el_pedido_y_no_lee() {
     assert!(started.elapsed() < Duration::from_secs(11));
     drop(client_end);
 }
+
+// ── WebFetch ──────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn un_webfetch_a_un_host_fuera_del_allowlist_responde_web_err() {
+    let (_server, state) = ready().await;
+    let state = state.with_web_allowed(vec!["ejemplo.com".into()]);
+    let response = state
+        .handle(
+            BrokerRequest::WebFetch {
+                url: "https://otro.org/".into(),
+            },
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(
+            response,
+            BrokerResponse::Web(Err(BackendError::NotAllowed(_)))
+        ),
+        "{response:?}"
+    );
+}
+
+#[tokio::test]
+async fn con_el_allowlist_vacio_un_webfetch_no_sale() {
+    // Es el estado por omisión de `from_resolved`: sin hosts habilitados.
+    let (_server, state) = ready().await;
+    let response = state
+        .handle(
+            BrokerRequest::WebFetch {
+                url: "https://ejemplo.com/".into(),
+            },
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(
+            response,
+            BrokerResponse::Web(Err(BackendError::NotAllowed(_)))
+        ),
+        "{response:?}"
+    );
+}
+
+#[tokio::test]
+async fn el_webfetch_se_atiende_aunque_la_config_del_modelo_este_rechazada() {
+    let (state, _) = rejected();
+    let response = state
+        .handle(
+            BrokerRequest::WebFetch {
+                url: "https://ejemplo.com/".into(),
+            },
+            None,
+            None,
+        )
+        .await;
+    // Responde por la puerta web (NotAllowed), no con el «no disponible» del modelo.
+    assert!(
+        matches!(
+            response,
+            BrokerResponse::Web(Err(BackendError::NotAllowed(_)))
+        ),
+        "{response:?}"
+    );
+}
