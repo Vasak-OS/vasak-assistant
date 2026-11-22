@@ -2930,6 +2930,15 @@ mod web {
                 capability(ToolBackend::new(vec![]), Some(skill(&fetcher, &[])), false).await,
             ),
             (
+                "allowlist con solo un punto",
+                capability(
+                    ToolBackend::new(vec![]),
+                    Some(skill(&fetcher, &["."])),
+                    false,
+                )
+                .await,
+            ),
+            (
                 "allowlist en blanco",
                 capability(
                     ToolBackend::new(vec![]),
@@ -2951,7 +2960,7 @@ mod web {
             assert!(!cap.reason.is_empty(), "{name}");
             reasons.insert(cap.reason);
         }
-        // «sin allowlist» y «allowlist en blanco» comparten motivo.
+        // «sin allowlist», «solo un punto» y «en blanco» comparten motivo.
         assert_eq!(reasons.len(), 6);
     }
 }

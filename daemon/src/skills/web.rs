@@ -105,12 +105,14 @@ impl Skill for WebSkill {
     }
 
     fn probe(&self) -> BoxFuture<'_, bool> {
-        // En pie si hay al menos un host habilitado. Sin allowlist, la capacidad se
-        // ve no disponible («sin sitios habilitados»); no se abre ninguna conexión.
+        // En pie si hay al menos un host habilitado de verdad. Se normaliza como el
+        // broker (`web::host_allowed`: recorta espacios y el punto final) antes de
+        // decidir, así una entrada basura como «.» o « » cuenta como vacía y la
+        // capacidad se ve no disponible; no se abre ninguna conexión.
         let alive = self
             .allowed_hosts
             .iter()
-            .any(|host| !host.trim().is_empty());
+            .any(|host| !host.trim().trim_end_matches('.').is_empty());
         Box::pin(async move { alive })
     }
 }

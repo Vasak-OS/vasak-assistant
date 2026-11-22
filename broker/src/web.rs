@@ -34,8 +34,31 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Cuánto se espera una lectura web entera. Más corto que `CHAT_TIMEOUT` (que
 /// cubre la carga de un modelo): una página que no llega en este tiempo no vale la
-/// espera.
+/// espera. Cubre **toda** la operación —resolución DNS, conexión y lectura—, no
+/// sólo el pedido HTTP (ver [`fetch`]).
 pub const WEB_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Tope de **caracteres** del cuerpo que se le devuelve al demonio. El cuerpo
+/// viaja escapado en JSON dos veces y el peor caso de escape es 6 bytes por
+/// carácter (un carácter de control → `\u00XX`):
+///
+/// - en el resultado de tool que el demonio arma para el modelo, que no puede
+///   pasar `MAX_TOOL_RESULT_BYTES` (128 KiB en `daemon/src/service.rs`, el
+///   presupuesto más chico; si lo pasa, el modelo nunca ve el contenido);
+/// - en el marco del IPC (`BrokerResponse::Web`), que no puede pasar
+///   `MAX_FRAME_BYTES` (512 KiB) o `write_frame` lo rechaza y la conexión se
+///   cierra sin respuesta.
+///
+/// A 6 bytes/carácter, 16 Ki caracteres son 96 KiB en el peor caso: entran con
+/// margen bajo los 128 KiB del demonio (queda lugar para la URL, el tipo de
+/// contenido y otros resultados del mismo turno) y holgados bajo los 512 KiB del
+/// marco. Sin este tope un cuerpo de ~256 KiB (lo que deja pasar `read_capped`)
+/// rompe las dos cotas.
+const MAX_BODY_CHARS: usize = 16 * 1024;
+
+/// Lo que se agrega al final de un cuerpo recortado, para que el modelo sepa que
+/// la página no llegó entera.
+const TRUNCATION_MARK: &str = "\n\n… [contenido recortado]";
 
 /// Si `host` cae dentro del allowlist: por nombre exacto o como subdominio de una
 /// entrada (la entrada `ejemplo.com` permite `www.ejemplo.com`, pero no
@@ -86,13 +109,22 @@ fn is_blocked_v4(ip: Ipv4Addr) -> bool {
         || ip.is_unspecified()  // 0.0.0.0
         || ip.is_multicast()    // 224.0.0.0/4
         || ip.is_broadcast()    // 255.255.255.255
-        || is_cgnat(ip) // 100.64.0.0/10 (RFC 6598, NAT de carrier)
+        || is_cgnat(ip)         // 100.64.0.0/10 (RFC 6598, NAT de carrier)
+        || is_benchmarking(ip) // 198.18.0.0/15 (RFC 2544, no global)
 }
 
 /// 100.64.0.0/10 (RFC 6598): el segundo octeto va de 64 a 127.
 fn is_cgnat(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
     o[0] == 100 && (o[1] & 0xc0) == 0x40
+}
+
+/// 198.18.0.0/15 (RFC 2544, banco de pruebas): no es una dirección global. El /15
+/// fija los 7 bits altos del segundo octeto, así que 18 y 19 entran (18 & 0xfe ==
+/// 19 & 0xfe == 18) pero 17 y 20 no.
+fn is_benchmarking(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 198 && (o[1] & 0xfe) == 18
 }
 
 /// La v4 embebida en el prefijo NAT64 `64:ff9b::/96` (RFC 6052), o `None`. En una
@@ -113,10 +145,20 @@ fn nat64_embedded(ip: Ipv6Addr) -> Option<Ipv4Addr> {
 fn is_blocked_v6(ip: Ipv6Addr) -> bool {
     // `is_unique_local` y `is_unicast_link_local` son API inestable, así que los
     // rangos se comprueban a mano sobre el primer segmento.
-    let first = ip.segments()[0];
+    let s = ip.segments();
+    let first = s[0];
     let unique_local = (first & 0xfe00) == 0xfc00; // fc00::/7
     let link_local = (first & 0xffc0) == 0xfe80; // fe80::/10
-    ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || unique_local || link_local
+                                                 // 64:ff9b:1::/48 (RFC 8215): el NAT64 de uso local. A diferencia del prefijo
+                                                 // conocido `64:ff9b::/96` (que `nat64_embedded` traduce a su v4), acá se
+                                                 // bloquea el /48 entero.
+    let nat64_local = s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001;
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || unique_local
+        || link_local
+        || nat64_local
 }
 
 /// Trae `raw_url` con las dos puertas (allowlist + SSRF) ya aplicadas. `Err` lleva
@@ -149,37 +191,57 @@ pub async fn fetch(allowlist: &[String], raw_url: &str) -> Result<WebContent, Ba
         )));
     }
 
-    // Resolver el host y comprobar **todas** sus IPs. Si cualquiera es interna, se
-    // rechaza entero: un host no puede mezclar una IP pública y una interna para
-    // colarse.
-    let resolved = resolve(&host, port).await?;
-    for addr in &resolved {
-        if is_blocked_ip(addr.ip()) {
-            return Err(BackendError::NotAllowed(format!(
-                "«{host}» resuelve a una dirección interna: la habilidad web no sale a la red local."
-            )));
+    // Toda la operación de red —resolución DNS, conexión y lectura— bajo un único
+    // plazo. La resolución va adentro a propósito: `serve` del broker espera
+    // `handle` sin plazo propio, así que una DNS lenta retendría el permiso de
+    // conexión. El `connect_timeout` del cliente, más corto, sigue acotando la
+    // conexión adentro de este plazo.
+    tokio::time::timeout(WEB_FETCH_TIMEOUT, async {
+        // Resolver el host y comprobar **todas** sus IPs. Si cualquiera es interna,
+        // se rechaza entero: un host no puede mezclar una IP pública y una interna
+        // para colarse.
+        let resolved = resolve(&host, port).await?;
+        for addr in &resolved {
+            if is_blocked_ip(addr.ip()) {
+                return Err(BackendError::NotAllowed(format!(
+                    "«{host}» resuelve a una dirección interna: la habilidad web no sale a la red local."
+                )));
+            }
         }
-    }
 
-    // Fijar la conexión a las IPs ya verificadas: reqwest no vuelve a resolver, así
-    // que un cambio de DNS entre la comprobación y la conexión (rebinding) no puede
-    // desviarla a una IP interna. El puerto del SocketAddr lo ignora reqwest (usa el
-    // de la URL); las IPs son las que mandan.
-    let client = pinned_client(&host, &resolved)?;
+        // Fijar la conexión a las IPs ya verificadas: reqwest no vuelve a resolver,
+        // así que un cambio de DNS entre la comprobación y la conexión (rebinding)
+        // no puede desviarla a una IP interna. El puerto del SocketAddr lo ignora
+        // reqwest (usa el de la URL); las IPs son las que mandan.
+        let client = pinned_client(&host, &resolved)?;
+        fetch_with_client(&client, &url).await
+    })
+    .await
+    .map_err(|_| BackendError::Failed("la lectura web tardó demasiado.".into()))?
+}
 
+/// La parte de red de [`fetch`], ya pasadas las dos puertas (allowlist + SSRF):
+/// con un `client` ya construido (en producción, fijado a las IPs verificadas) y
+/// la `url` ya validada, hace el GET, comprueba el estado, lee el cuerpo con tope y
+/// arma el [`WebContent`] con el cuerpo recortado a [`MAX_BODY_CHARS`]. El plazo
+/// total lo pone quien llama; acá no se pone uno propio.
+///
+/// Separada de la validación a propósito: así estas líneas de red se pueden
+/// ejercitar en pruebas contra un servidor local con un cliente común, sin el
+/// guardia SSRF —que bloquea `127.0.0.1`—.
+pub async fn fetch_with_client(client: &Client, url: &Url) -> Result<WebContent, BackendError> {
     // GET pelado: sin cabeceras de autorización, sin cuerpo. `redirect::none` y
     // `no_proxy` ya van en el cliente; el tope de cuerpo lo pone `read_capped`.
     let response = client
         .get(url.clone())
-        .timeout(WEB_FETCH_TIMEOUT)
         .send()
         .await
-        .map_err(|error| http::map_error(&url, error))?;
+        .map_err(|error| http::map_error(url, error))?;
 
     if !response.status().is_success() {
         return Err(BackendError::Failed(format!(
             "{} respondió {}",
-            http::origin(&url),
+            http::origin(url),
             response.status()
         )));
     }
@@ -191,10 +253,10 @@ pub async fn fetch(allowlist: &[String], raw_url: &str) -> Result<WebContent, Ba
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_owned();
-    let body = read_capped(&url, response).await?;
+    let body = read_capped(url, response).await?;
     // El cuerpo es texto; un binario (o un corte en medio de un carácter) llega como
     // su mejor interpretación UTF-8 en vez de fallar.
-    let body = String::from_utf8_lossy(&body).into_owned();
+    let body = cap_body(String::from_utf8_lossy(&body).into_owned());
 
     Ok(WebContent {
         final_url,
@@ -203,10 +265,25 @@ pub async fn fetch(allowlist: &[String], raw_url: &str) -> Result<WebContent, Ba
     })
 }
 
+/// Recorta `body` a [`MAX_BODY_CHARS`] caracteres cortando siempre en un borde de
+/// carácter (nunca en medio de uno) y marca el recorte. Si ya entra, lo devuelve
+/// tal cual.
+fn cap_body(mut body: String) -> String {
+    // `char_indices().nth(N)` da el byte donde empieza el carácter de índice N: el
+    // punto de corte justo tras N caracteres, en un borde de carácter. Si hay N o
+    // menos caracteres devuelve `None` y no se recorta.
+    if let Some((cut, _)) = body.char_indices().nth(MAX_BODY_CHARS) {
+        body.truncate(cut);
+        body.push_str(TRUNCATION_MARK);
+    }
+    body
+}
+
 /// Parsea y valida la URL web: `http`/`https`, con host, sin usuario ni contraseña.
 /// A diferencia de `config::normalize_url` **no** recorta la consulta ni la ruta:
-/// una página las necesita. `Err` sin la URL completa.
-fn parse_web_url(raw: &str) -> Result<Url, BackendError> {
+/// una página las necesita. `Err` sin la URL completa. `pub` para que las pruebas
+/// de [`fetch_with_client`] armen una `Url` validada por el mismo camino.
+pub fn parse_web_url(raw: &str) -> Result<Url, BackendError> {
     let url = Url::parse(raw.trim())
         .map_err(|_| BackendError::Failed("la dirección web es inválida".into()))?;
     if url.scheme() != "http" && url.scheme() != "https" {
@@ -246,8 +323,8 @@ async fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, BackendError>
 
 /// Un cliente HTTP fijado a `resolved` para `host`: reqwest no vuelve a resolver,
 /// no sigue redirecciones y no usa proxy del entorno. Mismo criterio que
-/// `http::client`, con el destino ya verificado clavado.
-fn pinned_client(host: &str, resolved: &[SocketAddr]) -> Result<Client, BackendError> {
+/// `http::client`, con el destino ya verificado clavado. `pub` para las pruebas.
+pub fn pinned_client(host: &str, resolved: &[SocketAddr]) -> Result<Client, BackendError> {
     Client::builder()
         .resolve_to_addrs(host, resolved)
         .connect_timeout(CONNECT_TIMEOUT)
